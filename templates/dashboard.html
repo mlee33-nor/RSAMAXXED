@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broker Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+         background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+  h1 { text-align: center; margin-bottom: 20px; color: #eee; }
+  .refresh-note { text-align: center; color: #888; font-size: 0.85em; margin-bottom: 16px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { background: #16213e; padding: 10px 12px; text-align: left; font-weight: 600;
+       border-bottom: 2px solid #0f3460; }
+  td { padding: 8px 12px; border-bottom: 1px solid #222; }
+  tr:hover { background: #16213e44; }
+  .state-success { color: #4caf50; font-weight: bold; }
+  .state-failed  { color: #f44336; font-weight: bold; }
+  .state-partial { color: #ff9800; font-weight: bold; }
+  .no-events { text-align: center; padding: 40px; color: #666; }
+  .accounts { font-size: 0.85em; color: #aaa; }
+  .acct-ok   { color: #81c784; }
+  .acct-fail { color: #e57373; }
+</style>
+</head>
+<body>
+<h1>Broker Dashboard</h1>
+<p class="refresh-note">Auto-refreshes every 10 seconds</p>
+
+{% if events %}
+<table>
+  <thead>
+    <tr>
+      <th>Time (UTC)</th>
+      <th>Broker</th>
+      <th>Action</th>
+      <th>State</th>
+      <th>Message</th>
+      <th>Accounts</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for e in events | reverse %}
+    <tr>
+      <td>{{ e.timestamp[:19].replace("T", " ") }}</td>
+      <td>{{ e.broker }}</td>
+      <td>{{ e.action }}</td>
+      <td class="state-{{ e.state }}">{{ e.state }}</td>
+      <td>{{ e.message or "—" }}</td>
+      <td class="accounts">
+        {% for a in e.accounts %}
+          <span class="{{ 'acct-ok' if a.ok else 'acct-fail' }}">
+            {{ a.account_id }}: {{ a.message or "ok" }}
+            {% if a.num_holdings %} ({{ a.num_holdings }} holdings){% endif %}
+          </span><br>
+        {% endfor %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="no-events">No events yet. Run a broker command to see results here.</p>
+{% endif %}
+
+<script>
+  setTimeout(function(){ location.reload(); }, 10000);
+</script>
+</body>
+</html>

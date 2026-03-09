@@ -1,0 +1,13 @@
+.env
+trades.json
+sessions/
+__pycache__/
+*.pyc
+logs/
+CascadeProjects/
+custom_accounts.json
+mirror_state.json
+*.exe
+.claude/
+.env.example
+SourceIdle.bat
