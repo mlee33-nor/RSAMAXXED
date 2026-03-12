@@ -1,9 +1,47 @@
 [
-  {"date": "2026-03-06", "symbol": "SKYQ", "note": "Reg Alert"},
-  {"date": "2026-03-06", "symbol": "ELPW", "note": "Reg Alert"},
-  {"date": "2026-03-06", "symbol": "ARTL", "note": "Reg Alert"},
-  {"date": "2026-03-06", "symbol": "RONN", "note": "OTC - Fidelity only, $0.01 shot in the dark"},
-  {"date": "2026-03-06", "symbol": "WLDS", "note": "conditional - 1-for-3 reverse split 3/11, need 2 shares/acct"},
-  {"date": "2026-03-09", "symbol": "ZNB", "note": "Reg Alert"},
-  {"date": "2026-03-09", "symbol": "PASW", "note": "Reg Alert"}
+  {
+    "date": "2026-03-06",
+    "symbol": "SKYQ",
+    "note": "Reg Alert"
+  },
+  {
+    "date": "2026-03-06",
+    "symbol": "ELPW",
+    "note": "Reg Alert"
+  },
+  {
+    "date": "2026-03-06",
+    "symbol": "ARTL",
+    "note": "Reg Alert"
+  },
+  {
+    "date": "2026-03-06",
+    "symbol": "RONN",
+    "note": "OTC - Fidelity only, $0.01 shot in the dark"
+  },
+  {
+    "date": "2026-03-06",
+    "symbol": "WLDS",
+    "note": "conditional - 1-for-3 reverse split 3/11, need 2 shares/acct"
+  },
+  {
+    "date": "2026-03-09",
+    "symbol": "ZNB",
+    "note": "Reg Alert"
+  },
+  {
+    "date": "2026-03-09",
+    "symbol": "PASW",
+    "note": "Reg Alert"
+  },
+  {
+    "symbol": "LHSW",
+    "note": "Reg Alert",
+    "date": "2026-03-10"
+  },
+  {
+    "symbol": "CLAW",
+    "note": "Reg Alert",
+    "date": "2026-03-11"
+  }
 ]

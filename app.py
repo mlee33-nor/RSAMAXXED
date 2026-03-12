@@ -30,7 +30,7 @@ import trade_journal
 
 # Quick Picks — remote stock list hosted on a public GitHub Gist.
 # Update the gist JSON to push new picks to all copies of the app.
-QUICK_PICKS_URL = "https://jsonblob.com/api/jsonBlob/019cd43a-b421-7a6c-8035-8e2f5a46b0cd"
+QUICK_PICKS_URL = "https://jsonblob.com/api/jsonBlob/019ce035-23d0-7f14-bcec-0c54bc1a540b"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -295,28 +295,33 @@ PICKS_FILE = ROOT_DIR / "picks.json"
 
 
 def _fetch_quick_picks() -> List[Dict[str, str]]:
-    """Load quick picks from local picks.json first, then fall back to remote gist.
+    """Fetch quick picks from remote first (so all users stay in sync), fall back to local cache.
 
     Expected JSON format: [{"symbol": "AAPL"}, {"symbol": "ZNB", "note": "EV play"}, ...]
     """
     import json
-    # Local file takes priority
-    if PICKS_FILE.exists():
-        try:
-            data = json.loads(PICKS_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, list) and data:
-                return data
-        except Exception:
-            pass
-    # Fall back to remote gist
+    # Remote is authoritative — always try it first
     try:
         req = urllib.request.Request(QUICK_PICKS_URL, headers={"User-Agent": "gotEV/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
             if isinstance(data, list):
+                # Cache locally for offline use
+                try:
+                    PICKS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
                 return data
     except Exception:
         pass
+    # Offline fallback — use local cache
+    if PICKS_FILE.exists():
+        try:
+            data = json.loads(PICKS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
     return []
 
 
@@ -1018,7 +1023,15 @@ class App(tk.Tk):
 
             def _push():
                 import json as _json
-                ok = False
+                # Save locally first (primary storage)
+                try:
+                    PICKS_FILE.write_text(_json.dumps(all_picks, indent=2), encoding="utf-8")
+                except Exception as ex:
+                    self.after(0, lambda: status_lbl.configure(
+                        text=f"Local save failed: {ex}", fg=RED))
+                    return
+
+                # Remote sync is best-effort
                 try:
                     data = _json.dumps(all_picks).encode("utf-8")
                     req = urllib.request.Request(
@@ -1026,22 +1039,15 @@ class App(tk.Tk):
                         headers={"Content-Type": "application/json",
                                  "User-Agent": "gotEV/1.0"})
                     with urllib.request.urlopen(req, timeout=10):
-                        ok = True
-                except Exception as ex:
-                    self.after(0, lambda: status_lbl.configure(
-                        text=f"Remote save failed: {ex}", fg=RED))
-
-                try:
-                    PICKS_FILE.write_text(_json.dumps(all_picks, indent=2), encoding="utf-8")
+                        pass
                 except Exception:
-                    pass
+                    pass  # remote sync failed — local file is authoritative
 
-                if ok:
-                    self.after(0, lambda: self._render_quick_picks(all_picks))
-                    self.after(0, lambda: status_lbl.configure(
-                        text=f"Added {len(parsed)} pick(s) for {date_str}!", fg=GREEN))
-                    self.after(0, lambda: self._log(
-                        f"Quick Picks: added {len(parsed)} tickers for {date_str}"))
+                self.after(0, lambda: self._render_quick_picks(all_picks))
+                self.after(0, lambda: status_lbl.configure(
+                    text=f"Added {len(parsed)} pick(s) for {date_str}!", fg=GREEN))
+                self.after(0, lambda: self._log(
+                    f"Quick Picks: added {len(parsed)} tickers for {date_str}"))
 
             threading.Thread(target=_push, daemon=True).start()
 
@@ -1051,6 +1057,13 @@ class App(tk.Tk):
                 def _push_empty():
                     import json as _json
                     try:
+                        PICKS_FILE.write_text("[]", encoding="utf-8")
+                    except Exception as ex:
+                        self.after(0, lambda: status_lbl.configure(
+                            text=f"Failed: {ex}", fg=RED))
+                        return
+                    # Remote sync best-effort
+                    try:
                         data = b"[]"
                         req = urllib.request.Request(
                             QUICK_PICKS_URL, data=data, method="PUT",
@@ -1058,13 +1071,11 @@ class App(tk.Tk):
                                      "User-Agent": "gotEV/1.0"})
                         with urllib.request.urlopen(req, timeout=10):
                             pass
-                        PICKS_FILE.write_text("[]", encoding="utf-8")
-                        self.after(0, lambda: self._render_quick_picks([]))
-                        self.after(0, lambda: status_lbl.configure(
-                            text="All picks cleared.", fg=TEXT_MUTED))
-                    except Exception as ex:
-                        self.after(0, lambda: status_lbl.configure(
-                            text=f"Failed: {ex}", fg=RED))
+                    except Exception:
+                        pass
+                    self.after(0, lambda: self._render_quick_picks([]))
+                    self.after(0, lambda: status_lbl.configure(
+                        text="All picks cleared.", fg=TEXT_MUTED))
                 threading.Thread(target=_push_empty, daemon=True).start()
 
         btn_row = tk.Frame(dlg, bg=BG_CARD)
