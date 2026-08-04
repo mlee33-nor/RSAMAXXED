@@ -1049,6 +1049,23 @@ def _fetch_quick_picks() -> List[Dict[str, str]]:
                     in _touched_pick_keys(local)]
 
     remote = _cloud_picks()
+
+    # An EMPTY feed is never allowed to erase a populated cache. The server
+    # stores the feed on a disk its host replaces on every deploy, so "no plays
+    # at all" is far more often a wiped database than a genuinely quiet day —
+    # and the old behaviour wrote that emptiness straight to disk, destroying
+    # the only other copy the customer had. Keeping what we hold is safe in
+    # both readings: if the feed really is empty, these picks age out on their
+    # own within PICK_MAX_AGE_DAYS.
+    if remote == [] and any(p for p in local if p not in local_bought):
+        data, removed = _prune_stale_picks(local)
+        if removed:
+            try:
+                PICKS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        return data
+
     if remote is not None:
         data = _merge_picks(remote, local_bought)
         data, _ = _prune_stale_picks(data)
@@ -1079,6 +1096,10 @@ class App(ctk.CTk):
         # hand back work before the rest of __init__ has finished.
         self._ui_queue: "queue.Queue[tuple]" = queue.Queue()
         self._ui_pump_id: Optional[str] = None
+        # Feed health, surfaced in the status bar and used to back off retries.
+        self._feed_last_ok: Optional[datetime] = None
+        self._feed_fail_streak: int = 0
+        self._feed_retry_id: Optional[str] = None
         self.title("RSAMAXXED Terminal — Multi-Broker Execution")
         # Windows shows the default Python feather without this. Best-effort:
         # a missing icon must never stop the terminal from opening.
@@ -1229,7 +1250,13 @@ class App(ctk.CTk):
         self._status_quotes = tk.Label(right, text="QUOTES · AWAITING FIRST SYNC",
                                        bg=BG_SECONDARY, fg=TEXT_MUTED,
                                        font=(FONT_MONO, 7))
-        self._status_quotes.pack(side="right")
+        self._status_quotes.pack(side="right", padx=(16, 0))
+        # The plays are the product, so their freshness gets a permanent
+        # readout. Quotes already had one and they matter far less.
+        self._feed_status_lbl = tk.Label(right, text="FEED  ·  connecting…",
+                                         bg=BG_SECONDARY, fg=TEXT_MUTED,
+                                         font=(FONT_MONO, 7))
+        self._feed_status_lbl.pack(side="right")
 
     # ---- Notification bar -------------------------------------------------
 
@@ -1781,6 +1808,10 @@ class App(ctk.CTk):
             self._mkt_clock.configure(text=now.strftime("%H:%M:%S") + " ET")
         except Exception:
             pass
+        # Rides the clock rather than owning a timer: the age it shows has to
+        # keep counting up on its own, or a feed that died an hour ago would
+        # still read "just now" until the next successful pull.
+        self._update_feed_status()
         self.after(1000, self._tick_clock)
 
     def _start_quote_loop(self) -> None:
@@ -8210,13 +8241,16 @@ class App(ctk.CTk):
         try:
             client = cloud_sync.CloudSync()
         except Exception:
+            self.after(0, lambda: self._feed_result(False))
             return                      # offline; keep what we have
 
         # Each stream in its own try: a server hiccup on one must not cost the
         # other. Buys are the half a customer acts on, so they may not ride on
         # whether the exits call happened to succeed.
+        ok = False
         try:
             picks = _fetch_quick_picks()
+            ok = True
             if picks:
                 self.after(0, lambda p=picks: self._render_quick_picks(p))
         except Exception:
@@ -8224,13 +8258,65 @@ class App(ctk.CTk):
 
         try:
             incoming = client.fetch_sells()
+            ok = True
         except Exception:
+            incoming = None
+        if incoming:
+            merged = _merge_sells(_load_sells(), incoming)
+            _save_sells(merged)
+            self.after(0, self._render_sell_alerts)
+
+        self.after(0, lambda good=ok: self._feed_result(good))
+
+    def _feed_result(self, ok: bool) -> None:
+        """Record the outcome of a feed pull and retry soon if it failed.
+
+        The regular tick is hourly, which is right for a healthy feed and far
+        too slow for a broken one: a thirty-second outage would otherwise cost
+        a customer a full hour of plays. Back off on repeated failures so a
+        server that is genuinely down isn't hammered, and cap it below the
+        hourly tick so the normal schedule always takes over again.
+        """
+        if ok:
+            self._feed_last_ok = datetime.now()
+            self._feed_fail_streak = 0
+            self._update_feed_status()
             return
-        if not incoming:
+
+        self._feed_fail_streak = getattr(self, "_feed_fail_streak", 0) + 1
+        self._update_feed_status()
+        if self._feed_retry_id is not None:
+            try:
+                self.after_cancel(self._feed_retry_id)
+            except Exception:
+                pass
+            self._feed_retry_id = None
+        delay = min(300_000 * self._feed_fail_streak, 1_800_000)   # 5,10,15 … 30 min
+        self._feed_retry_id = self.after(
+            delay, lambda: self._run_in_thread(self._feed_pull_worker))
+
+    def _update_feed_status(self) -> None:
+        """Say when the plays last arrived, so stale never looks like current.
+
+        Silence used to be indistinguishable from success — an unreachable feed
+        left yesterday's picks on screen with nothing to suggest they were old,
+        which is the worst possible failure for a product whose entire job is
+        being current.
+        """
+        lbl = getattr(self, "_feed_status_lbl", None)
+        if lbl is None:
             return
-        merged = _merge_sells(_load_sells(), incoming)
-        _save_sells(merged)
-        self.after(0, self._render_sell_alerts)
+        last = getattr(self, "_feed_last_ok", None)
+        streak = getattr(self, "_feed_fail_streak", 0)
+        if last is None:
+            lbl.configure(text="FEED  ·  connecting…", fg=TEXT_MUTED)
+            return
+        mins = int((datetime.now() - last).total_seconds() // 60)
+        stale = streak > 0 or mins > 150        # >2 missed hourly ticks
+        when = "just now" if mins < 2 else f"{mins}m ago" if mins < 120 else f"{mins // 60}h ago"
+        lbl.configure(
+            text=f"FEED  ·  {'not updating — ' if stale else ''}{when}",
+            fg=YELLOW if stale else TEXT_MUTED)
 
     def _track_loop(self) -> None:
         """Hourly TRACK poll, on its own timer.
