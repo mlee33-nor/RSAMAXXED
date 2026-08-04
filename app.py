@@ -8111,7 +8111,14 @@ class App(ctk.CTk):
     # ---- TRACK polling -----------------------------------------------------
 
     def _feed_pull_worker(self) -> None:
-        """Refresh the exits card from the cloud feed.
+        """Refresh BUYS and EXITS from the cloud feed. Runs on the hourly tick.
+
+        Both streams, because a customer's day is not bounded by a restart. The
+        pick list used to be fetched exactly once, 300ms after launch, and never
+        again — so a terminal left open (which is the normal way to run it, and
+        what mirror trading requires) showed yesterday's plays all day and only
+        told the truth if you happened to press Reload. An alert published at
+        10am is worth nothing to someone who sees it tomorrow.
 
         Sell alerts used to arrive only through the Discord SELL channel, which
         meant a customer without a token saw an empty card forever. Cloud rows
@@ -8124,9 +8131,23 @@ class App(ctk.CTk):
             client = cloud_sync.CloudSync()
             if not client.is_linked:
                 return
-            incoming = client.fetch_sells()
         except Exception:
             return                      # offline or unsubscribed; keep what we have
+
+        # Each stream in its own try: a server hiccup on one must not cost the
+        # other. Buys are the half a customer acts on, so they may not ride on
+        # whether the exits call happened to succeed.
+        try:
+            picks = _fetch_quick_picks()
+            if picks:
+                self.after(0, lambda p=picks: self._render_quick_picks(p))
+        except Exception:
+            pass
+
+        try:
+            incoming = client.fetch_sells()
+        except Exception:
+            return
         if not incoming:
             return
         merged = _merge_sells(_load_sells(), incoming)
