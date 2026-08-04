@@ -1,0 +1,495 @@
+{% extends "base.html" %}
+{% block title %}How reverse-split round-ups work — RSAMAXXED{% endblock %}
+{% block description %}A step-by-step, visual explanation of reverse-split round-up trading: why companies reverse split, what happens to your fractional share, the three ways it can settle, and why only one of them pays.{% endblock %}
+{% block nav_how %}on{% endblock %}
+
+{% block content %}
+<div class="wrap">
+
+  <section class="ex-hero">
+    <span class="eyebrow"><i class="pip"></i> The whole mechanism, in six steps</span>
+    <h1>What <span class="grad">reverse-split round-up</span> trading actually is.</h1>
+    <p class="lede">
+      No charts to read. No direction to call. Just a rounding rule that sits at the end of
+      a corporate action — and a decision your broker makes about five hundredths of a share.
+    </p>
+
+    <nav class="ex-jump" aria-label="Jump to a step">
+      <a href="#s1">1 · Why the split happens</a>
+      <a href="#s2">2 · What a split does</a>
+      <a href="#s3">3 · Your sliver</a>
+      <a href="#s4">4 · The fork</a>
+      <a href="#s5">5 · The trade</a>
+      <a href="#s6">6 · × ten accounts</a>
+      <a href="#risks">What can go wrong</a>
+    </nav>
+  </section>
+
+  <ol class="scenes">
+
+    <!-- =============================================================== 01 -->
+    <li class="scene" id="s1">
+      <div class="scene-copy">
+        <div class="scene-n">Step 01 · The setup</div>
+        <h2>A company under a dollar has a problem.</h2>
+        <p>
+          Major exchanges require a listed stock to keep its bid above $1.00. Drift below it
+          for long enough and the company gets a deficiency notice, then a deadline to fix it.
+        </p>
+        <p>
+          There is one lever that raises a share price without selling anything, without
+          earning anything, and without asking anyone's permission: a <b>reverse split</b>.
+          So the company announces one. This happens constantly, and it is announced in
+          advance, in public, on a schedule.
+        </p>
+        <div class="aside">
+          <b>The supply side of this trade is a compliance deadline.</b> Nobody is guessing
+          which company will split. They tell you, weeks ahead, in a filing.
+        </div>
+      </div>
+
+      <div class="scene-fig fig-price">
+        <svg viewBox="0 0 400 220" role="img" aria-label="A share price drifting below the one dollar minimum bid, then jumping above five dollars after a reverse split.">
+          <line class="dash" x1="16" y1="145" x2="228" y2="145"/>
+          <text x="16" y="138">$1.00 minimum bid</text>
+
+          <path class="line" style="--len:230" d="M20,110 L60,128 L100,120 L140,150 L180,168 L215,182"/>
+          <text x="20" y="200" class="r">deficiency notice</text>
+
+          <line class="dash" x1="238" y1="24" x2="238" y2="200"/>
+          <text x="244" y="200">effective date</text>
+
+          <g class="jump">
+            <path d="M258,60 L380,52" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round"/>
+            <circle cx="258" cy="60" r="4" class="g"/>
+            <text x="258" y="42" class="big" style="fill:var(--green)">$5.00</text>
+          </g>
+        </svg>
+        <span class="fig-cap">Same company. Same market cap. New price tag.</span>
+      </div>
+    </li>
+
+    <!-- =============================================================== 02 -->
+    <li class="scene" id="s2">
+      <div class="scene-copy">
+        <div class="scene-n">Step 02 · The mechanic</div>
+        <h2>Twenty shares become one. The price multiplies by twenty.</h2>
+        <p>
+          In a 1-for-20 reverse split, every twenty shares you own are exchanged for one.
+          To keep the company worth what it was worth a second earlier, the price per share
+          is multiplied by twenty. A quarter becomes five dollars.
+        </p>
+        <p>
+          Held four hundred shares at 25¢? You now hold twenty shares at $5.00. A hundred
+          dollars, before and after. Nothing has been created and nothing has been destroyed.
+        </p>
+        <div class="aside">
+          This is the part everyone already knows, and the part that makes no money.
+          <b>The money is in the remainder.</b>
+        </div>
+      </div>
+
+      <div class="scene-fig fig-tiles">
+        <svg viewBox="0 0 400 200" role="img" aria-label="Twenty small share tiles collapsing into one large share tile worth twenty times as much.">
+          <!-- 5 x 4 grid; each tile slides to the grid's centre and fades -->
+          <g>
+            <rect class="t" style="--i:0;--dx:56px;--dy:42px"   x="30"  y="40"  width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:1;--dx:28px;--dy:42px"   x="58"  y="40"  width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:2;--dx:0px;--dy:42px"    x="86"  y="40"  width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:3;--dx:-28px;--dy:42px"  x="114" y="40"  width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:4;--dx:-56px;--dy:42px"  x="142" y="40"  width="22" height="22" rx="4"/>
+
+            <rect class="t" style="--i:5;--dx:56px;--dy:14px"   x="30"  y="68"  width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:6;--dx:28px;--dy:14px"   x="58"  y="68"  width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:7;--dx:0px;--dy:14px"    x="86"  y="68"  width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:8;--dx:-28px;--dy:14px"  x="114" y="68"  width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:9;--dx:-56px;--dy:14px"  x="142" y="68"  width="22" height="22" rx="4"/>
+
+            <rect class="t" style="--i:10;--dx:56px;--dy:-14px"  x="30"  y="96"  width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:11;--dx:28px;--dy:-14px"  x="58"  y="96"  width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:12;--dx:0px;--dy:-14px"   x="86"  y="96"  width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:13;--dx:-28px;--dy:-14px" x="114" y="96"  width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:14;--dx:-56px;--dy:-14px" x="142" y="96"  width="22" height="22" rx="4"/>
+
+            <rect class="t" style="--i:15;--dx:56px;--dy:-42px"  x="30"  y="124" width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:16;--dx:28px;--dy:-42px"  x="58"  y="124" width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:17;--dx:0px;--dy:-42px"   x="86"  y="124" width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:18;--dx:-28px;--dy:-42px" x="114" y="124" width="22" height="22" rx="4"/>
+            <rect class="t" style="--i:19;--dx:-56px;--dy:-42px" x="142" y="124" width="22" height="22" rx="4"/>
+          </g>
+          <text x="30" y="170">20 shares × $0.25</text>
+
+          <path class="stroke" d="M185,93 L225,93 M215,85 L225,93 L215,101"/>
+
+          <rect class="one" x="250" y="61" width="64" height="64" rx="10" fill="var(--green)" opacity=".9"/>
+          <g class="after">
+            <text x="250" y="170">1 share × $5.00</text>
+            <text x="250" y="52" class="big">= $5.00</text>
+          </g>
+        </svg>
+        <span class="fig-cap">1-for-20 · value in = value out</span>
+      </div>
+    </li>
+
+    <!-- =============================================================== 03 -->
+    <li class="scene" id="s3">
+      <div class="scene-copy">
+        <div class="scene-n">Step 03 · The remainder</div>
+        <h2>But you didn't own twenty shares. You owned one.</h2>
+        <p>
+          Divide one share by twenty and you get 0.05 of a share. That is what the split
+          leaves in your account: a sliver worth about the quarter you paid, and worth
+          nothing to anybody as a tradeable object.
+        </p>
+        <p>
+          Companies don't issue fractional shares. Transfer agents don't want to track them.
+          So the corporate action has to say something about what happens to yours — and
+          your broker has to decide how to apply it to a position it holds in street name
+          on your behalf.
+        </p>
+        <div class="aside">
+          Every reverse split in history has produced these slivers. <b>Somebody has to
+          resolve them.</b> That resolution is the entire trade.
+        </div>
+      </div>
+
+      <div class="scene-fig fig-wedge">
+        <svg viewBox="0 0 400 240" role="img" aria-label="A circle representing one whole share, with one twentieth of it highlighted.">
+          <circle class="ring" cx="200" cy="120" r="70"/>
+          <path class="slice" d="M200,120 L200,50 A70,70 0 0,1 221.6,53.4 Z"/>
+          <line class="dash" x1="222" y1="52" x2="300" y2="34"/>
+          <g class="lbl">
+            <text x="286" y="28" class="big">0.05 sh</text>
+            <text x="286" y="46">1 ÷ 20</text>
+          </g>
+          <text x="200" y="212" text-anchor="middle">one whole share, for scale</text>
+        </svg>
+        <span class="fig-cap">This is what lands in your account</span>
+      </div>
+    </li>
+
+    <!-- =============================================================== 04 -->
+    <li class="scene" id="s4">
+      <div class="scene-copy">
+        <div class="scene-n">Step 04 · The fork</div>
+        <h2>Three things can happen to a sliver. Only one of them pays.</h2>
+        <p>
+          <b style="color:var(--green)">Rounded up.</b> The fraction is bumped to a whole
+          share. You now hold one share marked near $5.00, having paid 25¢.
+        </p>
+        <p>
+          <b style="color:var(--amber)">Cash in lieu.</b> The fraction is sold and you're
+          handed its value in cash — roughly what you put in. You break about even, minus
+          your time.
+        </p>
+        <p>
+          <b style="color:var(--red)">Rounded down.</b> The fraction is cancelled. The
+          position is gone and so is the quarter.
+        </p>
+        <div class="aside">
+          Which one you get depends on <b>the issuer's split terms</b> and on <b>your
+          broker's own fractional-share policy</b> — two things you do not control, and
+          neither of which is promised to you in advance. Policies change without notice.
+          This is the real risk in the strategy, and it is why the trade is spread across
+          ten brokers instead of concentrated in one.
+        </div>
+      </div>
+
+      <div class="scene-fig fig-fork">
+        <svg viewBox="0 0 400 240" role="img" aria-label="Three possible outcomes for a fractional share: rounded up to a whole share, cash in lieu, or rounded down to nothing.">
+          <circle cx="40" cy="120" r="7" fill="var(--accent)"/>
+          <text x="18" y="148">0.05 sh</text>
+
+          <path class="branch b1" style="--len:250" d="M52,120 C150,120 160,48 250,48"/>
+          <path class="branch b2" style="--len:210" d="M52,120 C150,120 160,120 250,120"/>
+          <path class="branch b3" style="--len:250" d="M52,120 C150,120 160,192 250,192"/>
+
+          <g class="out o1">
+            <circle cx="258" cy="48" r="5" class="g"/>
+            <text x="272" y="44" class="big" style="fill:var(--green)">Rounds up</text>
+            <text x="272" y="62">1 whole share · $5.00</text>
+          </g>
+          <g class="out o2">
+            <circle cx="258" cy="120" r="5" class="a"/>
+            <text x="272" y="116" class="big" style="fill:var(--amber)">Cash in lieu</text>
+            <text x="272" y="134">~$0.25 back · flat</text>
+          </g>
+          <g class="out o3">
+            <circle cx="258" cy="192" r="5" class="r"/>
+            <text x="272" y="188" class="big" style="fill:var(--red)">Rounded down</text>
+            <text x="272" y="206">$0.00 · position closed</text>
+          </g>
+        </svg>
+        <span class="fig-cap">Not every position rounds up</span>
+      </div>
+    </li>
+
+    <!-- =============================================================== 05 -->
+    <li class="scene" id="s5">
+      <div class="scene-copy">
+        <div class="scene-n">Step 05 · The trade</div>
+        <h2>When it rounds up, you sell the share you were handed.</h2>
+        <p>
+          You paid 25¢ for one share. The split turned it into 0.05 of a share. The broker
+          rounded that back to 1.00. You now hold a whole share of a company that trades
+          near $5.00, and it cost you a quarter.
+        </p>
+        <p>
+          So you sell it. <b>$5.00 in, minus the $0.25 you spent, is $4.75 realized</b> —
+          in that one account, from that one split. Not a paper gain. A closed round trip
+          with a confirmed fill on both ends. That is the only number RSAMAXXED will ever
+          call profit.
+        </p>
+        <div class="aside">
+          Post-split prices often fade in the days after the effective date, and thinly
+          traded names may have no real bid at all. <b>The $5.00 is where it should trade,
+          not where it will.</b>
+        </div>
+      </div>
+
+      <div class="scene-fig fig-book">
+        <svg viewBox="0 0 400 200" role="img" aria-label="A ledger: buy one share at twenty-five cents, the split rounds it up to one whole share, sell at five dollars, keeping four dollars seventy-five.">
+          <g class="row">
+            <text x="20" y="40">BUY  1 sh @ $0.25</text>
+            <text x="380" y="40" text-anchor="end" class="big" style="fill:var(--red)">−$0.25</text>
+          </g>
+          <g class="row">
+            <text x="20" y="90">1-for-20 · rounds up</text>
+            <text x="380" y="90" text-anchor="end" class="big">1.00 sh</text>
+          </g>
+          <g class="row">
+            <text x="20" y="140">SELL 1 sh @ $5.00</text>
+            <text x="380" y="140" text-anchor="end" class="big" style="fill:var(--green)">+$5.00</text>
+          </g>
+          <g class="row">
+            <line class="rule" x1="20" y1="160" x2="380" y2="160"/>
+            <text x="20" y="186">REALIZED</text>
+            <text x="380" y="186" text-anchor="end" class="big" style="fill:var(--green)">+$4.75</text>
+          </g>
+        </svg>
+        <span class="fig-cap">Illustrative · one account, one split</span>
+      </div>
+    </li>
+
+    <!-- =============================================================== 06 -->
+    <li class="scene" id="s6">
+      <div class="scene-copy">
+        <div class="scene-n">Step 06 · The multiplier</div>
+        <h2>The rule doesn't care how many accounts you have.</h2>
+        <p>
+          $4.75 is not a living. But the round-up isn't applied to <em>you</em> — it's
+          applied to a position, in an account, at a broker. Hold one share in ten
+          brokerages and there are ten positions, ten fractions, ten decisions.
+        </p>
+        <p>
+          Doing that by hand means ten logins, ten order tickets, twice — once to buy,
+          once to sell — inside a window that closes. That is the job RSAMAXXED does:
+          one click, ten accounts, every fill journaled.
+        </p>
+        <div class="aside">
+          Spreading across brokers isn't only about volume. <b>It's the hedge.</b> When one
+          broker pays cash in lieu, the other nine are unaffected.
+        </div>
+      </div>
+
+      <div class="scene-fig">
+        <div class="mult">
+          <div class="ctrl">
+            <label for="m-accts">Accounts holding one share <b id="m-accts-out">10</b></label>
+            <input id="m-accts" type="range" min="1" max="55" value="10" step="1">
+          </div>
+          <div class="m-grid" id="m-grid" aria-hidden="true"></div>
+          <div class="m-out">
+            <div class="k">Realized if every one rounds up</div>
+            <div class="v pos num" id="m-total">+$47.50</div>
+          </div>
+        </div>
+        <span class="fig-cap">$4.75 × accounts · illustrative</span>
+      </div>
+    </li>
+  </ol>
+
+  <!-- ============================================================== LEDGER -->
+  <section class="sect">
+    <div class="sect-h reveal">
+      <div class="kicker">The whole thing, on one line</div>
+      <h2>A worked example.</h2>
+      <p>
+        One ticker. One 1-for-20 reverse split. One share bought in each of ten brokerages,
+        assuming every one of them rounds up.
+      </p>
+    </div>
+
+    <div class="card reveal" style="margin-top:36px">
+      <div class="scroll-x">
+        <table class="table ledger">
+          <thead>
+            <tr>
+              <th>Leg</th><th class="num">Per account</th><th class="num">× 10 accounts</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Buy 1 share pre-split</td><td class="num neg">−$0.25</td><td class="num neg">−$2.50</td></tr>
+            <tr><td>Position after 1-for-20 split</td><td class="num">0.05 sh</td><td class="num">0.50 sh</td></tr>
+            <tr><td>Broker rounds the fraction up</td><td class="num">1.00 sh</td><td class="num">10.00 sh</td></tr>
+            <tr><td>Sell 1 share post-split</td><td class="num pos">+$5.00</td><td class="num pos">+$50.00</td></tr>
+            <tr class="total"><td>Realized</td><td class="num pos">+$4.75</td><td class="num pos">+$47.50</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:16px;font-size:12.4px;line-height:1.65">
+        Illustrative example, not typical or promised results. It assumes all ten brokers round
+        up, that the post-split share can be sold near $5.00, and it ignores commissions,
+        settlement delays, and taxes. Real splits miss on all three assumptions regularly.
+      </p>
+    </div>
+  </section>
+
+  <!-- =============================================================== RISKS -->
+  <section class="sect" id="risks">
+    <div class="sect-h reveal">
+      <div class="kicker">The honest part</div>
+      <h2>Why this isn't free money.</h2>
+      <p>
+        If you only read one section on this site, read this one. Everything above describes
+        the good case. Here is the rest of the distribution.
+      </p>
+    </div>
+
+    <div class="risks reveal">
+      <div class="risk">
+        <h3>The round-up may not happen</h3>
+        <p>
+          Many corporate actions specify cash in lieu outright. Many brokers round down or
+          pass through whatever the issuer says. Round-up is a policy, not a right, and no
+          broker owes you one.
+        </p>
+      </div>
+      <div class="risk">
+        <h3>Policies change without telling you</h3>
+        <p>
+          A broker that rounded up last quarter can settle the next split in cash. What
+          worked for the last ticker is evidence, not a promise.
+        </p>
+      </div>
+      <div class="risk">
+        <h3>The post-split price often fades</h3>
+        <p>
+          A company reverse-splitting to survive a delisting is usually not a healthy one.
+          The theoretical $5.00 can be $4.10 by the time you can actually sell it — or lower.
+        </p>
+      </div>
+      <div class="risk">
+        <h3>Some of these names barely trade</h3>
+        <p>
+          OTC tickers can have no honest quote and no real bid. A share you cannot sell is
+          not $5.00 of anything, which is why unrealized P/L is never shown anywhere in
+          this product.
+        </p>
+      </div>
+      <div class="risk">
+        <h3>Your broker's terms of service</h3>
+        <p>
+          Automating a brokerage account — including with this software — may conflict with
+          that broker's terms of service. Accounts have been restricted for less. Read them
+          and decide for yourself.
+        </p>
+      </div>
+      <div class="risk">
+        <h3>It is still the stock market</h3>
+        <p>
+          Positions can be halted, delisted, or cancelled between your buy and your sell.
+          You can lose money on any leg of this. Nothing here is investment advice.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================================= FAQ -->
+  <section class="sect">
+    <div class="sect-h reveal">
+      <div class="kicker">Loose ends</div>
+      <h2>Questions people actually ask.</h2>
+    </div>
+
+    <div class="faq reveal">
+      <details>
+        <summary>Is this legal?</summary>
+        <p>
+          Buying a share before a corporate action and selling it after is an ordinary
+          securities transaction. The mechanism is public and the outcome is decided by the
+          issuer and your broker, not by you. That said, we are software authors, not your
+          lawyers: opening accounts specifically to multiply a broker's round-up policy may
+          conflict with that broker's terms of service, and enough of it may get an account
+          closed. You are responsible for your own compliance.
+        </p>
+      </details>
+      <details>
+        <summary>Why ten brokerages instead of one big position?</summary>
+        <p>
+          Because the round-up is applied per position, not per dollar. Ten thousand shares
+          in one account rounds up to nothing extra — the fraction is what gets rounded, and
+          a big position doesn't leave one. One share in ten accounts creates ten fractions.
+          That's the whole reason the strategy is shaped this way.
+        </p>
+      </details>
+      <details>
+        <summary>Do you touch my brokerage passwords?</summary>
+        <p>
+          No. The desktop app runs on your machine, and each broker module talks only to that
+          broker's official domain. Credentials, cookies and 2FA secrets stay in your
+          <code>.env</code> and your local session files. If you pair the cloud dashboard,
+          exactly one thing uploads: your trade journal.
+        </p>
+      </details>
+      <details>
+        <summary>Why don't you show unrealized profit?</summary>
+        <p>
+          Because in this strategy it would be a lie. Half these tickers have no reliable
+          quote, and a position that hasn't settled its round-up yet has no knowable value.
+          A recorded buy matched to a confirmed sell is the only thing this product will
+          call profit.
+        </p>
+      </details>
+      <details>
+        <summary>How do you find the splits?</summary>
+        <p>
+          Reverse splits are announced ahead of the effective date in public filings. The
+          alert feed collects the tickers and dates and marks the type of each one — a
+          standard listed name, an OTC name, or a conditional alert that the automation
+          deliberately skips.
+        </p>
+      </details>
+      <details>
+        <summary>What does a bad split look like?</summary>
+        <p>
+          You buy ten shares across ten accounts for $2.50. Three brokers round up, four pay
+          cash in lieu, three round down. The three rounded-up shares open at $4.10 instead
+          of $5.00 and one of them is an OTC name with no bid until Thursday. You end the
+          week up single-digit dollars, having spent an hour on it. That is a normal outcome,
+          and it is why the tool exists — an hour is too long.
+        </p>
+      </details>
+    </div>
+  </section>
+
+  <section class="final reveal">
+    <h2>Now you know the mechanism.</h2>
+    <p>The only part left is not doing it by hand, ten times, twice, before the window closes.</p>
+    <a class="btn" href="{{ '/app' if user else '/pricing' }}">
+      {{ 'Open dashboard' if user else 'See pricing' }}
+    </a>
+  </section>
+
+  <p class="muted reveal" style="max-width:74ch;margin:44px auto 0;text-align:center;font-size:12.4px;line-height:1.65">
+    RSAMAXXED is trading automation software, not a broker, adviser, or fiduciary. This page is
+    educational: it is not investment advice and not a solicitation. Round-up treatment varies by
+    broker and by corporate action, changes without notice, and may not happen at all: you can
+    lose money. Every figure here is the arithmetic of a hypothetical split — illustrative only,
+    never a forecast, a promise, or past performance. Automating a brokerage account may conflict
+    with that broker's terms of service. You are responsible for your own trades, taxes, and
+    compliance.
+  </p>
+
+</div>
+{% endblock %}

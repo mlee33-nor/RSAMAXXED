@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% block title %}Pricing — RSAMAXXED{% endblock %}
+{% block description %}Three tiers: the alert feed on its own, the desktop automation tool for one brokerage, or mirror automation across all ten. Cancel anytime.{% endblock %}
+{% block nav_price %}on{% endblock %}
+
+{% block content %}
+<div class="wrap">
+
+  <section class="pr-hero">
+    <span class="eyebrow"><i class="pip"></i> $4.75 per account, per split · ten accounts is <b>$47.50</b></span>
+    <h1>Pay for as much of the work as you want done.</h1>
+    <p class="lede">
+      Take the alerts and trade them yourself. Or hand the whole loop — ten brokers, buy
+      and sell, journaled — to the terminal.
+    </p>
+
+    <div class="bill">
+      <span class="opt m">Monthly</span>
+      <label class="sw">
+        <input type="checkbox" id="billing">
+        <span class="track" aria-hidden="true"></span>
+        <span class="sr-only">Bill annually</span>
+      </label>
+      <span class="opt y">Annual</span>
+      <span class="save">2 months free</span>
+    </div>
+  </section>
+
+  <section class="tiers reveal">
+
+    <!-- ------------------------------------------------------ PLAYS ONLY -->
+    <div class="tier">
+      <div class="nm">Plays Only</div>
+      <p class="pitch">The alert feed, nothing else. You place the trades at your own brokers.</p>
+
+      <div class="price">
+        <span class="amt" data-monthly="Free" data-annual="Free">Free</span>
+      </div>
+      <div class="bill-note" data-monthly="No card required" data-annual="No card required">No card required</div>
+
+      <a class="btn btn-ghost btn-block" href="/signup?plan=plays">Start with Plays Only</a>
+      <p class="reassure">Free forever</p>
+
+      <ul class="feats">
+        <li class="head">What you get</li>
+        <li>Every reverse-split alert we track — <b>ticker and effective date</b></li>
+        <li>Each one classified <b>standard, OTC, or conditional</b></li>
+        <li>A split calendar, sorted by the date that matters</li>
+        <li>Web dashboard — nothing to install</li>
+        <li class="no">No desktop terminal</li>
+        <li class="no">No broker connections, no execution</li>
+      </ul>
+    </div>
+
+    <!-- -------------------------------------------------- AUTOMATION TOOL -->
+    <div class="tier star">
+      <span class="badge">Most popular</span>
+      <div class="nm">Automation Tool</div>
+      <p class="pitch">The desktop terminal places and journals the trade — in one brokerage.</p>
+
+      <div class="price">
+        <span class="amt" data-monthly="$79" data-annual="$66">$79</span>
+        <span class="per">/ month</span>
+      </div>
+      <div class="bill-note" data-monthly="Billed monthly" data-annual="$790 billed yearly">Billed monthly</div>
+
+      <a class="btn btn-block" href="/signup?plan=automation">Start with Automation</a>
+      <p class="reassure">Cancel anytime</p>
+
+      <ul class="feats">
+        <li class="head">Everything in Plays Only, plus</li>
+        <li><b>The desktop terminal</b> — runs on your machine, credentials never upload</li>
+        <li><b>One brokerage connected</b>, executing buys and sells</li>
+        <li>Order ticket with a size guard and a double-submit lock</li>
+        <li>Trade journal and <b>realized P/L</b> — never unrealized</li>
+        <li>Cloud dashboard, paired with a six-character code</li>
+        <li>CSV export of every fill</li>
+        <li class="no">No mirror fan-out across brokers</li>
+      </ul>
+    </div>
+
+    <!-- ------------------------------------------------ MIRROR AUTOMATION -->
+    <div class="tier">
+      <div class="nm">Mirror Automation</div>
+      <p class="pitch">One click fans the same order across all ten brokerages at once.</p>
+
+      <div class="price">
+        <span class="amt" data-monthly="$149" data-annual="$124">$149</span>
+        <span class="per">/ month</span>
+      </div>
+      <div class="bill-note" data-monthly="Billed monthly" data-annual="$1,490 billed yearly">Billed monthly</div>
+
+      <a class="btn btn-ghost btn-block" href="/signup?plan=mirror">Start with Mirror</a>
+      <p class="reassure">Cancel anytime</p>
+
+      <ul class="feats">
+        <li class="head">Everything in Automation Tool, plus</li>
+        <li><b>All ten brokerages</b> — Fidelity, Chase, Schwab, Robinhood, Public, SoFi, Wells Fargo, BBAE, Fennel, DSPAC</li>
+        <li><b>One-click mirror execution</b>, buy and sell, fired concurrently</li>
+        <li>Picks auto-imported from the alert feed into the trade queue</li>
+        <li>Per-pick account coverage — see which brokers are still missing a fill</li>
+        <li>Round-up radar: positions flagged as a split date approaches</li>
+        <li>Every failure surfaced with its reason, never swallowed</li>
+      </ul>
+    </div>
+  </section>
+
+  <p class="pr-note reveal">
+    Ten brokerages supported · Broker credentials never leave your computer ·
+    Only realized profit is ever counted
+  </p>
+
+  <!-- ================================================================= FAQ -->
+  <section class="sect">
+    <div class="sect-h reveal">
+      <div class="kicker">Before you pick</div>
+      <h2>Pricing questions.</h2>
+    </div>
+
+    <div class="faq reveal">
+      <details>
+        <summary>Which tier do I actually need?</summary>
+        <p>
+          If you already have brokerage accounts and don't mind clicking, <b>Plays Only</b> tells
+          you what is splitting and when. If you want a machine to place and record the trade in
+          one account, that's <b>Automation Tool</b>. If you hold accounts at several brokers —
+          which is the entire point of the strategy — <b>Mirror Automation</b> is the one that
+          matches how the trade actually works.
+        </p>
+      </details>
+      <details>
+        <summary>Do I need my own brokerage accounts?</summary>
+        <p>
+          Yes. RSAMAXXED is not a broker and never holds your money. It logs into accounts you
+          already own, on your own machine, and places orders you authorize. You open the
+          accounts; we automate the clicking.
+        </p>
+      </details>
+      <details>
+        <summary>Does the price scale with how much I make?</summary>
+        <p>
+          No. It's a flat monthly fee and we take no cut of any trade. We never see your balances
+          — only the trade journal you choose to sync, and only if you pair the dashboard.
+        </p>
+      </details>
+      <details>
+        <summary>What if a broker changes its policy or breaks the integration?</summary>
+        <p>
+          Broker modules break; unofficial interfaces change without warning. We fix them, but we
+          can't promise a given broker works on a given day, and we can't make a broker round your
+          fraction up. Read <a href="/how-it-works#risks" style="color:var(--accent)">what can go wrong</a>
+          before you subscribe — it is not a short list.
+        </p>
+      </details>
+      <details>
+        <summary>Can I switch tiers or cancel?</summary>
+        <p>
+          Switch up or down whenever you like; the change takes effect on your next billing date.
+          Cancelling stops the next charge and leaves your trade history exportable as CSV.
+        </p>
+      </details>
+      <details>
+        <summary>Which platforms does the desktop terminal run on?</summary>
+        <p>
+          Windows today. The broker automation leans on a native browser stack, so macOS and Linux
+          are not supported yet. Plays Only works in any browser.
+        </p>
+      </details>
+    </div>
+  </section>
+
+  <section class="final reveal">
+    <h2>Still deciding?</h2>
+    <p>Read the mechanism first. The pricing makes more sense once the trade does.</p>
+    <a class="btn btn-ghost" href="/how-it-works">How it works</a>
+  </section>
+
+  <p class="muted reveal" style="max-width:74ch;margin:44px auto 0;text-align:center;font-size:12.4px;line-height:1.65">
+    RSAMAXXED is trading automation software, not a broker, adviser, or fiduciary. This is
+    not investment advice and not a solicitation. Subscription fees buy access to software
+    and an alert feed — not a trading result. The $4.75 and $47.50 figures above assume one $0.25
+    share per account and a 1-for-20 split whose fraction rounds up: they are the arithmetic of a
+    hypothetical split, illustrative only, never a forecast, a promise, or past performance.
+    Round-up treatment varies by broker and by corporate action, changes without notice, and may not
+    happen at all: you can lose money. Automating a brokerage account may conflict with that
+    broker's terms of service. You are responsible for your own trades, taxes, and compliance.
+  </p>
+
+</div>
+{% endblock %}

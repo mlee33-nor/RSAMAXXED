@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Trades — RSAMAXXED{% endblock %}
+{% block nav_trades %}on{% endblock %}
+
+{% block content %}
+<div class="wrap page">
+  <div class="card reveal">
+    <div class="card-h">
+      <h3>Trade history</h3>
+      <a class="btn btn-ghost btn-sm" href="/app/trades.csv">Export CSV</a>
+    </div>
+
+    {% if not trades %}
+      <p class="muted" style="font-size:13.5px;margin:0">Nothing synced yet.</p>
+    {% else %}
+      <p class="muted" style="font-size:12.5px;margin:-8px 0 14px">
+        Showing the {{ trades | length }} most recent. Export for the full journal.
+      </p>
+      <div class="scroll-x">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Date</th><th>Side</th><th>Symbol</th>
+              <th class="num">Qty</th><th class="num">Fill</th>
+              <th>Broker</th><th>Account</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for t in trades %}
+              <tr>
+                <td class="dim num" style="white-space:nowrap">{{ t.timestamp.strftime('%Y-%m-%d') }}</td>
+                <td><span class="tag {{ t.side }}">{{ t.side | upper }}</span></td>
+                <td><b>{{ t.symbol }}</b></td>
+                <td class="num">{{ t.qty | qty }}</td>
+                <td class="num">{% if t.fill_price is none %}<span class="muted">—</span>{% else %}{{ t.fill_price | money }}{% endif %}</td>
+                <td class="dim">{{ t.broker | title }}</td>
+                <td class="muted" style="font-size:12.5px">{{ t.account_id }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

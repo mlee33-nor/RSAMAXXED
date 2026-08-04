@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — RSAMAXXED{% endblock %}
+{% block nav_dash %}on{% endblock %}
+
+{% block content %}
+<div class="wrap page">
+{% if not has_data %}
+  <div class="card empty reveal">
+    <h2>No trades synced yet</h2>
+    <p>
+      {% if linked_devices %}
+        Your desktop app is linked but hasn't pushed anything yet. It syncs on launch
+        and after every batch.
+      {% else %}
+        Link the desktop app and your trade journal appears here within seconds.
+      {% endif %}
+    </p>
+    <a class="btn" href="/app/devices">
+      {{ 'View devices' if linked_devices else 'Link a device' }}
+    </a>
+  </div>
+{% else %}
+
+  <div class="hero-pl reveal">
+    <div class="k">Net realized profit</div>
+    <div class="v num {{ 'pos' if s.realized >= 0 else 'neg' }}">{{ s.realized | money(sign=True) }}</div>
+    <div class="s">
+      {{ s.closed }} closed round-trip{{ '' if s.closed == 1 else 's' }} ·
+      {{ '%.0f' | format(s.win_rate) }}% win rate ·
+      {{ s.expectancy | money(sign=True) }} average
+    </div>
+  </div>
+
+  {% if s.zero_basis_symbols %}
+    <div class="notice warn" style="margin-top:14px">
+      <b>Heads up:</b>
+      {{ s.zero_basis_symbols | join(', ') }}
+      {{ 'was' if s.zero_basis_symbols|length == 1 else 'were' }} bought without a recorded
+      fill price, so {{ 'its' if s.zero_basis_symbols|length == 1 else 'their' }} cost basis
+      counts as $0 and the profit above is overstated by whatever you actually paid.
+      Everything else is exact.
+    </div>
+  {% endif %}
+
+  <div class="tiles">
+    <div class="tile"><div class="k">Deployed</div><div class="v num">{{ s.deployed | money }}</div></div>
+    <div class="tile"><div class="k">Open positions</div><div class="v num">{{ s.open_count }}</div></div>
+    <div class="tile"><div class="k">Accounts</div><div class="v num">{{ s.account_count }}</div></div>
+    <div class="tile"><div class="k">Trades</div><div class="v num">{{ s.trade_count }}</div></div>
+    <div class="tile">
+      <div class="k">Max drawdown</div>
+      <div class="v num {{ 'neg' if drawdown < 0 else '' }}">{{ drawdown | money }}</div>
+    </div>
+  </div>
+
+  <div class="card interactive reveal" style="margin-top:14px">
+    <div class="card-h"><h3>Cumulative realized P/L</h3></div>
+    {{ eq_svg | safe }}
+  </div>
+
+  <div class="grid-2">
+    <div class="card interactive reveal">
+      <div class="card-h"><h3>By month</h3></div>
+      {{ month_svg | safe }}
+    </div>
+    <div class="card interactive reveal">
+      <div class="card-h"><h3>By broker</h3></div>
+      {{ broker_svg | safe }}
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card interactive reveal">
+      <div class="card-h">
+        <h3>Open allocation</h3>
+        <span class="muted" style="font-size:12px">by shares</span>
+      </div>
+      {{ donut_svg | safe }}
+      {% if legend %}
+        <div class="legend">
+          {% for sym, qty, pct, color in legend %}
+            <div class="legend-row">
+              <span class="swatch" style="background:{{ color }}"></span>
+              <span class="sym">{{ sym }}</span>
+              <span class="muted num">{{ qty | qty }} sh</span>
+              <span class="dim num" style="width:54px;text-align:right">{{ '%.1f' | format(pct) }}%</span>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </div>
+
+    <div class="card interactive reveal">
+      <div class="card-h"><h3>Top symbols</h3></div>
+      <table class="table">
+        <tbody>
+          {% for sym, pl in top_symbols %}
+            <tr>
+              <td><b>{{ sym }}</b>
+                {% if sym in s.zero_basis_symbols %}<span class="tag" title="No recorded cost basis">est.</span>{% endif %}
+              </td>
+              <td class="num {{ 'pos' if pl >= 0 else 'neg' }}">{{ pl | money(sign=True) }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card reveal">
+    <div class="card-h">
+      <h3>Latest holdings snapshot</h3>
+      <a class="btn btn-ghost btn-sm" href="/app/holdings">View all</a>
+    </div>
+    {% if snapshot %}
+      <p class="dim" style="margin:0;font-size:13.5px">
+        {{ snapshot.rows | length }} rows captured
+        {{ snapshot.captured_at.strftime('%b %d, %Y at %H:%M UTC') }}.
+      </p>
+    {% else %}
+      <p class="muted" style="margin:0;font-size:13.5px">
+        No snapshot yet — the desktop app uploads one after each holdings refresh.
+      </p>
+    {% endif %}
+  </div>
+
+{% endif %}
+</div>
+{% endblock %}

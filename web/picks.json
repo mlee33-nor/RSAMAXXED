@@ -1,0 +1,42 @@
+[
+  {
+    "symbol": "DBGI",
+    "note": "Reg Alert",
+    "date": "2026-07-20"
+  },
+  {
+    "symbol": "MSS",
+    "note": "Reg Alert",
+    "date": "2026-07-20"
+  },
+  {
+    "symbol": "CLDI",
+    "note": "Reg Alert",
+    "date": "2026-07-21"
+  },
+  {
+    "symbol": "FFAI",
+    "note": "Reg Alert",
+    "date": "2026-07-21"
+  },
+  {
+    "symbol": "PMI",
+    "note": "Reg Alert",
+    "date": "2026-07-21"
+  },
+  {
+    "symbol": "MVIS",
+    "note": "Reg Alert",
+    "date": "2026-07-22"
+  },
+  {
+    "symbol": "ZNB",
+    "note": "Reg Alert",
+    "date": "2026-07-23"
+  },
+  {
+    "symbol": "SGLY",
+    "note": "Reg Alert",
+    "date": "2026-07-23"
+  }
+]

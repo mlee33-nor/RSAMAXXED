@@ -1,0 +1,44 @@
+.env
+trades.json
+*.bak
+sessions/
+__pycache__/
+*.pyc
+logs/
+CascadeProjects/
+custom_accounts.json
+mirror_state.json
+# What automation did, run by run — holds real broker account ids.
+mirror_runs.json
+discord_state.json
+watchlist.json
+*.exe
+.claude/
+
+# Holds this machine's RSAMAXXED Cloud device bearer token.
+cloud_state.json
+
+# Web app (web/)
+web/local.db
+web/.env
+
+.pytest_cache/
+
+# Local pick/feed state, same class as mirror_state.json above.
+picks_done.json
+sells.json
+lifecycle_state.json
+
+# Reference copies of other people's decompiled binaries. Kept locally for
+# study; committing them to a PUBLIC repo would republish someone else's
+# copyrighted source under our name.
+Fractional _Automation.py
+*_decompiled.py
+
+# The live pick list. It is the product; the desktop app now syncs it from the
+# authenticated cloud feed, and web/picks.json is the deliberate free-tier copy.
+picks.json
+# Spelled out rather than left to `git add -f`: the rule above matches at every
+# depth, so the free-tier copy was tracked only by historical accident and any
+# `git add -A` on a fresh branch would quietly drop it.
+!web/picks.json
