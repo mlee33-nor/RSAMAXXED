@@ -43,3 +43,7 @@ picks.json
 # seed the feed from it — the pre-ingest design. Plays reach customers over the
 # authenticated feed now, and a public repo is the one place the product must
 # not sit: anyone cloning it read the plays without subscribing.
+
+# Operator-only scheduler wrapper. Customers never publish, so this
+# stays off the public repo alongside the feed key it depends on.
+publish_feed_task.bat
