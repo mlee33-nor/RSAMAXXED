@@ -3105,25 +3105,24 @@ class App(ctk.CTk):
         self._render_pipeline()
 
         if not picks:
-            # An unlinked install has nothing to wait FOR, so saying alerts
-            # "land here automatically" reads as "sit tight" and leaves a new
-            # user staring at an empty screen indefinitely. Name the one action
-            # that fixes it, and put a button on it.
-            if not self._cloud_linked():
-                box = self._empty_state(
-                    self._picks_grid, "globe", "Link your account to get the plays",
-                    "Buy alerts, exits and the round-up board all arrive with your "
-                    "RSAMAXXED account — no Discord needed. Link this device once "
-                    "and they fill in on their own.",
-                    bg=BG_CARD, pad=18)
-                box.pack(fill="x")
-                PillButton(box, text="Link this device",
-                           command=lambda: self._show_frame("accounts"),
-                           width=150, height=32, font_size=10).pack(pady=(0, 16))
+            # Empty has two very different causes and the user can act on only
+            # one of them, so never show the same message for both: "nothing is
+            # open today" is normal, "we can't reach the feed" is a problem.
+            # There is deliberately nothing to sign up for here — the plays
+            # arrive on their own.
+            if getattr(self, "_feed_fail_streak", 0) or self._feed_last_ok is None:
+                self._empty_state(
+                    self._picks_grid, "warning", "Waiting for the play feed",
+                    "Couldn't reach the feed just now. It retries by itself "
+                    "every few minutes — nothing for you to do, and nothing to "
+                    "sign up for. Your saved plays stay put in the meantime.",
+                    bg=BG_CARD, pad=18).pack(fill="x")
             else:
                 self._empty_state(
-                    self._picks_grid, "starfill", "No active picks",
-                    "New RSA alerts land here automatically from the pick feed.",
+                    self._picks_grid, "starfill", "No open plays right now",
+                    f"Nothing is live today. New alerts land here on their own — "
+                    f"the feed is checked every hour "
+                    f"(last at {self._feed_last_ok:%H:%M}).",
                     bg=BG_CARD, pad=18).pack(fill="x")
             return
 
@@ -6476,16 +6475,6 @@ class App(ctk.CTk):
 
     # ---- RSAMAXXED Cloud sync ---------------------------------------------------
 
-    def _cloud_linked(self) -> bool:
-        """Does this machine hold a device token? Local file read, no network,
-        so it is safe to call from a render path."""
-        if not CLOUD_AVAILABLE:
-            return False
-        try:
-            return bool(cloud_sync.CloudSync().is_linked)
-        except Exception:
-            return False
-
     def _build_cloud_card(self, parent) -> None:
         """Pair this machine with an RSAMAXXED account. This is how the play
         feed reaches the terminal — buys, exits and the round-up board — as well
@@ -6512,17 +6501,16 @@ class App(ctk.CTk):
 
         info = tk.Frame(card.inner, bg=BG_INPUT, padx=16, pady=12)
         info.pack(fill="x", padx=20, pady=(4, 12))
-        # This copy used to read "optional — RSAMAXXED works exactly the same
-        # unlinked", written when the cloud was only a stats mirror. It is now
-        # how the plays themselves arrive, and telling a new user the step is
-        # optional is telling them to skip the only one that matters.
-        tk.Label(info, text="This is how you receive the plays",
+        # Be precise about what this does and does NOT gate. The plays arrive
+        # without it — claiming otherwise sends people hunting for an account
+        # they don't need when their Watchlist looks empty.
+        tk.Label(info, text="Optional — your plays already work without this",
                  bg=BG_INPUT, fg=TEXT_PRIMARY, font=(FONT_FAMILY, 10, "bold")).pack(anchor="w")
-        tk.Label(info, text="Link this machine to your RSAMAXXED account and the buy alerts, "
-                 "the exits and the round-up board arrive on their own, refreshed every hour — "
-                 "you never need to be in a Discord. Link once and you are done. It also puts "
-                 "your realized P/L and trade history on the website. Broker logins, cookies "
-                 "and 2FA secrets never leave this computer.",
+        tk.Label(info, text="Buy alerts, exits and the round-up board arrive on their own, "
+                 "refreshed every hour, with no account and no Discord. Linking is only for "
+                 "seeing your realized P/L, positions and trade history on the website — handy "
+                 "from your phone, and nothing else depends on it. Broker logins, cookies and "
+                 "2FA secrets never leave this computer.",
                  bg=BG_INPUT, fg=TEXT_SECONDARY, font=(FONT_FAMILY, 9),
                  wraplength=620, justify="left").pack(anchor="w", pady=(4, 0))
 
@@ -7890,11 +7878,11 @@ class App(ctk.CTk):
 
         if not self._track_available():
             self._empty_state(
-                self._exits_list, "warning", "No board source yet",
-                "Link this device to your RSAMAXXED account on the Brokers page "
-                "and the board arrives with your subscription — no Discord "
-                "needed. Running the feed yourself? Set "
-                "DISCORD_LIFECYCLE_CHANNEL in .env instead.").pack(fill="x")
+                self._exits_list, "warning", "No board source available",
+                "The round-up board comes down with the play feed, which needs "
+                "the 'requests' package installed — run "
+                "pip install -r requirements.txt. Running the feed yourself? "
+                "Set DISCORD_LIFECYCLE_CHANNEL in .env instead.").pack(fill="x")
             return
         if self._track_error:
             self._empty_state(
@@ -8371,8 +8359,9 @@ class App(ctk.CTk):
             return
         if not self._track_available():
             self._push_notification(
-                "Link this device to your RSAMAXXED account to receive the "
-                "board, or set DISCORD_LIFECYCLE_CHANNEL to read it directly.",
+                "Can't read the round-up board — install the requirements "
+                "(pip install -r requirements.txt), or set "
+                "DISCORD_LIFECYCLE_CHANNEL to read it from Discord directly.",
                 "warning")
             return
         self._track_busy = True

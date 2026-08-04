@@ -271,13 +271,14 @@ CONTENTS
 │            RSAMAXXED.bat
 │         (or run app.py directly for the GUI, or runner.py for CLI)
 │
-│     3.  GET THE PLAYS. Make a free account at rsamaxxed.com, then in
-│         the terminal open Brokers -> Link this device and type in the
-│         code it shows. Watchlist, Exits and the sell alerts start
-│         filling in within the hour.
+│     3.  THE PLAYS ARE ALREADY THERE. Nothing to do. No account, no
+│         sign-up, no pairing code, no API key, no Discord. The terminal
+│         downloads the buy alerts, the exits and the round-up
+│         (fractional) board on launch, then refreshes every hour while
+│         it is open.
 │
-│         This step needs no .env and no Discord. Do it first — the app
-│         is worth opening even before a single broker is connected.
+│         If the Watchlist looks empty, it is empty — not locked. The
+│         status bar bottom-right shows when the feed last arrived.
 │
 │     4.  CONNECT YOUR BROKERS. Copy .env.example to .env and fill in
 │         only the brokers you use, or enter them in the Brokers tab and
