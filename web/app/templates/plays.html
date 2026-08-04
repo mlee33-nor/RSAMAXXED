@@ -1,0 +1,242 @@
+{% extends "base.html" %}
+{% block title %}Plays — RSAMAXXED{% endblock %}
+{% block nav_plays %}on{% endblock %}
+
+{#
+  The Plays board. Two columns, and the split is the whole design:
+
+    LEFT   BUYS  — what is still open, soonest deadline first. This is a
+                   to-do list, so it is ordered by urgency, never by date.
+    RIGHT  SELLS — what has exited, newest first, grouped by day. This is a
+                   record, so it is ordered by time.
+
+  A play appears on the left while you can still act on it and on the right
+  once it has closed. Same ticker, two different jobs.
+#}
+
+{% macro kindtag(kind) -%}
+  {%- if kind == 'otc' -%}<span class="ptag otc">OTC</span>
+  {%- elif kind == 'conditional' -%}<span class="ptag cond">Conditional</span>
+  {%- else -%}<span class="ptag std">Standard</span>{%- endif -%}
+{%- endmacro %}
+
+{% macro countdown(days) -%}
+  {%- if days is none -%}<span class="cd none">no deadline</span>
+  {%- elif days < 0 -%}<span class="cd gone">closed</span>
+  {%- elif days == 0 -%}<span class="cd now">last day</span>
+  {%- elif days == 1 -%}<span class="cd soon">1 day left</span>
+  {%- elif days <= 3 -%}<span class="cd soon">{{ days }} days left</span>
+  {%- else -%}<span class="cd ok">{{ days }} days left</span>{%- endif -%}
+{%- endmacro %}
+
+{% block content %}
+<div class="wrap page">
+
+  <div class="card-h" style="margin-bottom:18px">
+    <div>
+      <h1 style="font-size:26px;letter-spacing:-.02em;margin:0">Plays</h1>
+      <p class="muted" style="font-size:13px;margin:5px 0 0">
+        Reverse-split round-up alerts, split into what's still open and what has exited.
+      </p>
+    </div>
+    <span class="eyebrow"><i class="pip"></i> {{ plan.name }}</span>
+  </div>
+
+  {% if not board.has_anything %}
+    <div class="card empty">
+      <h2>No alerts yet.</h2>
+      <p>
+        The feed publishes as alerts land. Nothing has come through in the
+        last {{ 45 }} days — this page fills itself in the moment one does.
+      </p>
+      <a class="btn btn-ghost" href="/how-it-works">What lands here</a>
+    </div>
+  {% else %}
+
+  <!-- ============================================================ SUMMARY -->
+  <div class="tiles">
+    <div class="tile">
+      <div class="k">Open now</div>
+      <div class="v num">{{ board.open_count }}</div>
+    </div>
+    <div class="tile{% if board.urgent %} hot{% endif %}">
+      <div class="k">Closing ≤ 2 days</div>
+      <div class="v num">{{ board.urgent | length }}</div>
+    </div>
+    <div class="tile">
+      <div class="k">Exits, 45 days</div>
+      <div class="v num">{{ board.exit_count }}</div>
+    </div>
+    <div class="tile">
+      <div class="k">Round-ups confirmed</div>
+      <div class="v num">{{ board.roundup_symbols | length }}</div>
+    </div>
+  </div>
+
+  <!-- ============================================================== BOARD -->
+  <div class="board">
+
+    <!-- ------------------------------------------------------------ BUYS -->
+    <section class="card side buys">
+      <div class="card-h">
+        <h3><span class="sd buy" aria-hidden="true"></span>Open plays</h3>
+        <span class="muted" style="font-size:12px">soonest deadline first</span>
+      </div>
+
+      {% if not board.open_plays %}
+        <p class="muted" style="font-size:13.5px;margin:0">
+          Nothing open. Every alert in the window has passed its last buy date.
+        </p>
+      {% else %}
+        <ul class="plist">
+          {% for l in board.open_plays %}
+            {% set p = l.play %}
+            <li class="prow {{ l.stage }}{% if not p.is_actionable %} watch{% endif %}">
+              <div class="prow-top">
+                <b class="sym">{{ p.symbol }}</b>
+                {{ kindtag(p.kind) }}
+                {% if l.rounded_up %}<span class="ptag ru" title="This ticker's fraction rounded up">rounded up</span>{% endif %}
+                <span class="spacer"></span>
+                {{ countdown(p.days_left()) }}
+              </div>
+
+              {% if p.ratio or p.entry_price is not none or p.est_profit is not none or p.last_buy_date %}
+              <div class="prow-facts">
+                <span class="f"><i>Ratio</i><b>{{ p.ratio or '—' }}</b></span>
+                <span class="f"><i>Entry</i><b>{% if p.entry_price is none %}—{% else %}{{ p.entry_price | price }}{% endif %}</b></span>
+                <span class="f"><i>Est / acct</i><b class="pos">{% if p.est_profit is none %}—{% else %}{{ p.est_profit | money }}{% endif %}</b></span>
+                <span class="f"><i>Last buy</i><b>{{ p.last_buy_date or '—' }}</b></span>
+              </div>
+              {% endif %}
+
+              <div class="prow-foot">
+                <span class="muted">Alerted {{ p.alert_date }}</span>
+                {% if p.strategy %}<span class="muted">· {{ p.strategy }}</span>{% endif %}
+                {% if p.roundup_history and p.roundup_history != 'N/A' %}
+                  <span class="muted">· history: {{ p.roundup_history }}</span>
+                {% endif %}
+                {% if not p.is_actionable %}
+                  <span class="warn-note">watch only — the split isn't declared yet</span>
+                {% endif %}
+              </div>
+            </li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+
+      {% if board.closed_plays %}
+        <details class="closed-fold">
+          <summary>{{ board.closed_plays | length }} recently closed</summary>
+          <ul class="plist tight">
+            {% for l in board.closed_plays %}
+              {% set p = l.play %}
+              <li class="prow past">
+                <div class="prow-top">
+                  <b class="sym">{{ p.symbol }}</b>
+                  {{ kindtag(p.kind) }}
+                  {% if l.rounded_up %}<span class="ptag ru">rounded up</span>{% endif %}
+                  <span class="spacer"></span>
+                  <span class="cd gone">closed {{ p.last_buy_date or p.alert_date }}</span>
+                </div>
+                <div class="prow-facts">
+                  <span class="f"><i>Ratio</i><b>{{ p.ratio or '—' }}</b></span>
+                  <span class="f"><i>Entry</i><b>{% if p.entry_price is none %}—{% else %}{{ p.entry_price | price }}{% endif %}</b></span>
+                  {% if l.exits %}
+                    <span class="f"><i>Exited</i><b class="pos">{{ l.exits | length }}×</b></span>
+                  {% endif %}
+                </div>
+              </li>
+            {% endfor %}
+          </ul>
+        </details>
+      {% endif %}
+    </section>
+
+    <!-- ----------------------------------------------------------- SELLS -->
+    <section class="card side sells">
+      <div class="card-h">
+        <h3><span class="sd sell" aria-hidden="true"></span>Exits</h3>
+        <span class="muted" style="font-size:12px">newest first</span>
+      </div>
+
+      {% if not board.exits %}
+        <p class="muted" style="font-size:13.5px;margin:0">
+          No exits in the last 45 days.
+        </p>
+      {% else %}
+        {% for day, rows in board.exits_by_date.items() %}
+          <div class="daygroup">
+            <div class="dayhead"><span>{{ day }}</span><i></i></div>
+            <ul class="plist">
+              {% for e in rows %}
+                <li class="prow exit">
+                  <div class="prow-top">
+                    <b class="sym">{{ e.symbol }}</b>
+                    {% if e.symbol in board.roundup_symbols %}
+                      <span class="ptag ru">rounded up</span>
+                    {% endif %}
+                    <span class="spacer"></span>
+                    <b class="proceeds pos">
+                      {%- if e.proceeds_low is none -%}—
+                      {%- elif e.is_range -%}+{{ e.proceeds_low | money }}–{{ e.proceeds_high | money }}
+                      {%- else -%}+{{ e.proceeds_low | money }}{%- endif -%}
+                    </b>
+                  </div>
+
+                  <div class="prow-facts">
+                    <span class="f"><i>Sold at</i><b>{% if e.exit_price is none %}—{% else %}{{ e.exit_price | price }}{% endif %}</b></span>
+                    <span class="f"><i>Accounts</i><b>{{ e.accounts or '—' }}</b></span>
+                  </div>
+
+                  {% if e.legs %}
+                    <div class="legs">
+                      {% for leg in e.legs %}
+                        <span class="leg">{{ leg.broker }}
+                          <b>×{% if leg.accounts_high > leg.accounts_low %}{{ leg.accounts_low }}–{{ leg.accounts_high }}{% else %}{{ leg.accounts_low }}{% endif %}</b>
+                        </span>
+                      {% endfor %}
+                    </div>
+                  {% endif %}
+
+                  {% if e.note %}
+                    <p class="exit-note">{{ e.note }}</p>
+                  {% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          </div>
+        {% endfor %}
+      {% endif %}
+    </section>
+  </div>
+  {% endif %}
+
+  <!-- ============================================================== UPSELL -->
+  {% if not can_automate %}
+    <div class="card upsell">
+      <div>
+        <h3>You're placing these by hand.</h3>
+        <p class="dim">
+          Automation runs the same list in your own brokerage accounts — places the
+          buy, records the fill, and journals the sell. Your logins stay on your machine.
+        </p>
+      </div>
+      <a class="btn" href="/pricing">See Automation</a>
+    </div>
+  {% else %}
+    <p class="muted" style="font-size:12.5px;margin-top:18px">
+      Your terminal pulls this same list automatically. Alerts sync into the trade
+      queue; nothing here needs copying by hand.
+    </p>
+  {% endif %}
+
+  <p class="muted" style="max-width:78ch;margin:26px auto 0;text-align:center;font-size:12.4px;line-height:1.65">
+    Alerts are information, not advice, and not a recommendation to trade. Prices and
+    estimates are quoted as the feed published them and are stale the moment they post.
+    Round-up treatment varies by broker and by corporate action, changes without notice,
+    and may not happen at all: you can lose money. A confirmed round-up on one ticker
+    never implies the next one behaves the same way.
+  </p>
+
+</div>
+{% endblock %}

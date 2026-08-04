@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Create account — RSAMAXXED{% endblock %}
+
+{% block content %}
+<div class="auth">
+  <aside class="aside">
+    <span class="eyebrow"><i class="pip"></i> Thirty seconds to linked</span>
+    <h2>Create an account. Pair your terminal. Watch it fill.</h2>
+    <p class="quote">
+      One build for everyone — no license file, no secret compiled into the app.
+      Your desktop shows a six-character code; you type it here; the two are bound.
+    </p>
+    <div class="mini-stat">
+      <div class="s"><div class="v num">1</div><div class="k">Click per play</div></div>
+      <div class="s"><div class="v num">10</div><div class="k">Accounts at once</div></div>
+      <div class="s"><div class="v num">100%</div><div class="k">Realized-only</div></div>
+    </div>
+  </aside>
+
+  <div class="pane">
+    <form method="post" action="/signup">
+      <h1>Create your account</h1>
+      <p class="sub">
+        {% if chosen and chosen.key == 'automation' %}
+          Then pair your terminal with a six-character code.
+        {% else %}
+          The alert feed opens the moment you're in.
+        {% endif %}
+      </p>
+
+      {% if error %}<div class="notice err">{{ error }}</div>{% endif %}
+
+      {% if chosen %}
+        <div class="notice ok" style="display:flex;justify-content:space-between;gap:12px;align-items:center">
+          <span><b>{{ chosen.name }}</b> — {{ 'Free' if chosen.monthly == 0 else '$' ~ chosen.monthly ~ '/mo' }}</span>
+          <a href="/pricing" style="color:inherit;opacity:.75;font-size:12.5px">change</a>
+        </div>
+      {% endif %}
+
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="plan" value="{{ plan_key or 'plays' }}">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email" required
+             value="{{ email or '' }}" autofocus placeholder="you@example.com">
+
+      <label for="password">Password <span class="muted">— at least 10 characters</span></label>
+      <input id="password" name="password" type="password" autocomplete="new-password"
+             minlength="10" required placeholder="••••••••••">
+
+      {% if invite_required %}
+        <label for="invite">Invite code</label>
+        <input id="invite" name="invite" type="text" required>
+      {% endif %}
+
+      <button class="btn btn-block" type="submit">Create account</button>
+      <p class="alt">Already have one? <a href="/login">Sign in</a></p>
+    </form>
+  </div>
+</div>
+{% endblock %}

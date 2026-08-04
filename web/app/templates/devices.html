@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Devices — RSAMAXXED{% endblock %}
+{% block nav_dev %}on{% endblock %}
+
+{% block content %}
+<div class="wrap page">
+  {% if welcome %}
+    <div class="notice ok">Account created. Link your desktop app below to start syncing.</div>
+  {% endif %}
+  {% if flash %}
+    <div class="notice {{ flash_kind }}">{{ flash }}</div>
+  {% endif %}
+
+  <div class="grid-2">
+    <div class="card interactive reveal">
+      <div class="card-h"><h3>Link a device</h3></div>
+
+      <ol class="steps">
+        <li>Open the <b>RSAMAXXED desktop app</b>.</li>
+        <li>Go to <b>Automation → RSAMAXXED Cloud</b> and press <b>Generate code</b>.</li>
+        <li>Type the six characters below. The code expires after ten minutes.</li>
+      </ol>
+
+      <form method="post" action="/app/devices/claim">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input class="code-input" name="code" type="text" inputmode="latin"
+               autocapitalize="characters" autocomplete="off" spellcheck="false"
+               maxlength="8" placeholder="K7M2QX" required aria-label="Pairing code">
+        <button class="btn btn-block" type="submit" style="margin-top:16px">Link device</button>
+      </form>
+    </div>
+
+    <div class="card interactive reveal">
+      <div class="card-h">
+        <h3>Linked devices</h3>
+        <span class="muted" style="font-size:12px">
+          {{ devices | selectattr('is_active') | list | length }} active
+        </span>
+      </div>
+
+      {% if not devices %}
+        <p class="muted" style="font-size:13.5px;margin:0">
+          Nothing linked yet. Pair your first machine on the left.
+        </p>
+      {% else %}
+        {% for d in devices %}
+          <div class="device-row">
+            <span class="dot {{ 'live' if d.is_active else 'dead' }}"></span>
+            <div class="grow">
+              <div class="nm">{{ d.name }}</div>
+              <div class="muted" style="font-size:12.5px">
+                {% if not d.is_active %}
+                  Revoked {{ d.revoked_at.strftime('%b %d, %Y') }}
+                {% elif d.last_seen_at %}
+                  Last synced {{ d.last_seen_at.strftime('%b %d, %Y · %H:%M UTC') }}
+                {% else %}
+                  Linked, waiting for first sync
+                {% endif %}
+              </div>
+            </div>
+            {% if d.is_active %}
+              <form method="post" action="/app/devices/{{ d.id }}/revoke" class="inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="btn btn-danger btn-sm" type="submit">Revoke</button>
+              </form>
+            {% endif %}
+          </div>
+        {% endfor %}
+      {% endif %}
+
+      <p class="muted" style="font-size:12.5px;margin-top:18px">
+        Revoking kills that machine's token immediately. Trades it already synced stay in
+        your history.
+      </p>
+    </div>
+  </div>
+</div>
+{% endblock %}

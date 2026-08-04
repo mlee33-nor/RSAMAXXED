@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#05060a">
+<title>{% block title %}RSAMAXXED{% endblock %}</title>
+<meta name="description" content="{% block description %}RSAMAXXED automates reverse-split round-up trades across ten brokerages at once. Realized profit only. Credentials never leave your machine.{% endblock %}">
+<link rel="stylesheet" href="/static/css/site.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%237c78ff'/><path d='M9 20l5-8 4 5 5-8' stroke='%23fff' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+</head>
+<body class="{% block body_class %}{% endblock %}">
+
+<div class="backdrop" aria-hidden="true">
+  <div class="aurora-wrap"><div class="aurora"></div></div>
+  <div class="grid"></div>
+  <div class="grid-spot"></div>
+  <div class="vig"></div>
+</div>
+<div class="spotlight" aria-hidden="true"></div>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="/">
+      <span class="mark" aria-hidden="true"></span>
+      <span>RSA<b>MAXXED</b></span>
+    </a>
+
+    <nav class="navlinks">
+      {% if user %}
+        {# Plays leads: it is the product on every tier, and the only page a
+           Plays Only customer has any reason to open. #}
+        <a href="/app/plays" class="{% block nav_plays %}{% endblock %}">Plays</a>
+        <a href="/app" class="{% block nav_dash %}{% endblock %}">Dashboard</a>
+        <a href="/app/trades" class="opt-md {% block nav_trades %}{% endblock %}">Trades</a>
+        <a href="/app/holdings" class="opt-md {% block nav_hold %}{% endblock %}">Holdings</a>
+        <a href="/app/devices" class="{% block nav_dev %}{% endblock %}">Devices</a>
+        <form method="post" action="/logout" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="linkish" type="submit">Sign out</button>
+        </form>
+      {% else %}
+        {# On phones the row sheds the optional links (opt-md/opt-sm) so it fits
+           one line inside the bar; both stay reachable from the hero CTA/footer. #}
+        <a href="/how-it-works" class="opt-md {% block nav_how %}{% endblock %}">How it works</a>
+        <a href="/pricing" class="{% block nav_price %}{% endblock %}">Pricing</a>
+        <a href="/login" class="opt-sm">Sign in</a>
+        <a href="/pricing" class="btn btn-sm">Get started</a>
+      {% endif %}
+    </nav>
+  </div>
+</header>
+
+<main>{% block content %}{% endblock %}</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <span>RSAMAXXED — reverse-split round-up trading, automated.</span>
+    <span class="muted">
+      <a href="/how-it-works">How it works</a> ·
+      <a href="/pricing">Pricing</a> ·
+      Broker credentials never leave your computer.
+    </span>
+  </div>
+</footer>
+
+<script src="/static/js/site.js" defer></script>
+</body>
+</html>

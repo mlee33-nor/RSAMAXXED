@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Holdings — RSAMAXXED{% endblock %}
+{% block nav_hold %}on{% endblock %}
+
+{% block content %}
+<div class="wrap page">
+{% if not snapshot %}
+  <div class="card empty reveal">
+    <h2>No holdings snapshot yet</h2>
+    <p>
+      The desktop app uploads a snapshot each time it refreshes holdings across your
+      brokers. Run a refresh and it will show up here.
+    </p>
+    <a class="btn btn-ghost" href="/app">Back to dashboard</a>
+  </div>
+{% else %}
+  <div class="card reveal">
+    <div class="card-h">
+      <h3>Holdings</h3>
+      <span class="muted" style="font-size:12px">
+        captured {{ snapshot.captured_at.strftime('%b %d, %Y · %H:%M UTC') }}
+      </span>
+    </div>
+    <p class="muted" style="font-size:12.5px;margin:-8px 0 0">
+      A point-in-time mirror of what each broker reported. Live prices are not profit —
+      see the dashboard for realized P/L.
+    </p>
+  </div>
+
+  {% for (broker, account), rows in by_account.items() %}
+    <div class="card interactive reveal">
+      <div class="card-h">
+        <h3>{{ broker | title }} <span class="muted">· {{ account }}</span></h3>
+        <span class="muted num" style="font-size:12px">{{ rows | length }} position{{ '' if rows|length == 1 else 's' }}</span>
+      </div>
+      <div class="scroll-x">
+        <table class="table">
+          <thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Value</th></tr></thead>
+          <tbody>
+            {% for r in rows %}
+              <tr>
+                <td><b>{{ r.symbol }}</b></td>
+                <td class="num">{{ r.qty | qty }}</td>
+                <td class="num">{% if r.value is none %}<span class="muted">—</span>{% else %}{{ r.value | money }}{% endif %}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% endfor %}
+{% endif %}
+</div>
+{% endblock %}

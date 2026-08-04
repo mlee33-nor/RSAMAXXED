@@ -1,0 +1,304 @@
+{% extends "base.html" %}
+{% block title %}RSAMAXXED — 25¢ in, $5 out. Reverse-split round-ups, ten accounts at once.{% endblock %}
+{% block description %}A reverse split turns your share into a fraction. Brokers that round the fraction up hand back a whole share worth twenty times what you paid. RSAMAXXED runs that trade across ten brokerages at once and counts only realized profit.{% endblock %}
+
+{% block content %}
+<div class="wrap">
+
+  <!-- ===================================================== HERO / THE ENGINE -->
+  <section class="hero">
+    <span class="eyebrow"><i class="pip"></i> One 1-for-20 split · ten accounts · <b>$47.50</b></span>
+
+    <h1>25¢ goes in.<br><span class="grad">$5.00 comes out.</span></h1>
+
+    <p class="lede">
+      A reverse split rounds your fraction of a share up to a whole one — worth about 20×
+      what you paid. RSAMAXXED runs that trade across ten accounts at once, and counts
+      only what actually clears.
+    </p>
+
+    <div class="cta">
+      {% if user %}
+        <a class="btn" href="/app">Open my dashboard</a>
+      {% else %}
+        <a class="btn" href="/pricing">Start collecting the spread</a>
+      {% endif %}
+      <a class="btn btn-ghost" href="/how-it-works">Show me the math</a>
+    </div>
+
+    <!-- Not a screenshot. All three sliders drive the real arithmetic. -->
+    <div class="engine reveal">
+      <div class="engine-bar">
+        <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="title">round-up engine · illustrative</span>
+      </div>
+
+      <div class="engine-body">
+        <canvas id="roundup" role="img"
+                aria-label="Simulation: one share in each account collapses to a fraction after a reverse split, then rounds up to a whole share worth twenty times as much."></canvas>
+
+        <aside class="engine-side">
+          <div class="ctrl">
+            <label for="r-price">Entry price <b id="r-price-out">$0.25</b></label>
+            <input id="r-price" type="range" min="5" max="200" value="25" step="5">
+          </div>
+          <div class="ctrl">
+            <label for="r-ratio">Split ratio <b id="r-ratio-out">1-for-20</b></label>
+            <input id="r-ratio" type="range" min="2" max="50" value="20" step="1">
+          </div>
+          <div class="ctrl">
+            <label for="r-accts">Accounts <b id="r-accts-out">10</b></label>
+            <input id="r-accts" type="range" min="1" max="55" value="10" step="1">
+          </div>
+
+          <div class="readout">
+            <div class="k">You keep</div>
+            <div class="v pos num" id="r-profit">+$47.50</div>
+            <div class="sub" id="r-sub"></div>
+            <div class="post"><span>Post-split share</span><b id="r-post">$5.00</b></div>
+          </div>
+        </aside>
+      </div>
+
+      <div class="engine-note" id="r-phase">10 accounts · 1 share each @ $0.25</div>
+    </div>
+
+    <p class="muted" style="margin-top:16px;font-size:12.4px">
+      Illustrative example. It assumes the fraction rounds up and the whole share sells near
+      its post-split mark. Neither is promised — see <a href="/how-it-works#risks" style="color:var(--accent)">what can go wrong</a>.
+    </p>
+  </section>
+
+  <!-- ============================================================ THE PROOF -->
+  <section class="proof reveal">
+    <div class="cell">
+      <div class="v num pos"><span data-count-to="4.75" data-count-dp="2" data-count-pre="$">0</span></div>
+      <div class="k">Booked per account, per split</div>
+    </div>
+    <div class="cell">
+      <div class="v num pos"><span data-count-to="20" data-count-post="×">0</span></div>
+      <div class="k">What the surviving share is worth</div>
+    </div>
+    <div class="cell">
+      <div class="v num"><span data-count-to="10">0</span></div>
+      <div class="k">Accounts firing at once</div>
+    </div>
+    <div class="cell">
+      <div class="v num"><span data-count-to="0" data-count-pre="$">0</span></div>
+      <div class="k">Credentials ever uploaded</div>
+    </div>
+  </section>
+
+  <!-- ========================================================== WHERE THE $ -->
+  <section class="sect" id="math">
+    <div class="sect-h reveal">
+      <div class="kicker">Where the money comes from</div>
+      <h2>Nobody is predicting anything.</h2>
+      <p>
+        This isn't a bet on a stock going up. It's a rounding rule, written into how
+        brokers settle fractional shares. It pays the same whether the market is green
+        or red that week.
+      </p>
+    </div>
+
+    <div class="steps-lp stagger">
+      <div class="card interactive reveal" style="--i:0">
+        <div class="n">01 / YOU SPEND 25¢</div>
+        <h3>One share. Every account.</h3>
+        <p>
+          A company trading under a dollar announces a 1-for-20 reverse split to keep its
+          listing. You buy a single share in each brokerage you hold — pocket change apiece.
+          RSAMAXXED places all ten orders in parallel and journals every fill.
+        </p>
+      </div>
+      <div class="card interactive reveal" style="--i:1">
+        <div class="n">02 / IT SHRINKS</div>
+        <h3>Your share becomes a sliver.</h3>
+        <p>
+          On the effective date, twenty old shares collapse into one new share. You held
+          one. Now you hold five hundredths of one. On paper, you own a fraction of a company.
+        </p>
+      </div>
+      <div class="card interactive reveal" style="--i:2">
+        <div class="n">03 / YOU KEEP $4.75</div>
+        <h3>The broker makes you whole.</h3>
+        <p>
+          Rather than settle a fraction, some brokers round you up to a full share — now
+          marked near twenty times what you paid. You sell it. The difference is money that
+          did not exist ten seconds ago.
+        </p>
+      </div>
+    </div>
+
+    <p class="dim reveal" style="text-align:center;margin-top:30px;font-size:14px;max-width:64ch;margin-inline:auto">
+      Not every broker rounds up, and not every split qualifies. That is precisely why you
+      run it across ten of them at once — and why RSAMAXXED only counts a sale that actually
+      cleared. <a href="/how-it-works" style="color:var(--accent)">See the full mechanism →</a>
+    </p>
+  </section>
+
+  <!-- ============================================================== FAN-OUT -->
+  <section class="sect">
+    <div class="sect-h reveal">
+      <div class="kicker">Mirror execution</div>
+      <h2>One click. Ten paydays.</h2>
+      <p>
+        Placing the same trade by hand across ten brokerages takes twenty minutes, a
+        spreadsheet, and a mistake. RSAMAXXED fires them concurrently and reconciles every
+        fill. Press the button and watch the money land.
+      </p>
+    </div>
+
+    <div class="card mirror reveal">
+      <div class="mirror-stage">
+        <div class="mirror-fire">
+          <button class="btn" id="fire" type="button">
+            <span class="lg">Execute BUY · 1 share × 10 accounts</span>
+            <span class="sm">Execute BUY · 10 accounts</span>
+          </button>
+        </div>
+
+        <div class="fan-wrap">
+          <svg id="fanout" class="fanout" aria-hidden="true">
+            <defs>
+              <linearGradient id="wireGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#7c78ff"/>
+                <stop offset="100%" stop-color="#34d39e"/>
+              </linearGradient>
+            </defs>
+          </svg>
+
+          <div class="brokers">
+            <div class="bnode">Fidelity<span class="st">idle</span></div>
+            <div class="bnode">Chase<span class="st">idle</span></div>
+            <div class="bnode">Schwab<span class="st">idle</span></div>
+            <div class="bnode">Robinhood<span class="st">idle</span></div>
+            <div class="bnode">Public<span class="st">idle</span></div>
+            <div class="bnode">SoFi<span class="st">idle</span></div>
+            <div class="bnode">Wells Fargo<span class="st">idle</span></div>
+            <div class="bnode">BBAE<span class="st">idle</span></div>
+            <div class="bnode">Fennel<span class="st">idle</span></div>
+            <div class="bnode">DSPAC<span class="st">idle</span></div>
+          </div>
+        </div>
+
+        <div class="fan-total">
+          <span class="k">Booked this split</span>
+          <span class="v pos num" id="fan-sum">+$0.00</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================================================== HONEST P/L -->
+  <section class="sect">
+    <div class="sect-h reveal">
+      <div class="kicker">Your money, counted honestly</div>
+      <h2>We only show you profit you can spend.</h2>
+      <p>
+        Most portfolio tools flatter you with unrealized gains. In this strategy that
+        number isn't optimistic — it's fiction with decimals.
+      </p>
+    </div>
+
+    <div class="feat stagger">
+      <div class="card interactive reveal" style="--i:0">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><path d="M21 7v6h-6"/></svg></div>
+        <h3>Realized profit, or nothing</h3>
+        <p>
+          A recorded buy matched to a confirmed sell. That is the only thing RSAMAXXED will
+          ever call profit. Not every name rounds up, and half these tickers have no
+          honest quote at all — so a live-price P/L would be a story, not a number.
+        </p>
+      </div>
+      <div class="card interactive reveal" style="--i:1">
+        <div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></div>
+        <h3>Ten brokerages, one button</h3>
+        <p>
+          Mirror trading fans a single order across every linked account simultaneously,
+          then tells you exactly which ones filled, which didn't, and why. Failures are
+          recorded, never swallowed.
+        </p>
+      </div>
+      <div class="card interactive reveal" style="--i:2">
+        <div class="ico"><svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div>
+        <h3>Your logins never leave the machine</h3>
+        <p>
+          Every broker module talks only to that broker's own domain. Passwords, cookies
+          and 2FA secrets never touch our servers. Link the dashboard and exactly one
+          thing uploads: the trade journal.
+        </p>
+      </div>
+      <div class="card interactive reveal" style="--i:3">
+        <div class="ico"><svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2.5"/><path d="M11 18h2"/></svg></div>
+        <h3>Watch it add up from anywhere</h3>
+        <p>
+          Pair the desktop app with a six-character code and your realized P/L, open
+          positions and full history follow you to any browser. Lose the laptop, revoke
+          the device, keep the money.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================== PAIRING -->
+  <section class="sect">
+    <div class="sect-h reveal">
+      <div class="kicker">Link up</div>
+      <h2>Thirty seconds from install to dashboard.</h2>
+      <p>No license files. No per-machine installers. No secrets baked into the build.</p>
+    </div>
+
+    <div class="steps-lp stagger">
+      <div class="card interactive reveal" style="--i:0">
+        <div class="n">STEP 01</div>
+        <h3>Create an account</h3>
+        <p class="dim">An email and a password. That is the entire signup.</p>
+      </div>
+      <div class="card interactive reveal" style="--i:1">
+        <div class="n">STEP 02</div>
+        <h3>Press “Link to Cloud”</h3>
+        <p class="dim">The desktop app shows six characters, good for ten minutes.</p>
+      </div>
+      <div class="card interactive reveal" style="--i:2">
+        <div class="n">STEP 03</div>
+        <h3>Type them here</h3>
+        <p class="dim">Your journal syncs, and keeps syncing after every trade.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================== BROKERS -->
+  <section class="sect">
+    <div class="sect-h reveal">
+      <div class="kicker">Coverage</div>
+      <h2>Ten brokerages. Ten shots at the same rounding.</h2>
+      <p>Each module speaks only to its broker's official domain. Nothing is proxied through us.</p>
+    </div>
+    <div class="broker-chips reveal">
+      <span>BBAE</span><span>Chase</span><span>DSPAC</span><span>Fennel</span><span>Fidelity</span>
+      <span>Public</span><span>Robinhood</span><span>Schwab</span><span>SoFi</span><span>Wells Fargo</span>
+    </div>
+  </section>
+
+  <!-- ================================================================= FINAL -->
+  <section class="final reveal">
+    <h2>The rounding is already happening.</h2>
+    <p>It's happening in ten accounts you already have. You're just not collecting it yet.</p>
+    <a class="btn" href="{{ '/app' if user else '/signup' }}">
+      {{ 'Open dashboard' if user else 'Start collecting' }}
+    </a>
+  </section>
+
+  <p class="muted reveal" style="max-width:74ch;margin:44px auto 0;text-align:center;font-size:12.4px;line-height:1.65">
+    RSAMAXXED is trading automation software, not a broker, adviser, or fiduciary. This is
+    not investment advice and not a solicitation. Round-up treatment varies by broker and
+    by corporate action, changes without notice, and may not happen at all: you can lose money.
+    Figures on this page are the arithmetic of a hypothetical split — illustrative only, never
+    a forecast, a promise, or past performance. Automating a brokerage account may conflict
+    with that broker's terms of service. You are responsible for your own trades, taxes,
+    and compliance.
+  </p>
+
+</div>
+{% endblock %}
