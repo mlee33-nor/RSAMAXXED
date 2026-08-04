@@ -13,6 +13,7 @@ import builtins
 import importlib
 import json
 import os
+import queue
 import re
 import threading
 import tkinter as tk
@@ -1074,6 +1075,10 @@ def _fetch_quick_picks() -> List[Dict[str, str]]:
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
+        # First, because the `after` override below reads it and a worker can
+        # hand back work before the rest of __init__ has finished.
+        self._ui_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._ui_pump_id: Optional[str] = None
         self.title("RSAMAXXED Terminal — Multi-Broker Execution")
         # Windows shows the default Python feather without this. Best-effort:
         # a missing icon must never stop the terminal from opening.
@@ -1133,11 +1138,56 @@ class App(ctk.CTk):
         self._show_frame("dashboard")
 
         self._tick_clock()
+        # Drains work a background thread could not hand to Tk directly. Must be
+        # running before the first worker starts — see `after` below.
+        self.after(120, self._ui_pump)
         self.after(300, self._start_quote_loop)
         # Auto-refresh non-browser brokers on startup (browser brokers need manual bootstrap)
         self.after(700, self._startup_refresh)
         # TRACK board: runs on its own hourly timer, not the Discord toggle.
         self.after(2500, self._track_loop)
+
+    # ---- Worker -> UI handoff ----------------------------------------------
+
+    def after(self, ms, func=None, *args):
+        """Tk's `after`, made safe to call from a worker thread.
+
+        `_tkinter` lets a non-main thread register a callback only while the
+        interpreter is actively dispatching; it waits about a second and then
+        raises RuntimeError("main thread is not in main loop"). Startup renders
+        for longer than that, so a worker that finished quickly — which is
+        exactly what happens on a fresh install, where there are no cached picks
+        to fetch and no quotes to look up — had its `after` call raise, and the
+        exception killed the thread. The first pick render and the first quote
+        refresh were dropped on the floor, leaving a new user staring at an
+        empty Watchlist with nothing in the log to explain it.
+
+        Rather than lose the update, hand it to a queue the main thread drains
+        (`_ui_pump`). Ordering is preserved and the callback runs as soon as the
+        event loop is free. Calls from the main thread take the normal path, so
+        timers and their return ids behave exactly as before.
+        """
+        if threading.current_thread() is threading.main_thread():
+            return super().after(ms, func, *args)
+        try:
+            return super().after(ms, func, *args)
+        except RuntimeError:
+            if callable(func):
+                self._ui_queue.put((func, args))
+            return None
+
+    def _ui_pump(self) -> None:
+        """Main-thread drain for work handed over by `after` above."""
+        while True:
+            try:
+                func, args = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                func(*args)
+            except Exception as exc:      # one bad callback must not stop the pump
+                self._log(f"UI update failed: {exc}", "warn")
+        self._ui_pump_id = super().after(100, self._ui_pump)
 
     # ---- Shell scaffolding ------------------------------------------------
 
