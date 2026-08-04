@@ -523,22 +523,19 @@ def fetch(channel_id: str, token: str, *, limit: int = 5) -> tuple[list[Lifecycl
 
 
 def fetch_cloud() -> tuple[list[LifecycleRow], str]:
-    """The board from the authenticated feed. (rows, error).
+    """The board from the cloud feed. (rows, error).
 
-    The route that works for an actual customer. Reading TRACK off Discord
-    needs a personal user token with access to a private channel, which is
-    something only the operator has — everyone who pays for this gets the board
-    through the cloud instead.
+    The route that works for an actual customer, and it needs no account.
+    Reading TRACK off Discord needs a personal user token with access to a
+    private channel, which is something only the operator has — everyone else
+    gets the board from the cloud, linked or not.
     """
     try:
         import cloud_sync
     except Exception:
         return [], "cloud sync unavailable"
     try:
-        client = cloud_sync.CloudSync()
-        if not client.is_linked:
-            return [], "not linked to an account"
-        raw = client.fetch_lifecycle()
+        raw = cloud_sync.CloudSync().fetch_lifecycle()
     except Exception as exc:
         return [], str(exc)[:160]
 
@@ -551,26 +548,29 @@ def pull(channel_id: str = "", token: str = "",
          prefer_cloud: bool = True) -> tuple[list[LifecycleRow], list[Transition], str]:
     """One full cycle: fetch, diff against stored state, persist, report.
 
-    Reads the cloud first and falls back to Discord. That order matters: the
-    cloud works for everyone, Discord works only for whoever holds a token with
-    access to the channel. Falling back the other way would make the operator's
-    machine the only one that ever worked, which is the bug this exists to fix.
+    Source order depends on which machine this is, and it has to:
+
+      OPERATOR (a TRACK channel is configured) reads Discord first. Discord is
+        the source of truth for the board, and this machine is the one that
+        publishes it. Reading the cloud first here was a feedback loop — we'd
+        read back what we last published, find rows, never fall through to
+        Discord, and the board would freeze at whatever it said the first time.
+      EVERYONE ELSE reads the cloud, which is the only source they have. There
+        is no account needed for it; see fetch_cloud.
 
     Serialised on a lock so a manual refresh racing the background poll can't
     interleave two read-modify-writes and lose a transition.
     """
     rows: list[LifecycleRow] = []
     err = ""
-    if prefer_cloud:
-        rows, err = fetch_cloud()
-    if not rows:
-        if not channel_id:
-            return [], [], err or "no board source configured"
-        rows, discord_err = fetch(channel_id, token)
+    if channel_id:
+        rows, err = fetch(channel_id, token)
+    if not rows and prefer_cloud:
+        rows, cloud_err = fetch_cloud()
         if not rows:
-            # Report the cloud's reason when there was one — "not linked" is a
-            # far more actionable message than a Discord permission error.
-            return [], [], err or discord_err
+            return [], [], err or cloud_err
+    if not rows:
+        return [], [], err or "no board source configured"
 
     with _lock:
         state = load_state(path)

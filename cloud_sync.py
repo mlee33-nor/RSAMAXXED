@@ -379,9 +379,19 @@ class CloudSync:
         return data if isinstance(data, list) else []
 
     def _get(self, path: str) -> Any:
+        """Read the feed, with or without an account.
+
+        An unlinked machine reads the open mirror of the same route instead of
+        raising. That is what makes a fresh checkout work the moment it starts:
+        the plays are free, so refusing to serve them to someone who hasn't
+        signed up only ever produced an empty terminal and a support question.
+
+        A linked machine still uses its token, so the server can attribute the
+        read and the trade-sync side keeps working exactly as before.
+        """
         token = self.device_token
         if not token:
-            raise CloudError("This device isn't linked to an RSAMAXXED account yet.")
+            return self._get_public(path)
         try:
             r = requests.get(
                 self._url(path),
@@ -392,9 +402,22 @@ class CloudSync:
             raise CloudError(f"Can't reach RSAMAXXED Cloud: {exc}") from exc
         if r.status_code == 401:
             self.unlink(local_only=True)
-            raise CloudError("This device was unlinked. Generate a new pairing code.")
+            # Don't strand the user on a revoked or stale token: the feed is
+            # open, so fall through to it rather than going dark until they
+            # notice and re-pair.
+            return self._get_public(path)
         if r.status_code == 403:
-            raise CloudError("Your plan doesn't include the play feed.")
+            return self._get_public(path)
+        if r.status_code >= 400:
+            raise CloudError(f"RSAMAXXED Cloud returned {r.status_code}")
+        return r.json()
+
+    def _get_public(self, path: str) -> Any:
+        """The same route, unauthenticated. See /public/* in web/app/routes/api.py."""
+        try:
+            r = requests.get(self._url(f"/public{path}"), timeout=_TIMEOUT)
+        except requests.RequestException as exc:
+            raise CloudError(f"Can't reach RSAMAXXED Cloud: {exc}") from exc
         if r.status_code >= 400:
             raise CloudError(f"RSAMAXXED Cloud returned {r.status_code}")
         return r.json()

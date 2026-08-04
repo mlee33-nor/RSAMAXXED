@@ -285,11 +285,18 @@ def whoami(device: Device = Depends(require_device)) -> dict[str, Any]:
 # Two directions, two very different doors:
 #
 #   WRITE  one operator machine, holding FEED_INGEST_KEY, publishes what it
-#          parsed out of the alert channels.
-#   READ   every paying customer, by device token or browser session.
+#          parsed out of the alert channels. Locked, always.
+#   READ   anyone. Identified callers (device token or browser session) get the
+#          /plays routes; everyone else gets the same data from /public/plays.
 #
-# The asymmetry is the point. Customers consume a feed they cannot forge, and
-# nobody but the operator ever needs Discord credentials.
+# The asymmetry is the point, and it is on the WRITE side only: the feed cannot
+# be forged, and nobody but the operator ever needs Discord credentials.
+#
+# Reading is deliberately open. The alert feed is free — it is the funnel, not
+# the product (see plans.py) — so gating it bought no revenue and cost the one
+# thing that matters: someone who pulls the software has to be able to run it
+# and start receiving plays, with no account, no pairing and no key. Anything
+# that stands between `git clone` and a populated Watchlist is a bug.
 
 class PlayIn(BaseModel):
     source_id: str = Field(min_length=1, max_length=80)
@@ -555,6 +562,58 @@ def read_lifecycle(
 
     Ordered oldest-first so a client folding it into local state processes the
     board in the same order the desktop's own poll would.
+    """
+    rows = db.scalars(
+        select(PlayLifecycle).order_by(
+            PlayLifecycle.alert_date.asc(), PlayLifecycle.symbol.asc())
+    )
+    return [
+        {"symbol": r.symbol,
+         "sell_symbol": r.sell_symbol or r.symbol,
+         "alert_date": r.alert_date,
+         "status": r.status,
+         "kind": r.kind,
+         "status_changed_at": (r.status_changed_at.isoformat()
+                               if r.status_changed_at else "")}
+        for r in rows
+    ]
+
+
+# ------------------------------------------------------- the open front door
+# Byte-identical payloads to the three routes above, with no caller identity.
+# They exist so a fresh checkout works on first launch: `_get` in cloud_sync.py
+# retries here whenever the machine holds no device token, which is the state
+# every new install starts in and the state most of them stay in.
+#
+# Keep these read-only and keep them in sync with their authenticated twins —
+# the desktop cannot tell which one answered it, and must not be able to.
+
+@router.get("/public/plays")
+def read_plays_public(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Buys, closed plays, exits and round-ups. No auth."""
+    return playsfeed.feed_json(playsfeed.load_board(db))
+
+
+@router.get("/public/plays/picks")
+def read_picks_public(db: Session = Depends(get_db)) -> list[dict[str, str]]:
+    """Open plays in the shape picks.json holds. No auth."""
+    notes = {"standard": "Reg Alert", "otc": "OTC", "conditional": "conditional"}
+    board = playsfeed.load_board(db)
+    return [
+        {"symbol": l.play.symbol,
+         "note": notes.get(l.play.kind, "Reg Alert"),
+         "date": l.play.alert_date}
+        for l in board.open_plays
+    ]
+
+
+@router.get("/public/plays/lifecycle")
+def read_lifecycle_public(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    """The TRACK board — what each split actually did. No auth.
+
+    Open for the same reason as the rest: without it a new install's Exits page
+    is empty, and 'which of my positions resolved' is the one question the
+    customer cannot answer from anywhere else.
     """
     rows = db.scalars(
         select(PlayLifecycle).order_by(

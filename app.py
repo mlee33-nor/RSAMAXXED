@@ -984,8 +984,11 @@ def _local_picks() -> List[Dict[str, str]]:
 
 
 def _cloud_picks() -> Optional[List[Dict[str, str]]]:
-    """Open plays from the authenticated cloud feed, or None if this copy can't
-    read it — not linked to an account, offline, or on a plan without the feed.
+    """Open plays from the cloud feed, or None if this copy couldn't read it.
+
+    No account required. An unlinked install reads the open feed (see
+    CloudSync._get), which is what lets a fresh checkout show plays on its very
+    first launch instead of an empty screen.
 
     None and [] mean different things here: None is "no answer, keep what you
     have", [] is "the feed says nothing is open". Collapsing them would blank a
@@ -994,10 +997,7 @@ def _cloud_picks() -> Optional[List[Dict[str, str]]]:
     if not CLOUD_AVAILABLE:
         return None
     try:
-        client = cloud_sync.CloudSync()
-        if not client.is_linked:
-            return None
-        picks = client.fetch_picks()
+        picks = cloud_sync.CloudSync().fetch_picks()
     except Exception:
         return None          # CloudError, or anything the transport threw
     return picks if isinstance(picks, list) else None
@@ -3074,10 +3074,26 @@ class App(ctk.CTk):
         self._render_pipeline()
 
         if not picks:
-            self._empty_state(
-                self._picks_grid, "starfill", "No active picks",
-                "New RSA alerts land here automatically from the pick feed.",
-                bg=BG_CARD, pad=18).pack(fill="x")
+            # An unlinked install has nothing to wait FOR, so saying alerts
+            # "land here automatically" reads as "sit tight" and leaves a new
+            # user staring at an empty screen indefinitely. Name the one action
+            # that fixes it, and put a button on it.
+            if not self._cloud_linked():
+                box = self._empty_state(
+                    self._picks_grid, "globe", "Link your account to get the plays",
+                    "Buy alerts, exits and the round-up board all arrive with your "
+                    "RSAMAXXED account — no Discord needed. Link this device once "
+                    "and they fill in on their own.",
+                    bg=BG_CARD, pad=18)
+                box.pack(fill="x")
+                PillButton(box, text="Link this device",
+                           command=lambda: self._show_frame("accounts"),
+                           width=150, height=32, font_size=10).pack(pady=(0, 16))
+            else:
+                self._empty_state(
+                    self._picks_grid, "starfill", "No active picks",
+                    "New RSA alerts land here automatically from the pick feed.",
+                    bg=BG_CARD, pad=18).pack(fill="x")
             return
 
         purchased_pick_set = self._get_purchased_pick_set(picks)
@@ -6425,15 +6441,24 @@ class App(ctk.CTk):
         # ---- Discord auto-import card (feeds the picks Mirror Trading buys) ----
         self._build_discord_card(scroll_frame)
 
-        # ---- RSAMAXXED Cloud: mirror the trade journal to the web dashboard ----
-        self._build_cloud_card(scroll_frame)
+        # Account linking now lives on the Brokers page — see _build_accounts.
 
     # ---- RSAMAXXED Cloud sync ---------------------------------------------------
 
+    def _cloud_linked(self) -> bool:
+        """Does this machine hold a device token? Local file read, no network,
+        so it is safe to call from a render path."""
+        if not CLOUD_AVAILABLE:
+            return False
+        try:
+            return bool(cloud_sync.CloudSync().is_linked)
+        except Exception:
+            return False
+
     def _build_cloud_card(self, parent) -> None:
-        """Pair this machine with an RSAMAXXED Cloud account so the trade journal
-        shows up on the website. Purely additive — the app never asks the cloud
-        for permission to do anything."""
+        """Pair this machine with an RSAMAXXED account. This is how the play
+        feed reaches the terminal — buys, exits and the round-up board — as well
+        as how the trade journal reaches the website."""
         self._cloud_pending = None          # PendingPair while a code is live
         self._cloud_poll_stop = threading.Event()
 
@@ -6456,12 +6481,17 @@ class App(ctk.CTk):
 
         info = tk.Frame(card.inner, bg=BG_INPUT, padx=16, pady=12)
         info.pack(fill="x", padx=20, pady=(4, 12))
-        tk.Label(info, text="See your stats from your phone",
+        # This copy used to read "optional — RSAMAXXED works exactly the same
+        # unlinked", written when the cloud was only a stats mirror. It is now
+        # how the plays themselves arrive, and telling a new user the step is
+        # optional is telling them to skip the only one that matters.
+        tk.Label(info, text="This is how you receive the plays",
                  bg=BG_INPUT, fg=TEXT_PRIMARY, font=(FONT_FAMILY, 10, "bold")).pack(anchor="w")
-        tk.Label(info, text="Links this machine to your account on the RSAMAXXED website so your "
-                 "realized P/L, positions and trade history follow you anywhere. Only the trade "
-                 "journal is uploaded — broker logins, cookies and 2FA secrets never leave this "
-                 "computer. Optional: RSAMAXXED works exactly the same unlinked.",
+        tk.Label(info, text="Link this machine to your RSAMAXXED account and the buy alerts, "
+                 "the exits and the round-up board arrive on their own, refreshed every hour — "
+                 "you never need to be in a Discord. Link once and you are done. It also puts "
+                 "your realized P/L and trade history on the website. Broker logins, cookies "
+                 "and 2FA secrets never leave this computer.",
                  bg=BG_INPUT, fg=TEXT_SECONDARY, font=(FONT_FAMILY, 9),
                  wraplength=620, justify="left").pack(anchor="w", pady=(4, 0))
 
@@ -8179,10 +8209,8 @@ class App(ctk.CTk):
             return
         try:
             client = cloud_sync.CloudSync()
-            if not client.is_linked:
-                return
         except Exception:
-            return                      # offline or unsubscribed; keep what we have
+            return                      # offline; keep what we have
 
         # Each stream in its own try: a server hiccup on one must not cost the
         # other. Buys are the half a customer acts on, so they may not ride on
@@ -8224,14 +8252,33 @@ class App(ctk.CTk):
         self._run_in_thread(self._feed_pull_worker)
         self._track_loop_id = self.after(3600000, self._track_loop)
 
-    def _track_available(self) -> bool:
-        """Either source will do: a linked cloud account, or a TRACK channel."""
-        if self._track_channel():
-            return True
+    def _publish_lifecycle_worker(self, rows) -> None:
+        """Publish the TRACK board. Operator-only; silent no-op everywhere else.
+
+        Lifecycle rows are a STATUS, not an event — ingest updates them in place
+        on source_id — so re-sending an unchanged board costs one request and
+        changes nothing. That is what makes it safe to run on every hourly poll
+        rather than trying to detect when it's worth doing.
+        """
         try:
-            return bool(CLOUD_AVAILABLE and cloud_sync.CloudSync().is_linked)
+            client = cloud_sync.CloudSync()
+            if not client.can_publish_feed:
+                return
+            sent = client.publish_feed({"lifecycle": [r.to_json() for r in rows]})
         except Exception:
-            return False
+            return
+        n = (sent or {}).get("lifecycle", 0)
+        if n:
+            self.after(0, lambda: self._log(
+                f"TRACK: published {n} board change(s) to the feed", "ok"))
+
+    def _track_available(self) -> bool:
+        """Either source will do: the cloud feed, or a TRACK channel.
+
+        No account check — the board is served to anyone, so the only way to
+        have no source at all is having no network and no Discord channel.
+        """
+        return bool(CLOUD_AVAILABLE or self._track_channel())
 
     def _track_pull_now(self) -> None:
         if self._track_busy:
@@ -8274,6 +8321,14 @@ class App(ctk.CTk):
 
         self._track_rows = list(rows)
         self._track_pulled_at = datetime.now().strftime("%H:%M")
+
+        # Operator machines push the board they just read back out, so every
+        # other install gets it. Without this the lifecycle table only ever
+        # filled when someone remembered to run publish_feed.py by hand, and a
+        # customer's Exits page stayed empty no matter how correct their app
+        # was. No-op on a normal install: publishing needs the feed key.
+        if rows and CLOUD_AVAILABLE:
+            self._run_in_thread(self._publish_lifecycle_worker, list(rows))
 
         # Only announce a play that crossed INTO a sellable state. A seeded
         # first pull and rows that were already sellable stay quiet, or the very
@@ -8334,6 +8389,13 @@ class App(ctk.CTk):
 
         frame.bind("<Enter>", _acct_enter)
         frame.bind("<Leave>", _acct_leave)
+
+        # Account linking sits ABOVE the brokers, on this page, because this is
+        # where every doc sends people and where anyone looks for "connect my
+        # account" — it used to live on Automation, so a new user followed the
+        # README to Brokers, found nothing, and concluded the plays were broken.
+        # It is first because it is the one step without which nothing arrives.
+        self._build_cloud_card(scroll_frame)
 
         self._account_widgets: Dict[str, Dict[str, Any]] = {}
 
