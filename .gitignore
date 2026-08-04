@@ -38,7 +38,8 @@ Fractional _Automation.py
 # The live pick list. It is the product; the desktop app now syncs it from the
 # authenticated cloud feed, and web/picks.json is the deliberate free-tier copy.
 picks.json
-# Spelled out rather than left to `git add -f`: the rule above matches at every
-# depth, so the free-tier copy was tracked only by historical accident and any
-# `git add -A` on a fresh branch would quietly drop it.
-!web/picks.json
+# Including web/picks.json, which the rule above already covers at every depth.
+# That copy used to be COMMITTED by publish_picks.py so a Railway redeploy would
+# seed the feed from it — the pre-ingest design. Plays reach customers over the
+# authenticated feed now, and a public repo is the one place the product must
+# not sit: anyone cloning it read the plays without subscribing.
