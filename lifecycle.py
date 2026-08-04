@@ -539,7 +539,23 @@ def fetch_cloud() -> tuple[list[LifecycleRow], str]:
     except Exception as exc:
         return [], str(exc)[:160]
 
-    rows = [r for r in (rsa_feed.LifecycleRow.from_json(x) for x in raw) if r]
+    # Parse defensively, INSIDE the guard. The shape of this response is the one
+    # thing a client cannot control at runtime: a bad deploy, a schema change or
+    # a proxy error page can put anything on the wire, and the parse used to sit
+    # outside the try — so a list of the wrong element type raised straight out
+    # of here and took the whole TRACK poll down with it.
+    if not isinstance(raw, list):
+        return [], "the feed returned an unexpected board"
+    rows = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            row = rsa_feed.LifecycleRow.from_json(item)
+        except Exception:
+            continue        # one malformed row must not cost the other fifty
+        if row:
+            rows.append(row)
     return rows, "" if rows else "the feed has no board yet"
 
 
