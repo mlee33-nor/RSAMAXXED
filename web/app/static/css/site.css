@@ -1256,13 +1256,28 @@
   }
   .gear:hover{color:var(--text);border-color:var(--accent);background:rgba(124,120,255,.08)}
 
+  /* A popover anchored under the gear, not a slab across the page: editing ten
+     numbers is a two-second errand and shouldn't displace the board. The dim
+     behind it is a label, so clicking anywhere outside closes it. */
   .drawer-toggle{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
-  .drawer{display:none;margin-bottom:16px}
-  .drawer-toggle:checked ~ .drawer{display:block}
-  .drawer-toggle:focus-visible ~ .drawer{outline:2px solid var(--accent)}
+  .drawer-scrim{display:none}
+  .drawer-toggle:checked ~ .drawer-scrim{
+    display:block;position:fixed;inset:0;z-index:40;
+    background:rgba(3,4,8,.55);backdrop-filter:blur(2px);cursor:default;
+  }
+  .drawer{
+    display:none;position:absolute;z-index:41;right:0;top:100%;margin-top:10px;
+    width:min(560px,calc(100vw - 32px));
+    box-shadow:0 24px 60px rgba(0,0,0,.6);
+  }
+  .drawer-toggle:checked ~ .pop-anchor .drawer{display:block}
+  .pop-anchor{position:relative}
+  @media(max-width:640px){
+    /* No room to anchor on a phone: centre it instead of hanging it off-screen. */
+    .drawer{position:fixed;right:16px;left:16px;top:auto;bottom:16px;width:auto;margin:0}
+  }
 
-  .bgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
-  @media(max-width:900px){ .bgrid{grid-template-columns:repeat(3,1fr)} }
+  .bgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}
   @media(max-width:560px){ .bgrid{grid-template-columns:repeat(2,1fr)} }
   .bslot{display:flex;flex-direction:column;gap:6px}
   .bslot .bn{font-size:11.5px;color:var(--text-3);display:flex;align-items:center;gap:4px}
@@ -1280,6 +1295,8 @@
   }
   .bfoot b{font-family:var(--mono);color:var(--text);font-weight:650}
   .bfoot i{color:var(--accent-2);font-style:normal;font-size:9px}
+  .xclose{cursor:pointer;color:var(--text-3);font-size:13px;padding:2px 6px;border-radius:6px}
+  .xclose:hover{color:var(--text);background:rgba(255,255,255,.06)}
 
   /* ---- one filter row above everything it scopes */
   .filters{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px}
@@ -1313,9 +1330,11 @@
   .tile .k2{font-size:11px;color:var(--text-3);margin-top:3px;font-family:var(--mono)}
 
   /* ---- charts */
-  .chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+  /* align-items:start, so a card with a table under its chart doesn't stretch
+     the one beside it into a field of empty space. */
+  .chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px;align-items:start}
   @media(max-width:900px){ .chart-grid{grid-template-columns:1fr} }
-  .chart-card{margin:0;display:flex;flex-direction:column}
+  .chart-card{margin:0}
   .chart-card.wide{grid-column:1 / -1}
   /* Sized to include the axis band, so the card never grows a nested scrollbar. */
   .chart{margin:0;width:100%;min-height:196px}
@@ -1375,6 +1394,20 @@
   button.cday.sel{background:var(--accent);border-color:var(--accent);color:#0b0b16}
   button.cday i{font-style:normal;font-size:9px;opacity:.85;margin-top:1px}
   .dayblock.hide{display:none}
+
+  /* ---- pager */
+  .pgnav{
+    display:flex;align-items:center;gap:14px;justify-content:flex-end;
+    margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--line);
+  }
+  .pgstat{font-size:12px;color:var(--text-3);font-family:var(--mono);order:-1;margin-right:auto}
+  .pgbtn{
+    padding:6px 13px;border-radius:99px;font-size:12.5px;cursor:pointer;
+    background:transparent;border:1px solid var(--line-2);color:var(--text-2);
+    transition:color .15s var(--ease),border-color .15s var(--ease),background .15s var(--ease);
+  }
+  .pgbtn:hover:not(:disabled){color:var(--text);border-color:var(--accent);background:rgba(124,120,255,.1)}
+  .pgbtn:disabled{opacity:.35;cursor:default}
 
   /* ---- page header side: freshness stamp + the lock-this-browser control */
   .head-side{display:flex;align-items:center;gap:14px;flex-wrap:wrap}

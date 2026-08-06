@@ -158,27 +158,24 @@ class PlayLife:
 
     @property
     def paying_brokers(self) -> tuple[str, ...]:
-        """The brokers this play actually paid out in, best evidence first.
+        """The brokers this play paid out in, from the TRACK board and nothing
+        else. The whole profit model, in three lines:
 
-        This is the whole profit model, and the order matters:
+        * **rounded_up** — a whole share came back, and a whole share is a whole
+          share everywhere, so every broker you hold pays.
+        * **fractional** — a fraction came back only at the three brokers that
+          hold fractions; the other seven settled it to cash and hold nothing.
+        * **anything else** — pending, cash in lieu, canceled, unknown — paid
+          nowhere and contributes nothing to any total.
 
-        1. **The sell alert's legs.** If the play exited, the alert named the
-           brokers it was sold at, with an account count each. That is not a
-           rule about what usually happens — it is the record of which accounts
-           rounded and got sold. Nothing beats it.
-        2. **rounded_up with no exit yet.** A whole share came back, and a whole
-           share is a whole share everywhere, so every broker is eligible.
-        3. **fractional.** Only the three that hold fractions at all; the other
-           seven settled to cash and have nothing to sell.
-        4. **Anything else** — pending, cash in lieu, canceled, unknown — paid
-           nowhere, and contributes nothing to any total.
+        The question this answers is "if I had bought every alert, in my
+        accounts, what would the splits have paid me?" — so it deliberately does
+        NOT narrow to the brokers the alerter's own sell message happened to
+        name. That list is which accounts THEY held, not which accounts rounded;
+        it stays on the Sells tab as reporting, and out of the arithmetic.
 
         Returned as display names; pair with `broker_key()` to match settings.
         """
-        legs = [leg.get("broker") for e in self.exits for leg in e.legs]
-        named = tuple(dict.fromkeys(b for b in legs if b))   # de-duped, ordered
-        if named:
-            return named
         if self.paid_everywhere:
             return SUPPORTED_BROKERS
         if self.fraction_only:
@@ -200,6 +197,13 @@ class PlayLife:
         if len(brokers) >= len(SUPPORTED_BROKERS):
             return "every broker"
         return ", ".join(brokers)
+
+    @property
+    def sold_at(self) -> str:
+        """The brokers the sell alert named, for the record. Reporting only —
+        see `paying_brokers` for why this is not what the money is based on."""
+        legs = dict.fromkeys(l.get("broker") for e in self.exits for l in e.legs)
+        return ", ".join(b for b in legs if b)
 
     @property
     def resolved_on(self) -> str:
@@ -554,16 +558,18 @@ class Board:
     def calendar_months(self, today: date | None = None, months: int = 2) -> list[dict]:
         """Month grids of buy deadlines, starting with the current month.
 
-        Two months by default: a buy window that shuts inside a fortnight is the
-        only thing this view is for, and a year of empty squares is noise. Days
-        outside the range still appear in the day list under the grid, so a
-        far-off deadline is never hidden — only un-gridded.
+        The current month always, and a later one only if something actually
+        shuts in it — a grid of 30 blank squares is furniture, not information.
+        Days outside the range still appear in the day list under the grid, so a
+        far-off deadline is never hidden, only un-gridded.
         """
         today = today or date.today()
         counts = {d: len(v) for d, v in self.by_deadline.items() if d}
         out = []
         y, m = today.year, today.month
-        for _ in range(max(1, months)):
+        for i in range(max(1, months)):
+            if i and not any(k[:7] == f"{y:04d}-{m:02d}" for k in counts):
+                break
             weeks = []
             # Monday-first, matching how the rest of the site reads dates.
             for week in calendar.Calendar(firstweekday=0).monthdatescalendar(y, m):
