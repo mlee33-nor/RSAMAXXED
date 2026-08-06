@@ -497,3 +497,109 @@ def test_the_desktop_client_sends_the_key_it_is_given(monkeypatch):
 
     assert sent["headers"].get("X-Plays-Key") == PASSWORD
     assert sent["url"].endswith("/api/v1/public/plays")
+
+
+# ------------------------------------------------------- the dashboard shape
+#
+# The Dashboard is drawn by site.js into hosts it finds by id, and rewritten
+# against the reader's own account profile. Rename a host in the template and
+# nothing errors — the chart just silently never appears. These pin the
+# contract between the two files.
+
+DASH_HOSTS = ("chart-monthly", "chart-brokers", "chart-outcomes", "hero-spark")
+
+
+def test_the_dashboard_carries_every_chart_host_the_script_draws_into(board):
+    for host in DASH_HOSTS:
+        assert f'id="{host}"' in board, f"the script draws into #{host}; the page has no such node"
+
+
+def test_the_dashboard_renders_its_figures_without_javascript(board):
+    """Money is finished in the browser, but a real figure with a stated basis
+    has to survive the script being blocked — that is the whole reason the
+    server renders against one account per broker."""
+    assert 'id="hero-total"' in board and "$" in board
+    assert 'id="funnel"' in board and "data-base=" in board
+
+
+def test_the_funnel_can_never_widen(board):
+    """Each stage is a strict subset of the one before it. Widths are drawn as
+    a share of the first stage, so a stage that grew would render an arrow
+    pointing at a bar longer than its own parent — a picture that lies."""
+    counts = [int(n) for n in re.findall(r'class="fv"[^>]*>(\d+)<', board)]
+    assert len(counts) == 4, f"expected four funnel stages, found {len(counts)}"
+    assert counts == sorted(counts, reverse=True), f"the funnel widens: {counts}"
+
+
+def test_the_funnel_bars_never_exceed_full_width(board):
+    for w in re.findall(r'class="ftrack">\s*<i[^>]*style="width:([\d.]+)%"', board):
+        assert float(w) <= 100.0, f"a funnel stage drew itself at {w}% of the total"
+
+
+# ------------------------------------------------- the funnel can never widen
+#
+# The Dashboard draws alerted -> sold -> priced -> paid as a funnel, each bar
+# a share of the first. That picture is only honest while every stage is a
+# subset of the one before it.
+#
+# The tempting third stage is "rounded up", and it is WRONG. A play that came
+# back fractional and then sold at the three brokers that hold fractions pays
+# real money while never being a round-up, so "paid" would exceed its own
+# parent and the funnel would visibly widen. That is what these pin.
+
+@pytest.fixture()
+def fractional_sale(anon):
+    """A fractional play that sold, beside a round-up that has not."""
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={
+        "buys": [
+            {"source_id": "fn:1", "symbol": "FRAC", "kind": "standard",
+             "alert_date": "2026-07-01", "ratio": "1:20", "ratio_n": 20,
+             "entry_price": 0.50, "last_buy_date": "2026-07-03"},
+            {"source_id": "fn:2", "symbol": "WHOLE", "kind": "standard",
+             "alert_date": "2026-07-02", "ratio": "1:10", "ratio_n": 10,
+             "entry_price": 0.60, "last_buy_date": "2026-07-04"},
+        ],
+        "lifecycle": [
+            {"source_id": "2026-07-01:FRAC", "symbol": "FRAC", "alert_date": "2026-07-01",
+             "status": "fractional", "kind": "standard"},
+            {"source_id": "2026-07-02:WHOLE", "symbol": "WHOLE", "alert_date": "2026-07-02",
+             "status": "rounded_up", "kind": "standard"},
+        ],
+        "sells": [
+            {"source_id": "fn:s1", "symbol": "FRAC", "sell_date": "2026-07-20",
+             "exit_price": 10.0, "proceeds_low": 9.5,
+             "legs": [{"broker": "Fennel", "accounts_low": 1}]},
+        ],
+    })
+    return _board_of(anon)
+
+
+def test_a_fractional_play_that_sold_pays_without_ever_being_a_round_up(fractional_sale):
+    rounded = {l.play.symbol for l in fractional_sale.rounded_history}
+    paying = {r["sym"] for r in fractional_sale.payout_rows}
+    assert "FRAC" not in rounded, "the fixture stopped exercising the fractional path"
+    assert "FRAC" in paying, "a fractional play sold at Fennel still pays"
+    assert "WHOLE" not in paying, "a round-up with no exit must pay nothing"
+
+
+def test_every_funnel_stage_contains_the_next(fractional_sale):
+    alerted = len(fractional_sale.history)
+    sold = len(fractional_sale.sold_history)
+    priced = len(fractional_sale.payout_rows)
+    paid = fractional_sale.totals()["plays"]
+    assert alerted >= sold >= priced >= paid, (
+        f"the funnel widens: alerted={alerted} sold={sold} priced={priced} paid={paid}")
+
+
+def test_paid_is_not_a_subset_of_rounded_up(fractional_sale):
+    """The stage this funnel deliberately does not use, kept as a test so the
+    reason survives the next person who thinks it belongs there.
+
+    Stated as the set relation rather than as a count: counts drift with
+    whatever else the module has published by now, but "something pays that
+    never rounded up" is the whole point and is true whatever else is here."""
+    rounded = {l.play.symbol for l in fractional_sale.rounded_history}
+    paying = {r["sym"] for r in fractional_sale.payout_rows}
+    assert not paying <= rounded, (
+        "every paying play happens to be a round-up here, so this test has "
+        "stopped demonstrating why rounded-up cannot be the funnel's parent")

@@ -1139,14 +1139,6 @@
   .tile.hot{border-color:rgba(242,193,78,.32);background:rgba(242,193,78,.045)}
   .tile.hot .v{color:var(--amber)}
 
-  .upsell{
-    margin-top:16px;display:flex;align-items:center;justify-content:space-between;
-    gap:22px;flex-wrap:wrap;
-  }
-  .upsell h3{font-size:17px;margin:0 0 5px}
-  .upsell p{margin:0;font-size:13.5px;max-width:56ch}
-  .upsell .btn{flex:none}
-
   /* ============================================================ PLAYS TABS
      Radio inputs and sibling selectors, not JavaScript. The board is the thing
      people paid for; it must not depend on a script to be readable, and the CSP
@@ -1309,50 +1301,152 @@
   }
   .chip:hover{color:var(--text-2)}
   .chip.on{color:var(--text);border-color:var(--accent);background:rgba(124,120,255,.1)}
-  .basis{margin-left:auto;font-size:12px;color:var(--text-3)}
-  .basis label{color:var(--accent);cursor:pointer;text-decoration:underline}
+  /* nowrap: the basis is one sentence with its own control at the end, and
+     breaking "change" onto its own line reads as a stray link. */
+  .basis{margin-left:auto;flex:none;font-size:12px;color:var(--text-3);white-space:nowrap}
+  /* display+margin, because the base label{} rule is a block with 16px of top
+     margin — which is what was breaking "change" onto a line of its own. */
+  .basis label{
+    display:inline;margin:0;font-size:inherit;
+    color:var(--accent);cursor:pointer;text-decoration:underline;
+  }
 
   /* ---- the hero figure: exactly one per view */
-  .hero-row{display:grid;grid-template-columns:minmax(260px,1fr) 2fr;gap:12px;align-items:stretch}
+  .hero-row{display:grid;grid-template-columns:minmax(240px,.9fr) 2.1fr;gap:12px;align-items:stretch}
   @media(max-width:900px){ .hero-row{grid-template-columns:1fr} }
   .hero-card{
+    position:relative;overflow:hidden;
     margin:0;display:flex;flex-direction:column;justify-content:center;
+    /* tighter than a normal card: it holds one number. The extra bottom is the
+       lane the sparkline runs in, so text never sits on top of the line. */
+    padding:20px 22px 36px;
     background:
       radial-gradient(120% 100% at 0% 0%, rgba(124,120,255,.12), transparent 70%),
       var(--bg-2);
   }
+  .hero-card > *{position:relative;z-index:1}
   .hero-card .k{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3)}
   /* Proportional figures, not tabular: equal-width digits read loose this big. */
   .hero-fig{font-size:clamp(36px,4.4vw,52px);font-weight:660;letter-spacing:-.03em;margin:8px 0 6px;line-height:1}
   .hero-sub{font-size:12.5px}
+  /* The spark is a band across the foot of the card, not a block in the flow:
+     as a flow item it stood 70px tall and pushed every KPI tile beside it into
+     a field of nothing. Bled to the card's edges it costs no height at all. */
+  .spark{position:absolute;inset:auto 0 0 0;margin:0;line-height:0;z-index:0;opacity:.75}
+  .spark svg{display:block;width:100%;height:auto}
+  .spark-line{fill:none;stroke:var(--c-series);stroke-width:1.6;stroke-linejoin:round;stroke-linecap:round}
   /* 126px, so all five KPIs sit on one row beside the hero instead of the
      fifth wrapping alone and leaving a hole. */
   .tiles.compact{grid-template-columns:repeat(auto-fit,minmax(126px,1fr));margin:0}
   @media(max-width:1180px){ .tiles.compact{grid-template-columns:repeat(3,1fr)} }
   @media(max-width:900px){ .tiles.compact{grid-template-columns:repeat(2,1fr)} }
+  /* The tiles stretch to the hero's height whatever it is, so centre what is in
+     them: content pinned to the top of a tall box reads as a rendering fault. */
+  .tiles.compact .tile{display:flex;flex-direction:column;justify-content:center}
   .tile .k2{font-size:11px;color:var(--text-3);margin-top:3px;font-family:var(--mono)}
+
+  /* ---- the lifecycle rail
+     Four stages on one line. Each one owns a track of the SAME width, and the
+     fill inside it is the stage's share of every alert — so the eye compares
+     fills against a constant, which is the only honest way to draw a funnel
+     out of four separate bars. */
+  .funnel{
+    margin-top:12px;padding:16px 20px;display:grid;gap:10px 26px;
+    grid-template-columns:repeat(4,1fr);
+  }
+  @media(max-width:900px){ .funnel{grid-template-columns:repeat(2,1fr);gap:16px 22px} }
+  @media(max-width:520px){ .funnel{grid-template-columns:1fr} }
+  /* Two columns puts stages 3 and 4 on a second row, where the chevron on the
+     first of them points at the left margin. Odd children start a row here. */
+  @media(max-width:900px){ .fstep:nth-child(odd)::before{display:none} }
+  .fstep{position:relative;min-width:0}
+  /* The chevron between stages. Drawn on the gap, hidden on the last one and
+     whenever the grid wraps — an arrow pointing off the end of a row is worse
+     than no arrow. */
+  .fstep + .fstep::before{
+    content:"";position:absolute;left:-16px;top:9px;width:5px;height:5px;
+    border-top:1.5px solid var(--line-2);border-right:1.5px solid var(--line-2);
+    transform:rotate(45deg);
+  }
+  @media(max-width:520px){ .fstep + .fstep::before{display:none} }
+  .fhead{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+  .fk{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3);white-space:nowrap}
+  .fv{font-size:20px;font-weight:640;letter-spacing:-.02em;line-height:1;font-family:var(--mono)}
+  .ftrack{
+    display:block;height:4px;border-radius:99px;margin:9px 0 7px;overflow:hidden;
+    background:rgba(255,255,255,.05);
+  }
+  .ftrack i{
+    display:block;height:100%;border-radius:99px;min-width:2px;
+    background:linear-gradient(90deg,var(--accent-2),var(--c-series));
+    transition:width .5s var(--ease);
+  }
+  .fn{font-size:11px;color:var(--text-3);line-height:1.35;display:block}
+  /* The stage that is actually money, and the only one the account profile moves. */
+  .fstep.paid .fv{color:var(--green)}
+  .fstep.paid .ftrack i{background:linear-gradient(90deg,var(--c-series),var(--green))}
 
   /* ---- charts */
   /* align-items:start, so a card with a table under its chart doesn't stretch
-     the one beside it into a field of empty space. */
-  .chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px;align-items:start}
-  @media(max-width:900px){ .chart-grid{grid-template-columns:1fr} }
-  .chart-card{margin:0}
-  .chart-card.wide{grid-column:1 / -1}
-  /* Sized to include the axis band, so the card never grows a nested scrollbar. */
-  .chart{margin:0;width:100%;min-height:196px}
+     the one beside it into a field of empty space. The wide column carries the
+     month chart and its two audit tables; the narrow one stacks the two
+     supporting figures. */
+  .chart-grid{display:grid;grid-template-columns:1.5fr 1fr;gap:12px;margin-top:12px;align-items:start}
+  @media(max-width:1020px){ .chart-grid{grid-template-columns:1fr} }
+  .chart-card{margin:0;min-width:0}
+  .chart-card.outcomes{margin-top:12px;padding-bottom:18px}
+  .chart{margin:0;width:100%;min-height:0}
   .chart svg{display:block;width:100%;height:auto;overflow:visible}
-  .chart .empty-note{font-size:13px;color:var(--text-3);padding:26px 0}
+  .chart .empty-note{font-size:13px;color:var(--text-3);padding:22px 0}
+
+  /* The outcome key. HTML rather than SVG text so it wraps on its own, and its
+     own class rather than .legend, which is a column list somewhere else. */
+  .chartkey{display:flex;flex-flow:row wrap;gap:9px 22px;margin-top:14px}
+  .chartkey .ck{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--text-2)}
+  .chartkey .ck i{width:9px;height:9px;border-radius:3px;flex:none}
+  .chartkey .ck b{font-family:var(--mono);color:var(--text-3);font-weight:650}
 
   .ax-line{stroke:var(--line);stroke-width:1}
+  /* The average, stated as a line where the KPI tile only states it as a word. */
+  .ax-avg{stroke:var(--line-2);stroke-width:1;stroke-dasharray:3 4}
   .ax-text{fill:var(--text-3);font-size:10px;font-family:var(--mono)}
+  .ax-text.name{font-family:inherit;font-size:11px;fill:var(--text-2)}
+  .ax-text.run{fill:var(--accent-2);opacity:.75}
+  .ax-text.avg{fill:var(--text-3);font-size:9px;letter-spacing:.04em}
   .val-text{fill:var(--text-2);font-size:10.5px;font-family:var(--mono)}
-  .mark-bar{fill:var(--c-series)}
+
+  .mark-bar{fill:var(--c-series);transition:filter .16s var(--ease)}
+  .mark-bar.hot{filter:brightness(1.35) saturate(1.1)}
   .mark-line{fill:none;stroke:var(--c-series);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
-  .mark-area{fill:var(--c-series);opacity:.1}
+  /* A fat translucent copy of the line under the crisp one. Reads as a glow at
+     a fraction of the cost of an SVG blur filter, which would re-rasterise on
+     every repaint — and there is a repaint per keystroke in the accounts panel. */
+  .mark-line.halo{stroke:var(--accent-2);stroke-width:7;opacity:.14}
+  .mark-area{opacity:1}
   .mark-dot{fill:var(--c-series);stroke:var(--bg-2);stroke-width:2}
+  .mark-dot.live{opacity:0;fill:var(--accent-2);transition:opacity .12s var(--ease)}
+  .mark-dot.live.on{opacity:1}
+  .hoverband{fill:#fff;opacity:0;transition:opacity .14s var(--ease)}
+  .hoverband.on{opacity:.035}
+  .track{fill:rgba(255,255,255,.05)}
+  .mark-hbar{transition:filter .16s var(--ease)}
+  .mark-hbar.hot{filter:brightness(1.3)}
+  .seg{transition:filter .16s var(--ease)}
+  .seg.hot{filter:brightness(1.25)}
+  .seg-text{fill:#080a10;font-size:10px;font-weight:700;font-family:var(--mono);pointer-events:none}
   .hit{fill:transparent;cursor:pointer}
-  .hit:hover + .mark-bar,.mark-bar.hot{fill:var(--accent-hi)}
+
+  /* Marks arrive from their own baseline: bars grow up out of the axis, ranked
+     bars grow out of the left. transform-box:fill-box is what makes a percentage
+     origin mean the shape's own box rather than the whole SVG's. */
+  @keyframes markGrowY{from{transform:scaleY(0)}to{transform:scaleY(1)}}
+  @keyframes markGrowX{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+  .grow{transform-box:fill-box;transform-origin:50% 100%;animation:markGrowY .5s var(--ease) both}
+  .growx{transform-box:fill-box;transform-origin:0 50%;animation:markGrowX .55s var(--ease) both}
+  @media(prefers-reduced-motion:reduce){
+    .grow,.growx{animation:none}
+    .ftrack i{transition:none}
+  }
 
   .charttip{
     position:fixed;z-index:60;pointer-events:none;opacity:0;transform:translate(-50%,-115%);
@@ -1362,6 +1456,12 @@
   }
   .charttip.on{opacity:1}
   .charttip b{font-family:var(--mono);display:block;font-size:13.5px;margin-top:2px}
+  /* The second figure. Present but subordinate: on the month chart it is the
+     running total, which is context for the number above it, not a rival. */
+  .charttip i{
+    font-style:normal;display:block;font-size:11px;margin-top:3px;
+    color:var(--text-3);font-family:var(--mono);
+  }
 
   .tableview{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}
   .tableview summary{cursor:pointer;font-size:12.5px;color:var(--text-3);list-style:none}

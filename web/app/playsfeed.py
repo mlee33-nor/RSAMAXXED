@@ -487,6 +487,20 @@ class Board:
         return len(self.rounded_history) - len(self.profit_basis)
 
     @property
+    def sold_history(self) -> list[PlayLife]:
+        """Alerts the feed has published an exit for.
+
+        The honest parent of "paid", and NOT the same set as the round-ups. A
+        play pays when a sell alert names brokers and there is a price to value
+        it at — its TRACK status is not consulted, so a play that came back
+        fractional and was then sold at the three brokers that hold fractions
+        pays real money while never appearing in `rounded_history`. Anything
+        that draws paid as a share of rounded-up will eventually draw a stage
+        wider than its own parent.
+        """
+        return [l for l in self.history if l.sold]
+
+    @property
     def awaiting_sale(self) -> list[PlayLife]:
         """Splits that resolved into something sellable, but which no sell alert
         has closed yet. They are worth nothing on the dashboard by design (see
