@@ -992,8 +992,8 @@ function initPlaysDash() {
     if (heroTotal) heroTotal.textContent = money(s.total);
     if (heroSub) {
       heroSub.textContent = s.plays
-        ? `if you had bought all ${s.plays} plays the tracker says paid`
-        : 'no split in this period paid into the accounts you hold';
+        ? `across ${s.plays} plays with a confirmed sell, in the brokers each one actually sold at`
+        : 'no confirmed sell in this period landed in a broker you hold';
     }
     if (kpiPer) kpiPer.textContent = money(s.perMonth);
     if (kpiBest) kpiBest.textContent = s.best ? money(s.best.total) : '—';

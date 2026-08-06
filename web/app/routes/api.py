@@ -521,6 +521,47 @@ def ingest_plays(body: FeedIn, db: Session = Depends(get_db)) -> dict[str, Any]:
     return {"inserted": counts, "received": total}
 
 
+@router.get("/plays/export", dependencies=[Depends(require_ingest_key)])
+def export_plays(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """EVERY row, in the shape `/plays/ingest` accepts. Operator key required.
+
+    The read routes answer "what should I trade" and are windowed accordingly —
+    open plays plus a grace period, exits from the last 45 days. That is right
+    for a terminal and useless for a backup: an archive built from them silently
+    loses every play older than the window, which is most of the record.
+
+    This exists so `feed_archive.py` can hold the whole feed and put it back
+    after the database is replaced — which happens on every deploy until
+    Postgres is attached. Behind the operator key because it is the complete
+    product in one response.
+    """
+    return {
+        "buys": [{
+            "source_id": p.source_id, "symbol": p.symbol, "kind": p.kind,
+            "alert_date": p.alert_date, "ratio": p.ratio, "ratio_n": p.ratio_n,
+            "entry_price": p.entry_price, "est_profit": p.est_profit,
+            "last_buy_date": p.last_buy_date, "roundup_history": p.roundup_history,
+            "strategy": p.strategy,
+            "posted_at": p.posted_at.isoformat() if p.posted_at else None,
+        } for p in db.scalars(select(Play).order_by(Play.id))],
+        "sells": [{
+            "source_id": e.source_id, "symbol": e.symbol, "exit_price": e.exit_price,
+            "proceeds_low": e.proceeds_low, "proceeds_high": e.proceeds_high,
+            "legs": e.legs, "note": e.note, "sell_date": e.sell_date,
+            "posted_at": e.posted_at.isoformat() if e.posted_at else None,
+        } for e in db.scalars(select(PlayExit).order_by(PlayExit.id))],
+        "roundups": [{
+            "source_id": r.source_id, "symbol": r.symbol,
+            "confirmed_date": r.confirmed_date,
+            "posted_at": r.posted_at.isoformat() if r.posted_at else None,
+        } for r in db.scalars(select(PlayRoundUp).order_by(PlayRoundUp.id))],
+        "lifecycle": [{
+            "source_id": l.source_id, "symbol": l.symbol, "sell_symbol": l.sell_symbol,
+            "alert_date": l.alert_date, "status": l.status, "kind": l.kind,
+        } for l in db.scalars(select(PlayLifecycle).order_by(PlayLifecycle.id))],
+    }
+
+
 @router.get("/plays")
 def read_plays(
     user: User = Depends(require_feed_reader),

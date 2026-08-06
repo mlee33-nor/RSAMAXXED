@@ -158,29 +158,25 @@ class PlayLife:
 
     @property
     def paying_brokers(self) -> tuple[str, ...]:
-        """The brokers this play paid out in, from the TRACK board and nothing
-        else. The whole profit model, in three lines:
+        """The brokers this play was CONFIRMED SOLD at — from the sell alerts,
+        broker by broker.
 
-        * **rounded_up** — a whole share came back, and a whole share is a whole
-          share everywhere, so every broker you hold pays.
-        * **fractional** — a fraction came back only at the three brokers that
-          hold fractions; the other seven settled it to cash and hold nothing.
-        * **anything else** — pending, cash in lieu, canceled, unknown — paid
-          nowhere and contributes nothing to any total.
+        This is the whole profit model, and the reason it is not the TRACK
+        status: a round-up is per broker, not per play. 'Rounded up' on the
+        board means it rounded up *somewhere*; Wells Fargo rounding a fraction
+        into a whole share says nothing about what Fidelity did with the same
+        position. Only the sell alert names brokers, and only a broker that
+        appears there had something real to sell.
 
-        The question this answers is "if I had bought every alert, in my
-        accounts, what would the splits have paid me?" — so it deliberately does
-        NOT narrow to the brokers the alerter's own sell message happened to
-        name. That list is which accounts THEY held, not which accounts rounded;
-        it stays on the Sells tab as reporting, and out of the arithmetic.
+        So: no confirmed sell, no money. A play that rounded up but has not been
+        sold anywhere yet contributes nothing until an exit names the brokers —
+        which is the conservative direction, and the honest one for a figure
+        the page calls confirmed.
 
         Returned as display names; pair with `broker_key()` to match settings.
         """
-        if self.paid_everywhere:
-            return SUPPORTED_BROKERS
-        if self.fraction_only:
-            return FRACTIONAL_BROKERS
-        return ()
+        legs = [leg.get("broker") for e in self.exits for leg in e.legs]
+        return tuple(dict.fromkeys(b for b in legs if b))   # de-duped, ordered
 
     @property
     def sold(self) -> bool:
@@ -466,6 +462,15 @@ class Board:
         """Round-ups left OUT of the number above for want of a price. Shown on
         the page: a total that quietly drops rows overstates its own coverage."""
         return len(self.rounded_history) - len(self.profit_basis)
+
+    @property
+    def awaiting_sale(self) -> list[PlayLife]:
+        """Splits that resolved into something sellable, but which no sell alert
+        has closed yet. They are worth nothing on the dashboard by design (see
+        `paying_brokers`) — this is what lets the page SAY so, instead of
+        quietly dropping them and looking like it lost money."""
+        return [l for l in self.history
+                if l.status in ("rounded_up", "fractional") and not l.exits]
 
     # ---- what the dashboard computes from
     @property
