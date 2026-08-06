@@ -723,24 +723,23 @@ function initAccounts(onChange) {
 }
 
 /* ------------------------------------------------------------- the figures */
-function summarise(rows, accounts, monthsBack) {
-  let cutoff = '';
-  if (monthsBack > 0) {
-    const d = new Date();
-    d.setMonth(d.getMonth() - monthsBack);
-    cutoff = d.toISOString().slice(0, 10);
-  }
-
+function summarise(rows, accounts, month) {
   const byMonth = new Map();
+  const detail = [];
   let total = 0, plays = 0;
+
   rows.forEach(r => {
-    if (cutoff && (r.on || '') < cutoff) return;
-    // The rule: only accounts at the brokers this play actually paid in.
-    const n = r.brokers.reduce((a, k) => a + (accounts[k] || 0), 0);
+    const key = (r.on || '').slice(0, 7) || '—';
+    if (month && key !== month) return;
+    // THE RULE: only your accounts at the brokers this play was sold at. A
+    // broker the sell alert never named contributes nothing, however many
+    // accounts you hold there.
+    const held = r.brokers.filter(k => (accounts[k] || 0) > 0);
+    const n = held.reduce((a, k) => a + accounts[k], 0);
     if (!n) return;
     const amount = r.per * n;
     total += amount; plays += 1;
-    const key = (r.on || '').slice(0, 7) || '—';
+    detail.push({ sym: r.sym, on: r.on, per: r.per, held, n, amount });
     const bucket = byMonth.get(key) || { key, total: 0, plays: 0 };
     bucket.total += amount; bucket.plays += 1;
     byMonth.set(key, bucket);
@@ -748,7 +747,9 @@ function summarise(rows, accounts, monthsBack) {
 
   const months = [...byMonth.values()].sort((a, b) => a.key < b.key ? -1 : 1);
   const best = months.reduce((a, m) => (!a || m.total > a.total) ? m : a, null);
-  return { total, plays, months, best, perMonth: months.length ? total / months.length : 0 };
+  detail.sort((a, b) => b.amount - a.amount);
+  return { total, plays, months, best, detail,
+           perMonth: months.length ? total / months.length : 0 };
 }
 
 /* --------------------------------------------------------------- the charts
@@ -983,11 +984,12 @@ function initPlaysDash() {
   const monthly = $('#chart-monthly'), cumulative = $('#chart-cumulative');
   const tableBody = $('#monthly-table tbody');
 
-  let range = 0;                       // 0 = all time
+  const auditBody = $('#audit-table tbody');
+  let month = '';                      // '' = all time
   let accounts = {};
 
   const paint = () => {
-    const s = summarise(rows, accounts, range);
+    const s = summarise(rows, accounts, month);
 
     if (heroTotal) heroTotal.textContent = money(s.total);
     if (heroSub) {
@@ -1009,6 +1011,20 @@ function initPlaysDash() {
       });
     }
 
+    if (auditBody) {
+      auditBody.innerHTML = '';
+      s.detail.forEach(d => {
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+          `<td class="mono dim">${d.on}</td><td><b>${d.sym}</b></td>` +
+          `<td class="mono">${money(d.per)}</td>` +
+          `<td class="small dim">${d.held.join(', ')}</td>` +
+          `<td class="mono">${d.n}</td>` +
+          `<td class="mono pos">${money(d.amount)}</td>`;
+        auditBody.appendChild(tr);
+      });
+    }
+
     monthlyChart(monthly, s.months);
     cumulativeChart(cumulative, s.months);
   };
@@ -1016,10 +1032,8 @@ function initPlaysDash() {
   $$('#range-row .chip').forEach(btn => {
     btn.addEventListener('click', () => {
       $$('#range-row .chip').forEach(b => b.classList.toggle('on', b === btn));
-      range = parseInt(btn.dataset.range, 10) || 0;
-      if (heroPeriod) {
-        heroPeriod.textContent = range ? `last ${range} months` : 'all time';
-      }
+      month = btn.dataset.month || '';
+      if (heroPeriod) heroPeriod.textContent = month || 'all time';
       paint();
     });
   });

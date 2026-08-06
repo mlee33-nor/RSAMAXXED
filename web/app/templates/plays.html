@@ -168,13 +168,19 @@
     <!-- ------------------------------------------------------- DASHBOARD -->
     <section class="pane p-dash">
       {# One filter row above everything it scopes — never a filter per card. #}
+      {#
+        Months, not rolling windows. The feed is three months old, so "last 3
+        / 6 / 12 months" were three buttons that all selected everything —
+        controls that visibly do nothing. One chip per month that actually has
+        payouts can never be empty and never lies about its own range.
+      #}
       <div class="filters" id="range-row">
         <span class="flabel">Period</span>
-        <div class="chips" role="group" aria-label="Time period">
-          <button type="button" class="chip" data-range="3">3 months</button>
-          <button type="button" class="chip" data-range="6">6 months</button>
-          <button type="button" class="chip" data-range="12">12 months</button>
-          <button type="button" class="chip on" data-range="0">All time</button>
+        <div class="chips" role="group" aria-label="Period">
+          <button type="button" class="chip on" data-month="">All time</button>
+          {% for m in totals.months %}
+            <button type="button" class="chip" data-month="{{ m.key }}">{{ m.key }}</button>
+          {% endfor %}
         </div>
         <span class="basis" id="basis-note">1 account at each broker · <label for="settings-open">change</label></span>
       </div>
@@ -232,10 +238,33 @@
               <tbody>
                 {% for m in totals.months %}
                   <tr><td class="mono">{{ m.key }}</td><td class="mono">{{ m.plays }}</td>
-                      <td class="mono pos" data-month="{{ m.key }}">{{ m.total | money }}</td></tr>
+                      <td class="mono pos">{{ m.total | money }}</td></tr>
                 {% endfor %}
               </tbody>
             </table>
+          </details>
+
+          {#
+            Every play in the selected period, with its own arithmetic spelled
+            out: what it paid per account, which of YOUR brokers it was sold at,
+            how many accounts that is, and the product. A total nobody can audit
+            is a total nobody should trust.
+          #}
+          <details class="tableview">
+            <summary>Show the arithmetic, play by play</summary>
+            <div class="htable-wrap">
+              <table class="htable" id="audit-table">
+                <thead>
+                  <tr><th>Alerted</th><th>Ticker</th><th>Per account</th>
+                      <th>Sold at, where you hold accounts</th><th>Accounts</th><th>Pays</th></tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <p class="muted" style="font-size:11.5px;margin:10px 0 0">
+              Brokers named by the sell alert that you hold no accounts at are
+              left out, and pay nothing.
+            </p>
           </details>
         </div>
 
