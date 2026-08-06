@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from fastapi import Request
 from fastapi.templating import Jinja2Templates
 
-from . import security
+from . import config, security
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(_HERE, "templates"))
@@ -34,6 +34,23 @@ def _asset_version() -> str:
 
 
 ASSET_V = _asset_version()
+
+
+def asset_version() -> str:
+    """The stamp to put on this render's asset URLs.
+
+    Read once at import in production, where these files cannot change without
+    a deploy that restarts the process anyway — two stat() calls per request
+    for an answer that is constant would be waste.
+
+    Recomputed per render everywhere else, because in local development the
+    files DO change under a running server. With a stamp fixed at import, an
+    edit to site.css keeps the old URL, the browser keeps serving what it has
+    cached for that URL, and the edit appears not to have happened until you
+    remember to restart. Since /static pins versioned URLs hard (see the cache
+    policy in main.py), the stamp has to move the moment the file does.
+    """
+    return ASSET_V if config.IS_PROD else _asset_version()
 
 
 def money(v: float | None, sign: bool = False) -> str:
@@ -112,5 +129,5 @@ def csrf_for(request: Request) -> str:
 def render(request: Request, name: str, **ctx):
     ctx.setdefault("user", None)
     ctx["csrf_token"] = csrf_for(request)
-    ctx["asset_v"] = ASSET_V
+    ctx["asset_v"] = asset_version()
     return templates.TemplateResponse(request, name, ctx)
