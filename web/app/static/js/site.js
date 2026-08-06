@@ -1279,6 +1279,11 @@ function initPlaysDash() {
   const heroTotal = $('#hero-total'), heroSub = $('#hero-sub'), heroPeriod = $('#hero-period');
   const heroSparkEl = $('#hero-spark');
   const kpiPer = $('#kpi-permonth'), kpiBest = $('#kpi-best'), kpiWhen = $('#kpi-best-when');
+  // The month in progress, and the key the SERVER decided it is. Taking it
+  // from the browser's own clock would let the tile and the page it sits in
+  // land on different months for anyone whose date is a few hours off ours.
+  const kpiThis = $('#kpi-thismonth'), kpiThisNote = $('#kpi-thismonth-note');
+  const thisKey = $('#tile-thismonth')?.dataset.month || '';
   const monthly = $('#chart-monthly'), brokersEl = $('#chart-brokers');
   const tableBody = $('#monthly-table tbody');
 
@@ -1304,6 +1309,19 @@ function initPlaysDash() {
         ? `across ${s.plays} plays with a confirmed sell, in the brokers each one actually sold at`
         : 'no confirmed sell in this period landed in a broker you hold';
     }
+    // Its own pass over the rows, scoped to the current month rather than to
+    // the selected period: switching the chips must not change what this
+    // month has made.
+    if (kpiThis && thisKey) {
+      const tm = summarise(rows, accounts, thisKey, names);
+      kpiThis.textContent = money(tm.total);
+      if (kpiThisNote) {
+        kpiThisNote.textContent = tm.plays
+          ? `${tm.plays} play${tm.plays === 1 ? '' : 's'} paid · ${thisKey}`
+          : 'nothing booked yet';
+      }
+    }
+
     if (kpiPer) kpiPer.textContent = money(s.perMonth);
     if (kpiBest) kpiBest.textContent = s.best ? money(s.best.total) : '—';
     if (kpiWhen) kpiWhen.textContent = s.best ? s.best.key : '';

@@ -1335,10 +1335,12 @@
   .spark{position:absolute;inset:auto 0 0 0;margin:0;line-height:0;z-index:0;opacity:.75}
   .spark svg{display:block;width:100%;height:auto}
   .spark-line{fill:none;stroke:var(--c-series);stroke-width:1.6;stroke-linejoin:round;stroke-linecap:round}
-  /* 126px, so all five KPIs sit on one row beside the hero instead of the
-     fifth wrapping alone and leaving a hole. */
-  .tiles.compact{grid-template-columns:repeat(auto-fit,minmax(126px,1fr));margin:0}
-  @media(max-width:1180px){ .tiles.compact{grid-template-columns:repeat(3,1fr)} }
+  /* Three across, so the six KPIs fill two rows exactly and leave no hole.
+     They were five on one row; a sixth cannot join them — at this page width
+     six columns give each tile about 83px of usable space, and "$1,269.42" at
+     the tile's own type size needs more than that. Two rows of three is also
+     what makes the tiles come out the height of the hero beside them. */
+  .tiles.compact{grid-template-columns:repeat(3,1fr);margin:0}
   @media(max-width:900px){ .tiles.compact{grid-template-columns:repeat(2,1fr)} }
   /* The tiles stretch to the hero's height whatever it is, so centre what is in
      them: content pinned to the top of a tall box reads as a rendering fault. */
