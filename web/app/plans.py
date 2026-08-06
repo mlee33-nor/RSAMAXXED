@@ -6,8 +6,10 @@ and nowhere else.
 
 Two tiers ship today:
 
-    plays       the alert feed — buys, exits and round-up confirmations,
-                on the web. Nothing to install.
+    plays       the alert feed — buys, exits and round-up confirmations, plus
+                the record of what every past split did. On the web, nothing to
+                install. Also sold to people who never make an account: the
+                /plays board takes a shared password instead (routes/plays.py).
     automation  the feed, plus the desktop terminal: it places and journals
                 the trades in your own brokerage accounts, and syncs the
                 journal back here.
@@ -55,8 +57,10 @@ PLANS: dict[str, Plan] = {
         key="plays",
         name="Plays Only",
         blurb="Every alert we get, the moment we get it. You place the trades.",
-        monthly=0,          # free tier — the alert feed is the funnel, not the product
-        annual_monthly=0,
+        # $15/mo. Annual is $12/mo ($144), which keeps the site-wide "2 months
+        # free" claim true — 12 x 12 is less than 10 x 15.
+        monthly=15,
+        annual_monthly=12,
         features=frozenset({FEED}),
         order=10,
     ),
