@@ -299,6 +299,124 @@ def test_the_calendar_marks_the_days_a_window_shuts(board):
     assert 'data-day=' in board
 
 
+# ------------------------------------------------- marking what you've bought
+# The one piece of state on this board that belongs to the READER. Eleven open
+# alerts look identical to someone who acted on four of them yesterday.
+
+def test_every_open_play_can_be_ticked_off(board):
+    """Otherwise the list can't answer the question it exists to answer: which
+    of these have I not bought yet."""
+    assert board.count('class="ownbox"') >= 1
+    assert 'aria-label="Mark HCWB as bought"' in board
+
+
+def test_a_mark_is_keyed_to_the_alert_and_not_to_a_row_id(board):
+    """The deploy runs an ephemeral database and re-ingests the feed, so row ids
+    move under a browser that is still holding notes. date:SYMBOL doesn't."""
+    assert 'data-play="2026-08-01:HCWB"' in board
+
+
+def test_a_mark_carries_the_post_split_ticker_too(anon):
+    """A reverse split renames the company. An exit published under the new
+    ticker still has to match the alert that was ticked under the old one, so
+    the mark carries both names."""
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={
+        "buys": [{"source_id": "rn:1", "symbol": "OLDCO", "kind": "standard",
+                  "alert_date": "2026-08-02", "last_buy_date": "2099-01-01"}],
+        "lifecycle": [{"source_id": "2026-08-02:OLDCO", "symbol": "OLDCO",
+                       "sell_symbol": "NEWCO", "alert_date": "2026-08-02",
+                       "status": "rounded_up", "kind": "standard"}],
+    })
+    assert 'data-syms="OLDCO,NEWCO"' in _unlock(anon).text
+
+
+def test_exits_say_which_symbol_and_day_they_closed(board):
+    """What lets the Sells tab flag the exits that close something you marked
+    bought — and the date is what stops it flagging the ticker's PREVIOUS
+    reverse split, which you never held."""
+    assert 'data-sym="AGAE"' in board
+    assert 'data-sold="2026-07-20"' in board
+
+
+def test_the_open_list_is_addressable_apart_from_the_closed_one(board):
+    """'How many are left to buy' must never count a window that already shut."""
+    assert 'id="open-plays"' in board
+
+
+def test_the_marks_never_reach_the_server():
+    """There is no account behind this board — one shared password identifies
+    nobody — so a note about what someone bought has nowhere to live but their
+    own browser, and no business anywhere else."""
+    with TestClient(app) as c:
+        js = c.get("/static/js/site.js").text
+    assert "rsamaxxed.bought" in js
+    assert "localStorage" in js
+    # The page does make one request — it polls the feed for new alerts — so
+    # "no network at all" is no longer the guarantee. This is: nothing is ever
+    # UPLOADED. No request body, no verb but the default GET, no beacon. There
+    # is therefore no path by which a mark could leave the browser.
+    for upload in ("body:", "method:", "sendBeacon", "XMLHttpRequest", "FormData"):
+        assert upload not in js, f"site.js can send data to the server via {upload}"
+
+
+# --------------------------------------------------- the new-alert chime
+
+def test_the_board_offers_a_chime_and_leaves_it_off(board):
+    """A browser refuses to make a sound until the page has been clicked, so an
+    'on by default' toggle would be a lie on first load. The click that turns it
+    on is the gesture that makes audio legal in the first place."""
+    assert 'id="sound-toggle"' in board
+    assert 'aria-pressed="false"' in board
+    assert "Chime off" in board
+
+
+def test_an_open_tab_learns_about_new_alerts_without_being_reloaded():
+    """The board is a server-rendered snapshot — without a poll, a tab left open
+    all day would never find out that anything had landed."""
+    with TestClient(app) as c:
+        js = c.get("/static/js/site.js").text
+    assert "/api/v1/public/plays" in js
+    assert "setInterval(poll" in js
+
+
+def test_the_poll_reads_the_feed_off_the_same_cookie_the_board_uses(anon):
+    """No key in the JavaScript: the page is already through the gate, and the
+    feed door accepts that. A password pasted into a static asset would be
+    published to everyone who can read the asset — which is everyone."""
+    _unlock(anon)
+    assert anon.get("/api/v1/public/plays").status_code == 200
+
+    stranger = TestClient(app)
+    assert stranger.get("/api/v1/public/plays").status_code == 401
+
+    with TestClient(app) as c:
+        js = c.get("/static/js/site.js").text
+    assert PASSWORD not in js
+    assert "credentials: 'same-origin'" in js
+
+
+def test_the_chime_needs_no_audio_file():
+    """default-src 'self' forbids a data: URI for media, and a served sound file
+    would be one more asset to cache-bust. It is synthesised instead."""
+    with TestClient(app) as c:
+        js = c.get("/static/js/site.js").text
+        csp = c.get("/plays").headers["content-security-policy"]
+    assert "createOscillator" in js
+    assert "<audio" not in js
+    assert "media-src" not in csp        # nothing had to be loosened for it
+
+
+def test_the_checkbox_is_hidden_until_the_script_that_makes_it_work_has_run():
+    """Every other control on this board works with JavaScript blocked. This one
+    cannot — so it must be absent rather than present and quietly amnesiac."""
+    with TestClient(app) as c:
+        css = c.get("/static/css/site.css").text
+        js = c.get("/static/js/site.js").text
+    assert ".own,.markbar{display:none}" in css
+    assert "html.js .own" in css
+    assert "classList.add('js')" in js
+
+
 # ------------------------------------------------------ the payout arithmetic
 # The rule the whole dashboard rests on, and the one the naive version got
 # wrong: a play pays YOUR accounts AT THE BROKERS IT ACTUALLY PAID IN. Not

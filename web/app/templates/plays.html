@@ -51,6 +51,26 @@
   {% set p = l.play %}
   <li class="prow {{ 'past' if closed else l.stage }}{% if not p.is_actionable %} watch{% endif %}">
     <div class="prow-top">
+      {#
+        The one control on this board that is about the READER rather than the
+        feed. Eleven open alerts look identical to someone who acted on four of
+        them yesterday; a tick is how they tell those apart, and everything
+        untocked is what is left to buy.
+
+        It is a note in this browser and nowhere else — the board is behind one
+        shared password, so there is no account to hang it on. Which is also why
+        the whole affordance is hidden until site.js has run (html.js): a
+        checkbox that silently forgets itself on reload is worse than none.
+
+        data-syms carries the post-split ticker too, so an exit published under
+        the renamed symbol still matches the alert that was ticked.
+      #}
+      <label class="own" title="Mark bought — a note in this browser only">
+        <input type="checkbox" class="ownbox" data-play="{{ l.key }}"
+               data-syms="{{ p.symbol }}{% if l.renamed %},{{ l.sell_symbol }}{% endif %}"
+               aria-label="Mark {{ p.symbol }} as bought">
+        <i aria-hidden="true"></i><span>Bought</span>
+      </label>
       <b class="sym">{{ p.symbol }}</b>
       {{ kindtag(p.kind) }}
       {% if l.life or l.rounded_up %}{{ statustag(l) }}{% endif %}
@@ -99,6 +119,21 @@
       <span class="eyebrow{% if not board.last_update %} stale{% endif %}">
         <i class="pip"></i> Updated {{ board.last_update | ago }}
       </span>
+
+      {#
+        The chime. Off until it is deliberately switched on, and that is not
+        politeness — a browser refuses to make a sound until the page has been
+        clicked, so an "on by default" toggle would be a lie on first load. The
+        click that turns it on is the gesture that makes audio work at all, and
+        it plays once there so you hear exactly what you agreed to.
+
+        Remembered in this browser, like everything else on this page that is
+        about the reader rather than the feed.
+      #}
+      <button type="button" class="gear snd" id="sound-toggle" aria-pressed="false"
+              title="Chime when a new alert lands">
+        <span class="sndico" aria-hidden="true">♪</span><span id="sound-label">Chime off</span>
+      </button>
 
       {#
         The accounts popover. How many accounts you hold AT EACH BROKER is the
@@ -163,7 +198,11 @@
     <nav class="tabbar" aria-label="Plays sections">
       <label for="tab-dash">Dashboard</label>
       <label for="tab-cal">Calendar<b>{{ board.open_count }}</b></label>
-      <label for="tab-buys">Buys<b>{{ board.open_count }}</b></label>
+      {# The badge counts what is LEFT once the reader has ticked what they
+         bought (see initBought in site.js). The server can't know that, so it
+         renders the honest fallback — every open play — and the browser
+         narrows it. #}
+      <label for="tab-buys">Buys<b id="buys-badge" title="{{ board.open_count }} open plays">{{ board.open_count }}</b></label>
       <label for="tab-sells">Sells<b>{{ board.exit_count }}</b></label>
       <label for="tab-track">Tracking<b>{{ board.history | length }}</b></label>
     </nav>
@@ -452,7 +491,17 @@
           Nothing open. Every alert in the window has passed its last buy date.
         </p>
       {% else %}
-        <ul class="plist grid2">
+        {# Its own row rather than a third item in the card header: the header is
+           a title and a caption, and this is a toolbar over the list below it.
+           Empty until site.js fills it, and invisible without site.js at all. #}
+        <div class="markbar" id="markbar">
+          <span class="mstat" id="mark-stat"></span>
+          <button type="button" class="chip sm" id="mark-hide" aria-pressed="false">Hide bought</button>
+          <button type="button" class="linkish" id="mark-clear" hidden>Clear marks</button>
+        </div>
+        {# id, not a positional selector: the closed fold below renders the same
+           rows, and "how many are left to buy" must never count those. #}
+        <ul class="plist grid2" id="open-plays">
           {% for l in board.open_plays %}{{ playrow(l) }}{% endfor %}
         </ul>
       {% endif %}
@@ -497,7 +546,13 @@
             </div>
             <ul class="plist grid2">
               {% for e in rows %}
-                <li class="prow exit">
+                {# data-sym/data-sold are the payoff for ticking a box on the
+                   Buys tab: site.js flags the exits that close something the
+                   reader marked bought. The date is carried because an exit
+                   older than the alert belongs to that ticker's PREVIOUS split,
+                   and flagging it would tell someone they hold what they
+                   don't. #}
+                <li class="prow exit" data-sym="{{ e.symbol }}" data-sold="{{ e.sell_date }}">
                   <div class="prow-top">
                     <b class="sym">{{ e.symbol }}</b>
                     {% if e.symbol in board.roundup_symbols %}<span class="ptag ru">rounded up</span>{% endif %}
