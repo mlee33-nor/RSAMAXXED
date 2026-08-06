@@ -486,7 +486,14 @@ class Board:
                 continue
             rows.append({
                 "sym": l.play.symbol,
-                "on": l.resolved_on,
+                # The ALERT month, not the month the split resolved. The page
+                # asks "if I had bought everything, what did each month make",
+                # and you buy on the alert — so the payout belongs to the month
+                # you would have put the money in. Booking it to the resolution
+                # date instead drains a month of its own plays and piles them
+                # into the next one, which is what made June read as empty.
+                "on": l.play.alert_date or l.resolved_on,
+                "booked": l.resolved_on,
                 "per": round(per, 4),
                 "brokers": [broker_key(b) for b in brokers],
                 "status": l.status,
