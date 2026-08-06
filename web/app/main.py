@@ -134,6 +134,12 @@ async def _security_headers(request: Request, call_next):
             if "v=" in request.url.query
             else "public, max-age=300",
         )
+    elif request.url.path in ("/robots.txt", "/sitemap.xml"):
+        # Crawler-facing, identical for everyone, and no business being marked
+        # private or session-varying. An hour is short enough to correct a
+        # mistake the same day and long enough to stop a bot re-fetching it on
+        # every page it visits.
+        response.headers.setdefault("Cache-Control", "public, max-age=3600")
     else:
         # Everything else here is personalised, gated, or live data.
         response.headers.setdefault("Cache-Control", "no-store")

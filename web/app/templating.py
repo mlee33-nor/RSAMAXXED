@@ -24,7 +24,11 @@ def _asset_version() -> str:
     they do and never needs remembering.
     """
     stamp = 0
-    for rel in ("static/css/site.css", "static/js/site.js"):
+    # The social card is in here too: it is served from /static under the same
+    # year-long immutable pin as the other two, so a redesigned card that did
+    # not move the stamp would keep showing the old image to every scraper
+    # that had already fetched it.
+    for rel in ("static/css/site.css", "static/js/site.js", "static/img/og.png"):
         try:
             st = os.stat(os.path.join(_HERE, rel))
             stamp ^= int(st.st_mtime) ^ (st.st_size << 8)
@@ -130,4 +134,10 @@ def render(request: Request, name: str, **ctx):
     ctx.setdefault("user", None)
     ctx["csrf_token"] = csrf_for(request)
     ctx["asset_v"] = asset_version()
+    # Absolute origin for the link-preview tags and the canonical URL. A
+    # scraper resolves nothing relative, so "/static/img/og.png" in an og:image
+    # is simply a card that never renders. Prefer the configured origin;
+    # derive it from the request otherwise, which behind Railway's proxy needs
+    # uvicorn's --proxy-headers or it hands out an http:// URL (see routes/api).
+    ctx["base_url"] = config.PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
     return templates.TemplateResponse(request, name, ctx)

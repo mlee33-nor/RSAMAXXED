@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import PlainTextResponse
 
 from .. import config, plans
 from ..db import engine
@@ -28,6 +29,51 @@ def pricing(request: Request, user: User | None = Depends(current_user)):
     # only one of them.
     return render(request, "pricing.html", user=user,
                   plays=plans.PLANS["plays"], automation=plans.PLANS["automation"])
+
+
+@router.get("/robots.txt", response_class=PlainTextResponse)
+def robots(request: Request) -> str:
+    """What a crawler may index.
+
+    The marketing pages and the /plays gate are the front door and should be
+    found. Everything below is either a form, an authenticated surface, or an
+    API — indexing them wastes crawl budget and puts URLs in results that
+    return a redirect or a 401 to whoever clicks them.
+
+    The board itself needs no rule: it is behind the password, so a crawler
+    reaches the gate and nothing else. This file is a courtesy to well-behaved
+    bots and never a security control.
+    """
+    base = config.PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+    return "\n".join((
+        "User-agent: *",
+        "Allow: /",
+        "Disallow: /api/",
+        "Disallow: /app/",
+        "Disallow: /login",
+        "Disallow: /signup",
+        "Disallow: /healthz",
+        "",
+        f"Sitemap: {base}/sitemap.xml",
+        "",
+    ))
+
+
+@router.get("/sitemap.xml", response_class=PlainTextResponse)
+def sitemap(request: Request) -> Response:
+    """The three public pages, so a launch does not wait on discovery."""
+    base = config.PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+    urls = "".join(
+        f"<url><loc>{base}{path}</loc><changefreq>{freq}</changefreq></url>"
+        for path, freq in (("/", "weekly"), ("/how-it-works", "monthly"),
+                           ("/pricing", "monthly"), ("/plays", "daily"))
+    )
+    return Response(
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        f"{urls}</urlset>",
+        media_type="application/xml",
+    )
 
 
 @router.get("/healthz")

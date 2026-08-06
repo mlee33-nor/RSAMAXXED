@@ -1,5 +1,12 @@
 {% extends "base.html" %}
 {% block title %}Plays — RSAMAXXED{% endblock %}
+{#
+  THIS is the page a shared /plays link previews as, not plays.html: anyone
+  who has not typed the password lands here, which is everyone the link is
+  being sent to. Inheriting base.html's automation copy would advertise the
+  paid terminal on every share of the free board.
+#}
+{% block description %}Every reverse-split round-up alert, the deadline to buy it, what the split actually did, and what the record was worth. One password, no account, no card.{% endblock %}
 {% block nav_plays %}on{% endblock %}
 
 {#
