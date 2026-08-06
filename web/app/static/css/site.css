@@ -1139,6 +1139,107 @@
   .tile.hot{border-color:rgba(242,193,78,.32);background:rgba(242,193,78,.045)}
   .tile.hot .v{color:var(--amber)}
 
+  /* ================================================== "I BOUGHT THIS" MARKS
+     The reader's own note on a play, and the only state on this board that
+     isn't the feed's. It lives in localStorage because it has nowhere else to
+     live — the board is behind one shared password and there is no account to
+     hang it on.
+
+     Which is why the whole affordance is gated on html.js, set at the top of
+     site.js: a checkbox that silently forgets itself on reload is worse than
+     not offering one, and every other control on this page works with scripts
+     blocked. */
+  .own,.markbar{display:none}
+  html.js .own{display:inline-flex}
+  html.js .markbar{display:flex}
+
+  .own{
+    align-items:center;gap:6px;flex:none;cursor:pointer;margin:0;
+    font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:650;
+    color:var(--text-3);user-select:none;
+    transition:color .15s var(--ease);
+  }
+  .own:hover{color:var(--text-2)}
+  /* Off-screen rather than display:none — a hidden input takes no focus, and
+     the box is only reachable by keyboard through the real checkbox. */
+  .own input{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+  .own i{
+    width:15px;height:15px;border-radius:5px;flex:none;display:grid;place-items:center;
+    border:1px solid var(--line-2);background:rgba(255,255,255,.02);
+    transition:border-color .15s var(--ease),background .15s var(--ease);
+  }
+  .own i::after{
+    content:"";width:7px;height:4px;margin-top:-2px;
+    border-left:2px solid var(--bg);border-bottom:2px solid var(--bg);
+    transform:rotate(-45deg) scale(.4);opacity:0;
+    transition:transform .16s var(--ease),opacity .16s var(--ease);
+  }
+  .own:hover i{border-color:var(--accent)}
+  .own input:checked + i{background:var(--green);border-color:var(--green)}
+  .own input:checked + i::after{opacity:1;transform:rotate(-45deg) scale(1)}
+  .own input:focus-visible + i{outline:2px solid var(--accent);outline-offset:2px}
+  .own input:checked ~ span{color:var(--green)}
+
+  /* A ticked row steps back; it does not disappear. The job is telling it
+     apart from the ones still to do, not losing it — hiding is the separate,
+     deliberate act of the toggle below. */
+  .prow.bought{opacity:.5;border-left:2px solid rgba(52,211,158,.55)}
+  .prow.bought:hover{opacity:.85}
+  html.hide-bought .prow.bought{display:none}
+
+  .markbar{align-items:center;gap:10px;flex-wrap:wrap;margin:-4px 0 14px}
+  .markbar .mstat{font-size:12px;color:var(--text-2)}
+  .markbar .mstat b{font-family:var(--mono);color:var(--text);font-weight:650}
+  .markbar .chip.sm{padding:4px 11px;font-size:11.5px}
+  .markbar .linkish{font-size:11.5px;padding:4px 9px;color:var(--text-3)}
+  .markbar .linkish.armed{color:var(--red)}
+
+  /* The payoff, on the Sells tab: a solid pill, so it can't be mistaken for
+     the translucent "rounded up" tag sitting beside it. */
+  .ptag.you{color:var(--bg);background:var(--green)}
+  .prow.exit.held{border-left-color:var(--green)}
+
+  /* ==================================================== THE NEW-ALERT CHIME
+     A <button> wearing the gear's pill, so the two controls in the header read
+     as one row. Buttons bring their own background, font and border. */
+  .gear.snd{background:transparent;font:inherit;font-size:12.5px}
+  .gear.snd .sndico{font-size:13px;line-height:1;opacity:.75}
+  .gear.snd.on{
+    color:var(--text);border-color:var(--green);background:rgba(52,211,158,.09);
+  }
+  .gear.snd.on .sndico{opacity:1;color:var(--green)}
+  /* Hidden with scripts blocked, for the same reason as the checkboxes: it
+     cannot do anything without site.js, and a dead control is worse than none. */
+  .gear.snd{display:none}
+  html.js .gear.snd{display:inline-flex}
+
+  /* The toast. Bottom-right, above everything, and it never redraws the board
+     under someone who is reading it — it says what landed and offers the
+     reload. */
+  #toast-host{
+    position:fixed;right:18px;bottom:18px;z-index:60;
+    display:flex;flex-direction:column;gap:8px;max-width:min(92vw,340px);
+  }
+  .toast{
+    display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+    padding:13px 15px;border-radius:var(--r);
+    background:var(--surface);border:1px solid var(--line-2);box-shadow:var(--lift);
+    animation:toast-in .32s var(--ease) both;
+  }
+  .toast b{font-size:13px;font-weight:640;white-space:nowrap}
+  .toast .syms{
+    font-family:var(--mono);font-size:12px;color:var(--text-2);
+    flex:1;min-width:80px;overflow:hidden;text-overflow:ellipsis;
+  }
+  .toast .btn{flex:none}
+  .toast .tclose{
+    background:none;border:0;cursor:pointer;color:var(--text-3);
+    font-size:13px;padding:2px 4px;line-height:1;
+  }
+  .toast .tclose:hover{color:var(--text)}
+  @keyframes toast-in{from{opacity:0;transform:translateY(10px) scale(.97)}}
+  @media(prefers-reduced-motion:reduce){ .toast{animation:none} }
+
   /* ============================================================ PLAYS TABS
      Radio inputs and sibling selectors, not JavaScript. The board is the thing
      people paid for; it must not depend on a script to be readable, and the CSP

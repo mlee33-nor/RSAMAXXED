@@ -114,6 +114,18 @@ class PlayLife:
         return self.play.symbol
 
     @property
+    def key(self) -> str:
+        """This alert's identity for anything the READER stores about it.
+
+        'date:SYMBOL' — the same shape the TRACK board is keyed on, and
+        deliberately not the row id or the `source_id`. Those are ours: the
+        deploy runs an ephemeral database and the feed is re-ingested, so an id
+        moves under a browser that is still holding a note about that play. The
+        date it was alerted and the ticker are the alert, and they survive it.
+        """
+        return _life_key(self.play.alert_date, self.play.symbol)
+
+    @property
     def booked_low(self) -> float:
         return sum(e.proceeds_low or 0.0 for e in self.exits)
 

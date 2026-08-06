@@ -7,6 +7,13 @@
    ========================================================================= */
 'use strict';
 
+/* Set here rather than in boot(), so it lands the moment this deferred file
+   starts executing instead of a frame later. Controls that CANNOT work without
+   this file — the "bought" checkboxes on the plays board are the only ones —
+   stay hidden until it does. Everything else on the site renders and reads with
+   scripts blocked, and must keep doing so. */
+document.documentElement.classList.add('js');
+
 const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const FINE_POINTER = matchMedia('(pointer:fine)').matches;
 
@@ -1400,6 +1407,357 @@ function initPlaysDash() {
   }, { passive: true });
 }
 
+/* ============================================================================
+   "I BOUGHT THIS" — the reader's own marks
+   ----------------------------------------------------------------------------
+   Eleven open alerts look identical to someone who acted on four of them
+   yesterday. A tick is how they tell those apart: everything unticked is what
+   is left to buy, which is the question the Buys tab is opened to answer.
+
+   Stored in localStorage and nowhere else. The board is behind one shared
+   password — there is no account to hang a note on, and none of this is any of
+   our business. The controls are hidden until this file runs (html.js, set at
+   the top) rather than server-rendered and inert: a checkbox that forgets
+   itself on reload is worse than none.
+
+   Identity is `alert_date:SYMBOL`, matching playsfeed.PlayLife.key, and not a
+   row id — the deploy runs an ephemeral database and re-ingests the feed, so
+   ids move under a browser that is still holding notes about them.
+   ========================================================================= */
+
+const BOUGHT_STORE = 'rsamaxxed.bought.v1';
+const HIDE_STORE = 'rsamaxxed.bought.hide';
+
+function readBought() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(BOUGHT_STORE) || 'null');
+    return (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  } catch (e) { return {}; }        // blocked storage, private mode, corrupt
+}
+
+function writeBought(map) {
+  try { localStorage.setItem(BOUGHT_STORE, JSON.stringify(map)); } catch (e) { /* fine */ }
+}
+
+function initBought() {
+  const boxes = $$('.ownbox');
+  if (!boxes.length) return;
+
+  let marks = readBought();
+  const stat = $('#mark-stat'), hideBtn = $('#mark-hide'), clearBtn = $('#mark-clear');
+  const badge = $('#buys-badge');
+  // Open plays only. The closed fold below the list renders the same rows, and
+  // "how many are left to buy" must never count a window that has already shut.
+  const openBoxes = $$('#open-plays .ownbox');
+  const total = openBoxes.length;
+  const exits = $$('.prow.exit[data-sym]');
+
+  /* The payoff for ticking a box. When a sell alert lands for something the
+     reader marked bought, the Sells tab says so instead of making them
+     remember — which is the moment the money is actually made.
+
+     Matched on ticker AND date: a mark carries the date it was alerted in its
+     key, and an exit older than that belongs to the ticker's PREVIOUS reverse
+     split. Flagging that would tell someone they hold a position they don't. */
+  const markExits = () => {
+    if (!exits.length) return;
+    const held = new Map();               // SYMBOL -> earliest alert date marked
+    boxes.forEach(box => {
+      if (!marks[box.dataset.play]) return;
+      const on = (box.dataset.play || '').split(':')[0] || '';
+      (box.dataset.syms || '').split(',').forEach(raw => {
+        const sym = raw.trim().toUpperCase();
+        if (!sym) return;
+        const prev = held.get(sym);
+        if (prev === undefined || on < prev) held.set(sym, on);
+      });
+    });
+
+    exits.forEach(li => {
+      const from = held.get((li.dataset.sym || '').toUpperCase());
+      const yours = from !== undefined && (li.dataset.sold || '') >= from;
+      li.classList.toggle('held', yours);
+      const tag = $('.ptag.you', li);
+      if (yours && !tag) {
+        const t = document.createElement('span');
+        t.className = 'ptag you';
+        t.textContent = 'You bought';
+        $('.sym', li)?.after(t);
+      } else if (!yours && tag) {
+        tag.remove();
+      }
+    });
+  };
+
+  const paint = () => {
+    // Every box is repainted from the store, which is what keeps the copies of
+    // one play in sync: the same alert is drawn on the Buys tab, in the
+    // calendar's day list and in "Closing next", and ticking one has to tick
+    // its twins or the board disagrees with itself tab by tab.
+    boxes.forEach(box => {
+      box.checked = !!marks[box.dataset.play];
+      box.closest('.prow')?.classList.toggle('bought', box.checked);
+    });
+
+    const done = openBoxes.filter(b => b.checked).length;
+    const left = total - done;
+    if (stat) {
+      stat.innerHTML = done
+        ? `<b>${left}</b> still to buy · ${done} marked bought`
+        : `<b>${total}</b> open · tick the ones you have already bought`;
+    }
+    if (badge) {
+      badge.textContent = left;
+      badge.title = done ? `${left} of ${total} open plays not marked bought`
+                         : `${total} open plays`;
+    }
+    if (clearBtn) clearBtn.hidden = !Object.keys(marks).length;
+    markExits();
+  };
+
+  boxes.forEach(box => box.addEventListener('change', () => {
+    const key = box.dataset.play;
+    // The date it was ticked, not a flag: it costs nothing to keep and it is
+    // the only thing that could ever say how stale a note is.
+    if (box.checked) marks[key] = new Date().toISOString().slice(0, 10);
+    else delete marks[key];
+    writeBought(marks);
+    paint();
+  }));
+
+  /* Hiding is a separate, deliberate act from marking — a ticked row still
+     reads perfectly well dimmed, and someone who bought everything should not
+     be shown an empty tab by default. Remembered, because a preference you
+     have to set on every visit isn't one. */
+  const setHide = (on, persist) => {
+    document.documentElement.classList.toggle('hide-bought', on);
+    hideBtn?.classList.toggle('on', on);
+    hideBtn?.setAttribute('aria-pressed', String(on));
+    if (persist) { try { localStorage.setItem(HIDE_STORE, on ? '1' : ''); } catch (e) { /* fine */ } }
+  };
+  let hidden = false;
+  try { hidden = localStorage.getItem(HIDE_STORE) === '1'; } catch (e) { /* fine */ }
+  setHide(hidden, false);
+  hideBtn?.addEventListener('click', () =>
+    setHide(!document.documentElement.classList.contains('hide-bought'), true));
+
+  /* Clear arms on the first click and fires on the second. A window.confirm
+     would do the same job, but a modal dialog for a note in localStorage is a
+     heavier interruption than the thing it is protecting. */
+  let armed = false;
+  const disarm = () => {
+    armed = false;
+    if (clearBtn) { clearBtn.textContent = 'Clear marks'; clearBtn.classList.remove('armed'); }
+  };
+  clearBtn?.addEventListener('click', () => {
+    if (!armed) {
+      armed = true;
+      clearBtn.textContent = 'Clear every mark — sure?';
+      clearBtn.classList.add('armed');
+      return;
+    }
+    marks = {};
+    writeBought(marks);
+    disarm();
+    paint();
+  });
+  // Capture, so a click anywhere else takes the safety back off before that
+  // click does whatever it was going to do.
+  addEventListener('click', e => { if (armed && e.target !== clearBtn) disarm(); }, true);
+
+  paint();
+}
+
+/* ============================================================================
+   THE NEW-ALERT CHIME
+   ----------------------------------------------------------------------------
+   The board is a server-rendered snapshot: it draws once and never speaks to
+   the server again, so on its own an open tab would never learn that an alert
+   had landed. This is the only thing on the page that polls, and it earns that
+   because a reverse-split buy window is measured in days and sometimes hours —
+   somebody who leaves the tab open all day should not have to keep reloading it
+   to find out whether there is anything to buy.
+
+   Three constraints shaped every decision here:
+
+     AUTOPLAY  a browser will not make a sound until the page has been clicked.
+               So the chime is armed by a deliberate toggle rather than being on
+               by default — an "on" that silently does nothing on first load is
+               worse than an "off". The click that enables it IS the gesture
+               that makes audio legal, which is why it plays once right there.
+     CSP       default-src 'self' forbids a data: audio URI, so there is no
+               sound FILE to serve, cache-bust or add a policy exception for.
+               The cha-ching is synthesised in WebAudio.
+     HONESTY   the chime does not redraw the board. Rewriting the page under
+               someone who is reading it would be worse than the reload it
+               saves, so it says what landed and offers the reload.
+
+   The poll runs whether or not the sound is on: the toast and the tab-title
+   badge are useful to someone who wants to be told quietly.
+   ========================================================================= */
+
+const SOUND_STORE = 'rsamaxxed.sound';
+const POLL_MS = 60000;
+const FEED_URL = '/api/v1/public/plays';
+
+/* A cash register, from parts: a filtered noise transient for the drawer, then
+   two bell strikes a fifth apart — the "cha" and the "CHING". The partials are
+   deliberately inharmonic (x2.01, x2.99 rather than x2, x3); exact harmonics
+   read as an organ, and struck metal never is. */
+function chaChing(ctx) {
+  const now = ctx.currentTime;
+  const out = ctx.createGain();
+  out.gain.value = 0.22;                    // quiet: this fires unprompted
+  out.connect(ctx.destination);
+
+  const noise = ctx.createBufferSource();
+  const buf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 0.06), ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < data.length; i++) {
+    data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+  }
+  noise.buffer = buf;
+  const band = ctx.createBiquadFilter();
+  band.type = 'bandpass';
+  band.frequency.value = 2400;
+  band.Q.value = 0.9;
+  const ng = ctx.createGain();
+  ng.gain.setValueAtTime(0.5, now);
+  ng.gain.exponentialRampToValueAtTime(0.0001, now + 0.07);
+  noise.connect(band).connect(ng).connect(out);
+  noise.start(now);
+
+  [[0, 1046.5, 0.42], [0.085, 1568.0, 0.9]].forEach(([at, hz, ring], strike) => {
+    [1, 2.01, 2.99].forEach((mult, partial) => {
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.value = hz * mult;
+      const gain = ctx.createGain();
+      const t = now + at;
+      const peak = (0.34 / (partial + 1)) * (strike ? 1.15 : 0.8);
+      gain.gain.setValueAtTime(0.0001, t);
+      gain.gain.exponentialRampToValueAtTime(peak, t + 0.006);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + ring);
+      osc.connect(gain).connect(out);
+      osc.start(t);
+      osc.stop(t + ring + 0.05);
+    });
+  });
+}
+
+function initPlayAlerts() {
+  const btn = $('#sound-toggle');
+  if (!btn) return;                          // not the plays board
+  const label = $('#sound-label');
+
+  /* The baseline is the PAGE, not the first poll: the board renders exactly the
+     open plays the feed holds, so anything the next poll knows that this page
+     doesn't is genuinely new since it was opened. */
+  const known = new Set($$('#open-plays .ownbox').map(b => b.dataset.play));
+  const BASE_TITLE = document.title;
+  let pending = 0;
+
+  let ctx = null;
+  const arm = () => {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!ctx && AC) ctx = new AC();
+    // Chrome starts a context suspended when it isn't sure about the gesture.
+    if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
+    return ctx;
+  };
+  const ping = () => { try { if (arm()) chaChing(ctx); } catch (e) { /* no audio */ } };
+
+  let soundOn = false;
+  try { soundOn = localStorage.getItem(SOUND_STORE) === '1'; } catch (e) { /* fine */ }
+
+  const paintToggle = () => {
+    btn.classList.toggle('on', soundOn);
+    btn.setAttribute('aria-pressed', String(soundOn));
+    if (label) label.textContent = soundOn ? 'Chime on' : 'Chime off';
+  };
+  paintToggle();
+
+  // A browser that already has permission from a previous visit still needs a
+  // gesture in THIS one. The first click anywhere is enough, and costs nothing.
+  if (soundOn) addEventListener('pointerdown', arm, { once: true, passive: true });
+
+  btn.addEventListener('click', () => {
+    soundOn = !soundOn;
+    try { localStorage.setItem(SOUND_STORE, soundOn ? '1' : ''); } catch (e) { /* fine */ }
+    paintToggle();
+    if (soundOn) ping();                     // hear what you just agreed to
+  });
+
+  /* The tab title, so a chime from a background tab has something to point at.
+     Cleared by a reload, which is the only thing that actually resolves it. */
+  const setBadge = () => {
+    document.title = pending ? `(${pending}) ${BASE_TITLE}` : BASE_TITLE;
+  };
+
+  const toast = symbols => {
+    let host = $('#toast-host');
+    if (!host) {
+      host = document.createElement('div');
+      host.id = 'toast-host';
+      host.setAttribute('role', 'status');
+      host.setAttribute('aria-live', 'polite');
+      document.body.appendChild(host);
+    }
+    host.innerHTML = '';                     // one toast, always the latest count
+
+    const card = document.createElement('div');
+    card.className = 'toast';
+
+    const title = document.createElement('b');
+    title.textContent = pending === 1 ? 'New alert' : `${pending} new alerts`;
+
+    // textContent, not innerHTML: these strings come off the wire, and a
+    // ticker is never worth an injection hole.
+    const syms = document.createElement('span');
+    syms.className = 'syms';
+    syms.textContent = symbols.slice(0, 4).join(', ') + (symbols.length > 4 ? '…' : '');
+
+    const show = document.createElement('button');
+    show.type = 'button';
+    show.className = 'btn btn-sm';
+    show.textContent = 'Show';
+    show.addEventListener('click', () => location.reload());
+
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'tclose';
+    close.setAttribute('aria-label', 'Dismiss');
+    close.textContent = '✕';
+    close.addEventListener('click', () => host.remove());
+
+    card.append(title, syms, show, close);
+    host.appendChild(card);
+  };
+
+  const poll = () => {
+    fetch(FEED_URL, { credentials: 'same-origin', cache: 'no-store',
+                      headers: { Accept: 'application/json' } })
+      .then(r => (r.ok ? r.json() : null))    // 401 = the gate expired. Stay quiet.
+      .then(feed => {
+        if (!feed) return;
+        // The same identity the board and the "bought" marks use, so a play
+        // cannot be new here and familiar three lines further down the page.
+        const fresh = (feed.buys || [])
+          .map(p => `${p.alert_date || ''}:${String(p.symbol || '').toUpperCase()}`)
+          .filter(k => k !== ':' && !known.has(k));
+        if (!fresh.length) return;
+        fresh.forEach(k => known.add(k));
+        pending += fresh.length;
+        setBadge();
+        toast(fresh.map(k => k.split(':')[1]));
+        if (soundOn) ping();
+      })
+      .catch(() => { /* offline, or the tab was frozen. Try again next tick. */ });
+  };
+
+  setInterval(poll, POLL_MS);
+}
+
 /* ---------------------------------------------------------------- the pager
    Day-groups, N at a time. Everything is in the DOM already — this only sets
    `hidden` — so with the script blocked the tab is simply a long complete list
@@ -1468,6 +1826,8 @@ function boot() {
   initPlaysDash();
   initPlaysCalendar();
   initPager();
+  initBought();
+  initPlayAlerts();
 }
 
 if (document.readyState === 'loading') addEventListener('DOMContentLoaded', boot);
