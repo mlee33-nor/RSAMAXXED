@@ -849,11 +849,32 @@ def import_picks_file(db: Session, path: str) -> int:
     existing = set(db.scalars(select(Play.source_id).where(
         Play.source_id.in_([r[0] for r in rows])
     )))
+
+    # And skip anything the feed already carries for that SYMBOL AND DATE,
+    # whatever source_id it arrived under.
+    #
+    # The two paths key the same real alert differently: the publisher uses the
+    # Discord message id, this file uses picks:SYM:DATE. Matching on source_id
+    # alone therefore lets one alert land twice — once complete from the
+    # publisher, with its ratio, entry price and buy deadline, and once bare
+    # from here with a dash in every one of those columns. On a public board
+    # that reads as two different plays, one of which looks broken.
+    #
+    # This file is the pre-ingest seeding path and carries only symbol, note
+    # and date, so it must only ever ADD alerts the publisher has not sent —
+    # never shadow one it has.
+    seen = {(sym, date_) for sym, date_ in db.execute(
+        select(Play.symbol, Play.alert_date).where(
+            Play.symbol.in_([r[1] for r in rows])
+        )
+    ).all()}
+
     added = 0
     for source_id, sym, kind, d in rows:
-        if source_id in existing:
+        if source_id in existing or (sym, d) in seen:
             continue
         existing.add(source_id)  # dedupe within the same file too
+        seen.add((sym, d))
         db.add(Play(source_id=source_id, symbol=sym, kind=kind, alert_date=d))
         added += 1
     if added:

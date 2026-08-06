@@ -631,3 +631,62 @@ def test_this_month_reports_that_month_and_not_the_whole_record(payouts):
     totals = board.totals(today=date.fromisoformat(picked["key"] + "-15"))
     assert totals["this_month"]["total"] == pytest.approx(picked["total"])
     assert totals["this_month"]["total"] <= totals["total"] + 1e-9
+
+
+# ------------------------------------------------- the two ingest paths
+#
+# An alert can reach the board two ways, and they key the SAME real alert
+# differently: the publisher uses the Discord message id, picks.json uses
+# picks:SYM:DATE. Deduping on source_id alone therefore lets one alert land
+# twice — once complete from the publisher and once bare from the file, with a
+# dash where its ratio, entry price and buy deadline should be. On a public
+# board that reads as two plays, one of which looks broken.
+
+def _picks_file(tmp_path, rows):
+    import json
+    p = tmp_path / "picks.json"
+    p.write_text(json.dumps(rows), encoding="utf-8")
+    return str(p)
+
+
+def test_the_picks_file_never_shadows_an_alert_the_publisher_already_sent(anon, tmp_path):
+    from app import playsfeed
+    from app.db import SessionLocal
+
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={"buys": [
+        {"source_id": "1509000000000000001:0", "symbol": "DUPE", "kind": "standard",
+         "alert_date": "2026-08-05", "ratio": "1:80", "ratio_n": 80,
+         "entry_price": 0.1231, "est_profit": 9.72, "last_buy_date": "2026-08-07"},
+    ]})
+
+    path = _picks_file(tmp_path, [{"symbol": "DUPE", "note": "Reg Alert",
+                                   "date": "2026-08-05"}])
+    db = SessionLocal()
+    try:
+        assert playsfeed.import_picks_file(db, path) == 0, \
+            "the bare copy was inserted alongside the complete one"
+        board = playsfeed.load_board(db)
+    finally:
+        db.close()
+
+    dupes = [l for l in board.history if l.play.symbol == "DUPE"]
+    assert len(dupes) == 1, f"DUPE appears {len(dupes)} times on the board"
+    kept = dupes[0].play
+    assert kept.ratio == "1:80" and kept.entry_price == 0.1231, \
+        "the complete row lost to the bare one"
+    assert kept.last_buy_date == "2026-08-07", "the buy deadline was dropped"
+
+
+def test_the_picks_file_still_adds_an_alert_the_publisher_has_not_sent(anon, tmp_path):
+    from app import playsfeed
+    from app.db import SessionLocal
+
+    path = _picks_file(tmp_path, [{"symbol": "ONLYPICK", "note": "Reg Alert",
+                                   "date": "2026-08-04"}])
+    db = SessionLocal()
+    try:
+        assert playsfeed.import_picks_file(db, path) == 1
+        # and running it again is still a no-op
+        assert playsfeed.import_picks_file(db, path) == 0
+    finally:
+        db.close()
