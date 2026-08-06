@@ -81,10 +81,18 @@ def _resolve(token: str, raw: str, server: str, label: str) -> tuple[str, str]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--limit", type=int, default=50,
-                    help="messages to read per channel (default 50)")
+                    help="messages to read per channel (default 50, max 100)")
     ap.add_argument("--dry-run", action="store_true",
                     help="parse and report, but publish nothing")
     args = ap.parse_args(argv)
+
+    # Discord rejects a limit above 100 outright. Clamping (loudly) beats
+    # handing back a 400 that reads like the channel is broken — and a run that
+    # silently fetched nothing is exactly how a day's alerts go missing.
+    if args.limit > 100:
+        print(f"note: --limit {args.limit} exceeds Discord's cap; reading 100")
+        args.limit = 100
+    args.limit = max(1, args.limit)
 
     token = _env("DISCORD_TOKEN")
     if not token:
