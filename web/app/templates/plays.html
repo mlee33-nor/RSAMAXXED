@@ -184,7 +184,8 @@
           <div class="k">Theoretical profit · <span id="hero-period">all time</span></div>
           <div class="hero-fig pos" id="hero-total">{{ totals.total | money }}</div>
           <div class="hero-sub muted" id="hero-sub">
-            if you had bought all {{ totals.plays }} plays the tracker says paid
+            across {{ totals.plays }} plays with a confirmed sell, in the
+            brokers each one actually sold at
           </div>
         </div>
         <div class="tiles compact">
@@ -201,6 +202,13 @@
             <div class="k">Round-up rate</div>
             <div class="v num">{{ board.roundup_rate | pct }}</div>
             <div class="k2">of {{ board.resolved_history | length }} resolved</div>
+          </div>
+          {# Says out loud what the confirmed-sells rule is holding back, so a
+             total that ignores 40 resolved plays doesn't look like a bug. #}
+          <div class="tile">
+            <div class="k">Not sold yet</div>
+            <div class="v num">{{ board.awaiting_sale | length }}</div>
+            <div class="k2">resolved, awaiting an exit</div>
           </div>
           <div class="tile{% if board.urgent %} hot{% endif %}">
             <div class="k">Closing ≤ 2 days</div>

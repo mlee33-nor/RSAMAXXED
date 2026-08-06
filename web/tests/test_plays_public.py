@@ -354,16 +354,38 @@ def _expected(board, acc):
                for r in board.payout_rows)
 
 
-def test_the_payout_follows_the_tracker_not_the_sell_alert(payouts):
-    """The question the dashboard answers is "if I had bought every alert, what
-    would the splits have paid ME" — so a rounded-up play pays every account you
-    hold, even though the alerter's own sell message listed only the brokers
-    THEY happened to hold. That list is reporting, on the Sells tab; it never
-    narrows the arithmetic."""
+def test_only_brokers_with_a_confirmed_sell_pay(payouts):
+    """A round-up is per broker, not per play. 'Rounded up' on the TRACK board
+    means it rounded up SOMEWHERE — Wells Fargo turning a fraction into a whole
+    share says nothing about what Fidelity did with the same position. Only the
+    sell alert names brokers, so only those brokers pay."""
     rows, _ = payouts
-    assert len(rows["ONLYCHASE"]["brokers"]) == 10, (
-        "the sell alert's leg list leaked back into the payout rule")
-    assert "chase" in rows["ONLYCHASE"]["brokers"]
+    assert rows["ONLYCHASE"]["brokers"] == ["chase"]
+
+
+def test_a_roundup_nobody_has_sold_yet_pays_nothing(payouts):
+    """WHOLE rounded up and has no exit. Until a sell alert names the brokers it
+    actually cleared at, it is worth nothing on a figure the page calls
+    confirmed — the conservative direction, deliberately."""
+    rows, board = payouts
+    assert "WHOLE" not in rows
+    assert not any(r["sym"] == "WHOLE" for r in board.payout_rows)
+
+
+def test_a_fractional_play_with_no_exit_pays_nothing(payouts):
+    """Same rule, and it matters more here: a fraction only exists at three
+    brokers to begin with, and even there it has to be sold to be worth
+    anything."""
+    rows, _ = payouts
+    assert "FRAC" not in rows
+
+
+def test_the_tracker_still_reports_what_it_knows(payouts):
+    """The outcome stats keep every play, sold or not — the record is the
+    record. It is only the MONEY that waits for a confirmed sell."""
+    _, board = payouts
+    statuses = {s for s, _, _ in board.history_by_status}
+    assert "rounded_up" in statuses and "fractional" in statuses
 
 
 def test_the_totals_engine_multiplies_broker_by_broker(payouts):
@@ -383,21 +405,6 @@ def test_accounts_at_a_broker_you_do_not_use_add_nothing(payouts):
     assert board.totals({"chase": 0})["total"] == 0
     assert board.totals({"chase": 2})["total"] == pytest.approx(
         board.totals({"chase": 1})["total"] * 2, rel=1e-6)
-
-
-def test_a_roundup_with_no_exit_yet_is_eligible_everywhere(payouts):
-    """A whole share is a whole share at every broker — until an exit says
-    otherwise, all ten are eligible."""
-    rows, _ = payouts
-    assert len(rows["WHOLE"]["brokers"]) == 10
-
-
-def test_a_fractional_play_pays_only_the_three_that_hold_fractions(payouts):
-    """The other seven settled to cash and hold nothing to sell."""
-    rows, board = payouts
-    assert sorted(rows["FRAC"]["brokers"]) == ["public", "robinhood", "sofi"]
-    # Accounts at a cash-in-lieu broker earn nothing from it.
-    assert not set(rows["FRAC"]["brokers"]) & {"chase", "fidelity", "schwab"}
 
 
 def test_totals_bucket_by_the_month_the_play_was_booked(payouts):

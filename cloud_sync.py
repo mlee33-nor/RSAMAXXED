@@ -347,6 +347,25 @@ class CloudSync:
                 totals[k] = totals.get(k, 0) + v
         return totals
 
+    def fetch_export(self) -> dict:
+        """EVERY feed row, for the local archive. Operator key required.
+
+        Deliberately not `fetch_feed`: that one is windowed for a terminal, so
+        an archive built from it loses everything older than the window.
+        """
+        key = self.feed_key
+        if not key:
+            raise CloudError(
+                f"Exporting the feed is an operator action — set {_FEED_KEY_ENV}.")
+        try:
+            r = requests.get(self._url("/plays/export"),
+                             headers={"X-Feed-Key": key}, timeout=_TIMEOUT)
+        except requests.RequestException as exc:
+            raise CloudError(f"Can't reach RSAMAXXED Cloud: {exc}") from exc
+        if r.status_code >= 400:
+            raise CloudError(f"RSAMAXXED Cloud returned {r.status_code}")
+        return r.json()
+
     def fetch_feed(self) -> dict:
         """The whole feed, already divided into buys / closed / sells / roundups."""
         return self._get("/plays")
