@@ -264,8 +264,16 @@ def held_accounts(trades: Optional[Iterable[dict]] = None) -> dict[str, dict[str
 
     Brokers come back normalized ('robinhood' -> 'Robinhood') so they compare
     against FRACTIONAL_BROKERS without every caller remembering to do it.
+
+    Split-adjusted, and it matters most here. A reverse split leaves a fraction
+    of a share behind, so an account that sold its whole GRNQ remnant still nets
+    1.0 - 0.1 = 0.9 against the raw journal and reads as OPEN — which is exactly
+    how the worklist ends up offering to sell the same position a second time,
+    the one thing this function promises not to do.
     """
-    rows = list(trades) if trades is not None else trade_journal.get_trades()
+    # Adjusted whichever way the rows arrived, so a caller that hands us a raw
+    # journal slice cannot reintroduce the bug by the back door.
+    rows = trade_journal.split_adjusted(trades)
     net: dict[tuple[str, str, str], float] = {}
     for t in rows:
         sym = str(t.get("symbol") or "").upper()

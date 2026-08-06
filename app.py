@@ -3954,8 +3954,14 @@ class App(ctk.CTk):
         is a recorded buy matched with a confirmed sell at a higher price
         (realized P/L) — live prices can't tell you whether a name rounded up.
         Also returns the OPEN positions (bought, not yet sold) for allocation.
-        Realized P/L matches the Analytics tab (all-time avg-buy basis)."""
-        trades = trade_journal.get_trades()
+        Realized P/L matches the Analytics tab (all-time avg-buy basis).
+
+        Reads the journal through split_adjusted(): a reverse split changes the
+        share count with no trade to record, and without that lens a fractional
+        sell is priced against a tenth of what was paid for it (see the rule in
+        trade_journal). It also leaves the position permanently open, so the
+        allocation donut below would keep drawing shares the split destroyed."""
+        trades = trade_journal.split_adjusted()
         buys: Dict[str, Dict[str, float]] = {}   # symbol -> {qty, cost}
         sells: Dict[str, Dict[str, float]] = {}  # symbol -> {qty, rev}
         open_qty: Dict[tuple, float] = {}        # (broker, symbol) -> net held
@@ -5860,7 +5866,12 @@ class App(ctk.CTk):
     # ---- Stats refresh ---------------------------------------------------
 
     def _refresh_stats(self) -> None:
-        all_trades = trade_journal.get_trades()
+        # Split-adjusted, for the same reason as the Command Center hero: every
+        # figure below subtracts a buy price from a sell price, and a reverse
+        # split silently puts those two in different units. The recent-trades
+        # table further down re-reads the executed fill off each row, because a
+        # history has to show what actually happened at the broker.
+        all_trades = trade_journal.split_adjusted()
 
         # Filter by ticker search
         search_q = ""
@@ -6214,16 +6225,24 @@ class App(ctk.CTk):
         self._recent_trades_tree.delete(*self._recent_trades_tree.get_children())
         for t in reversed(trades[-100:]):
             ts = t.get("timestamp", "")[:19].replace("T", " ")
-            price = t["fill_price"]
-            total_val = (price or 0) * t["qty"]
+            # The FILL, not the split-adjusted restatement the P/L above needs.
+            # This table is a record of what happened at the broker; showing
+            # "1.0 @ $1.00" for an order that really sold 0.1 @ $10.00 would be
+            # a nicer number and a false one.
+            qty = t.get("executed_qty", t["qty"])
+            price = t.get("executed_price", t["fill_price"])
+            total_val = (price or 0) * qty
             side_tag = t["side"].upper()
+            # ,.0f rounded a 0.1-share split remnant to "0". Whole shares still
+            # print whole; only a fraction spends the two decimals.
+            qty_str = f"{qty:,.0f}" if abs(qty - round(qty)) < 1e-9 else f"{qty:,.2f}"
             self._recent_trades_tree.insert("", "end", values=(
                 ts,
                 t["broker"].capitalize(),
                 t.get("account_id", ""),
                 side_tag,
                 t["symbol"],
-                f"{t['qty']:,.0f}",
+                qty_str,
                 f"${price:,.4f}" if price else "\u2014",
                 f"${total_val:,.2f}"),
                 tags=(t["side"],))
