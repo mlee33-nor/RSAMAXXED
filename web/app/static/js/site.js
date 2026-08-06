@@ -723,8 +723,25 @@ function initAccounts(onChange) {
 }
 
 /* ------------------------------------------------------------- the figures */
-function summarise(rows, accounts, month) {
+
+/* Broker key -> the name the settings panel shows. Read from the DOM rather
+   than restated here, so the display names keep living in one place
+   (playsfeed.SUPPORTED_BROKERS) and cannot drift out of step with it. */
+function brokerNames() {
+  const map = {};
+  $$('.bslot').forEach(slot => {
+    const input = $('[data-broker]', slot), name = $('.bn', slot);
+    if (!input || !name) return;
+    // .bn also carries an <i>◆</i> for the three that hold fractions; the
+    // name is the text node in front of it.
+    map[input.dataset.broker] = (name.firstChild?.textContent || name.textContent || '').trim();
+  });
+  return map;
+}
+
+function summarise(rows, accounts, month, names = {}) {
   const byMonth = new Map();
+  const byBroker = new Map();
   const detail = [];
   let total = 0, plays = 0;
 
@@ -743,20 +760,38 @@ function summarise(rows, accounts, month) {
     const bucket = byMonth.get(key) || { key, total: 0, plays: 0 };
     bucket.total += amount; bucket.plays += 1;
     byMonth.set(key, bucket);
+
+    // The same money, split by WHERE it landed. This is a decomposition, not a
+    // second estimate: summed over the brokers it comes back to `amount`, and
+    // over the rows to `total`, exactly.
+    held.forEach(k => {
+      const b = byBroker.get(k) ||
+        { key: k, name: names[k] || k, accounts: accounts[k], total: 0, plays: 0 };
+      b.total += r.per * accounts[k];
+      b.plays += 1;
+      b.accounts = accounts[k];
+      byBroker.set(k, b);
+    });
   });
 
   const months = [...byMonth.values()].sort((a, b) => a.key < b.key ? -1 : 1);
+  const brokers = [...byBroker.values()].sort((a, b) => b.total - a.total);
   const best = months.reduce((a, m) => (!a || m.total > a.total) ? m : a, null);
   detail.sort((a, b) => b.amount - a.amount);
-  return { total, plays, months, best, detail,
+  return { total, plays, months, brokers, best, detail,
            perMonth: months.length ? total / months.length : 0 };
 }
 
 /* --------------------------------------------------------------- the charts
    Hand-built SVG: no library, and none of the defaults a library brings.
-   Thin marks, hairline axes, one hue per chart, labels only where they earn
-   their place — the value on the tallest column, the value at the end of the
-   line, and the count at the tip of each outcome bar. */
+   Thin marks, hairline axes, labels only where they earn their place.
+
+   EVERY CHART DRAWS AT THE WIDTH OF ITS CARD — see boxWidth below. That keeps
+   one type size across the dashboard whatever column a chart lands in, and it
+   means every dimension in these functions is a real pixel.
+
+   Colour never carries meaning alone: every outcome segment is named in a
+   legend, every broker bar is named beside it, and both scales are labelled. */
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const svgEl = (tag, attrs = {}) => {
@@ -764,6 +799,55 @@ const svgEl = (tag, attrs = {}) => {
   for (const k in attrs) n.setAttribute(k, attrs[k]);
   return n;
 };
+
+const WIDE = 620, NARROW = 400;
+const EASE = 'cubic-bezier(.22,1,.36,1)';       // matches --ease
+
+/* Draw at the width the card actually is.
+
+   An SVG at width:100% scales its own text along with the box, so one fixed
+   viewBox means 10px labels render at 6px in a phone-width card and at 26px in
+   a full-bleed one. Taking the measured width as the viewBox width pins the
+   scale at 1:1 everywhere, and every dimension below is then a real pixel.
+   Falls back when the element has no box yet — a chart inside a tab nobody has
+   opened measures zero. */
+const boxWidth = (host, fallback) => {
+  const w = Math.round(host.getBoundingClientRect().width);
+  return w > 60 ? w : fallback;
+};
+
+/* Gradient/clip ids have to be unique per document or the second chart on the
+   page silently paints itself with the first one's fill. */
+let _defSeq = 0;
+const uid = p => `${p}-${++_defSeq}`;
+
+/* style= rather than stop-color=: a CSS variable in a presentation attribute
+   is not portable, and these colours have to come from the token set. */
+function linearGrad(id, stops, vertical = true) {
+  const g = svgEl('linearGradient', vertical ? { id, x1: 0, y1: 0, x2: 0, y2: 1 }
+                                             : { id, x1: 0, y1: 0, x2: 1, y2: 0 });
+  stops.forEach(([off, color, op]) => g.appendChild(
+    svgEl('stop', { offset: off, style: `stop-color:${color};stop-opacity:${op}` })));
+  return g;
+}
+
+/* Exact, from the points — getTotalLength() on a path inside a hidden tab pane
+   is unreliable, and this is a polyline, so the arithmetic is the same answer. */
+const polyLength = pts => pts.reduce(
+  (a, p, i) => i ? a + Math.hypot(p.x - pts[i - 1].x, p.y - pts[i - 1].y) : 0, 0);
+
+/* Draw the stroke on, once. Repainting on every keystroke in the accounts
+   panel would re-run this forty times while someone types "12". */
+function drawStroke(paths, len, delay = .18) {
+  paths.forEach(p => {
+    p.style.strokeDasharray = len;
+    p.style.strokeDashoffset = len;
+  });
+  requestAnimationFrame(() => paths.forEach(p => {
+    p.style.transition = `stroke-dashoffset .95s ${EASE} ${delay}s`;
+    p.style.strokeDashoffset = 0;
+  }));
+}
 
 let _tip;
 function tipFor(host) {
@@ -799,130 +883,306 @@ function emptyChart(host, msg) {
   host.appendChild(p);
 }
 
-function monthlyChart(host, months) {
+/* ---------------------------------------------------------- profit by month
+   One figure answering two questions: what each month paid (bars, left scale)
+   and what the record was worth by the end of it (line, right scale).
+
+   These were two cards side by side plotting the same series twice. Folded
+   together they cost half the height, and "is this compounding or is it one
+   good month?" is answerable in a glance instead of by holding one chart in
+   your head while looking at the other.
+
+   Both scales are anchored at zero across the same plot height, so the three
+   gridlines are true for the left axis and the right one at once — the reason
+   a dual axis is honest here and usually isn't. */
+function profitChart(host, months) {
   if (!host) return;
   if (!months.length) return emptyChart(host, 'Nothing paid out in this period.');
 
-  const W = 620, H = 200, L = 52, R = 10, T = 16, B = 28;
+  const W = boxWidth(host, WIDE), H = 232, L = 46, R = 46, T = 20, B = 26;
   const iw = W - L - R, ih = H - T - B;
+
   const max = niceMax(Math.max(...months.map(m => m.total)));
-  const band = iw / months.length;
-  const bw = Math.min(24, band * 0.55);          // cap the mark; leftover is air
-  const y = v => T + ih - (v / max) * ih;
+  let run = 0;
+  const cum = months.map(m => (run += m.total));
+  const cmax = niceMax(run);
+  const avg = months.reduce((a, m) => a + m.total, 0) / months.length;
+
+  // Cap the band and centre the group. Three months spread across the full
+  // width leave two hairlines adrift in a field of nothing; grouped, they read
+  // as a small chart rather than a broken one.
+  const band = Math.min(iw / months.length, 108);
+  const x0 = L + (iw - band * months.length) / 2;
+  const bw = Math.min(26, band * .46);
+  const cx = i => x0 + band * i + band / 2;
+  const y = v => T + ih - (v / max) * ih;         // left scale:  the month
+  const cy = v => T + ih - (v / cmax) * ih;       // right scale: the running total
 
   host.innerHTML = '';
   const s = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img' });
+  const gBar = uid('bar'), gArea = uid('area');
+  const defs = svgEl('defs');
+  defs.appendChild(linearGrad(gBar, [[0, 'var(--c-series)', .98], [1, 'var(--c-series)', .28]]));
+  defs.appendChild(linearGrad(gArea, [[0, 'var(--accent-2)', .28], [1, 'var(--accent-2)', 0]]));
+  s.appendChild(defs);
 
-  // Recessive grid: three solid hairlines, and the ticks that carry the values
-  // no bar is directly labelled with.
+  // Hover bands go down first so everything else paints over them.
+  const bandLayer = svgEl('g');
+  s.appendChild(bandLayer);
+
+  // Recessive grid: three hairlines carrying both scales at once.
   [0, .5, 1].forEach(f => {
     const yy = y(max * f);
     s.appendChild(svgEl('line', { class: 'ax-line', x1: L, x2: W - R, y1: yy, y2: yy }));
-    const t = svgEl('text', { class: 'ax-text', x: L - 8, y: yy + 3, 'text-anchor': 'end' });
-    t.textContent = compact(max * f);
-    s.appendChild(t);
+    const l = svgEl('text', { class: 'ax-text', x: L - 8, y: yy + 3, 'text-anchor': 'end' });
+    l.textContent = compact(max * f);
+    s.appendChild(l);
+    const r = svgEl('text', { class: 'ax-text run', x: W - R + 8, y: yy + 3 });
+    r.textContent = compact(cmax * f);
+    s.appendChild(r);
   });
 
-  const peak = months.reduce((a, m) => m.total > a.total ? m : a, months[0]);
+  // The per-month average, drawn where the KPI tile only states it.
+  if (months.length > 1) {
+    const ay = y(avg);
+    s.appendChild(svgEl('line', { class: 'ax-avg', x1: L, x2: W - R, y1: ay, y2: ay }));
+    const t = svgEl('text', { class: 'ax-text avg', x: L + 3, y: ay - 5 });
+    t.textContent = 'avg ' + compact(avg);
+    s.appendChild(t);
+  }
 
-  months.forEach((m, i) => {
-    const x = L + band * i + (band - bw) / 2;
-    const h = Math.max(1, ih - (y(m.total) - T));
-    const r = Math.min(4, bw / 2, h);
+  const bars = months.map((m, i) => {
+    const x = cx(i) - bw / 2;
+    const h = Math.max(2, ih - (y(m.total) - T));
+    const r = Math.min(5, bw / 2, h);
     // Rounded data-end, square at the baseline.
     const d = `M${x} ${T + ih}L${x} ${T + ih - h + r}Q${x} ${T + ih - h} ${x + r} ${T + ih - h}` +
               `L${x + bw - r} ${T + ih - h}Q${x + bw} ${T + ih - h} ${x + bw} ${T + ih - h + r}` +
               `L${x + bw} ${T + ih}Z`;
-
-    const hit = svgEl('rect', { class: 'hit', x: L + band * i, y: T, width: band, height: ih });
-    const bar = svgEl('path', { class: 'mark-bar', d });
-    hit.addEventListener('pointerenter', ev => {
-      bar.classList.add('hot');
-      const r2 = ev.target.getBoundingClientRect();
-      showTip(r2.left + r2.width / 2, r2.top + (y(m.total) - T) * (r2.height / ih),
-        `${monthLabel(m.key)} · ${m.plays} play${m.plays === 1 ? '' : 's'}<b>${money(m.total)}</b>`);
-    });
-    hit.addEventListener('pointerleave', () => { bar.classList.remove('hot'); hideTip(); });
-    s.appendChild(hit);
+    const bar = svgEl('path', { class: 'mark-bar', d, style: `fill:url(#${gBar})` });
     s.appendChild(bar);
+    return bar;
+  });
 
-    // Label selectively: the peak carries its value, the axis carries the rest.
-    if (m === peak && h > 14) {
-      const t = svgEl('text', { class: 'val-text', x: x + bw / 2, y: y(m.total) - 6, 'text-anchor': 'middle' });
-      t.textContent = compact(m.total);
-      s.appendChild(t);
-    }
+  // The running total. A wide translucent copy under the crisp one reads as a
+  // glow without an SVG filter, which would re-rasterise on every repaint.
+  const pts = months.map((m, i) => ({ x: cx(i), y: cy(cum[i]) }));
+  let strokes = [];
+  if (pts.length > 1) {
+    const line = pts.map(p => `${p.x} ${p.y}`).join('L');
+    s.appendChild(svgEl('path', {
+      class: 'mark-area', style: `fill:url(#${gArea})`,
+      d: `M${pts[0].x} ${T + ih}L${line}L${pts[pts.length - 1].x} ${T + ih}Z`,
+    }));
+    const halo = svgEl('path', { class: 'mark-line halo', d: `M${line}` });
+    const line2 = svgEl('path', { class: 'mark-line', d: `M${line}` });
+    s.appendChild(halo); s.appendChild(line2);
+    strokes = [halo, line2];
+  }
 
-    if (months.length <= 10 || i % 2 === 0) {
-      const t = svgEl('text', { class: 'ax-text', x: x + bw / 2, y: H - 9, 'text-anchor': 'middle' });
+  // End marker + the one direct label the line needs, set above the dot so it
+  // never collides with the right-hand ticks.
+  const last = pts[pts.length - 1];
+  s.appendChild(svgEl('circle', { class: 'mark-dot', cx: last.x, cy: last.y, r: 4 }));
+  const endLab = svgEl('text', { class: 'val-text', x: last.x, y: last.y - 10, 'text-anchor': 'middle' });
+  endLab.textContent = compact(cum[cum.length - 1]);
+  s.appendChild(endLab);
+
+  // One roving dot, moved to whichever month the pointer is over.
+  const live = svgEl('circle', { class: 'mark-dot live', cx: 0, cy: 0, r: 5 });
+  s.appendChild(live);
+
+  months.forEach((m, i) => {
+    if (months.length <= 12 || i % 2 === 0) {
+      const t = svgEl('text', { class: 'ax-text', x: cx(i), y: H - 8, 'text-anchor': 'middle' });
       t.textContent = monthLabel(m.key);
       s.appendChild(t);
     }
-  });
 
-  host.appendChild(s);
-}
-
-function cumulativeChart(host, months) {
-  if (!host) return;
-  if (months.length < 2) return emptyChart(host, 'Two months of payouts are needed to draw a trend.');
-
-  const W = 620, H = 200, L = 52, R = 42, T = 16, B = 28;
-  const iw = W - L - R, ih = H - T - B;
-  let run = 0;
-  const pts = months.map((m, i) => {
-    run += m.total;
-    return { x: L + (iw * i) / (months.length - 1), y: 0, v: run, key: m.key };
-  });
-  const max = niceMax(run);
-  pts.forEach(p => { p.y = T + ih - (p.v / max) * ih; });
-
-  host.innerHTML = '';
-  const s = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img' });
-
-  [0, .5, 1].forEach(f => {
-    const yy = T + ih - f * ih;
-    s.appendChild(svgEl('line', { class: 'ax-line', x1: L, x2: W - R, y1: yy, y2: yy }));
-    const t = svgEl('text', { class: 'ax-text', x: L - 8, y: yy + 3, 'text-anchor': 'end' });
-    t.textContent = compact(max * f);
-    s.appendChild(t);
-  });
-
-  const line = pts.map(p => `${p.x} ${p.y}`).join('L');
-  s.appendChild(svgEl('path', {
-    class: 'mark-area',
-    d: `M${pts[0].x} ${T + ih}L${line}L${pts[pts.length - 1].x} ${T + ih}Z`,
-  }));
-  s.appendChild(svgEl('path', { class: 'mark-line', d: `M${line}` }));
-
-  pts.forEach((p, i) => {
-    if (months.length <= 10 || i % 2 === 0) {
-      const t = svgEl('text', { class: 'ax-text', x: p.x, y: H - 9, 'text-anchor': 'middle' });
-      t.textContent = monthLabel(p.key);
-      s.appendChild(t);
-    }
-    const hit = svgEl('circle', { class: 'hit', cx: p.x, cy: p.y, r: 14 });
-    hit.addEventListener('pointerenter', ev => {
-      const r = ev.target.getBoundingClientRect();
-      showTip(r.left + r.width / 2, r.top, `${monthLabel(p.key)} · running total<b>${money(p.v)}</b>`);
+    const lit = svgEl('rect', {
+      class: 'hoverband', x: x0 + band * i + 1.5, y: T - 8,
+      width: band - 3, height: ih + 8, rx: 8,
     });
-    hit.addEventListener('pointerleave', hideTip);
+    bandLayer.appendChild(lit);
+
+    // Hit areas last: transparent, on top, so the whole column is a target.
+    const hit = svgEl('rect', { class: 'hit', x: x0 + band * i, y: T - 8, width: band, height: ih + 8 });
+    hit.addEventListener('pointerenter', ev => {
+      lit.classList.add('on');
+      bars[i].classList.add('hot');
+      live.setAttribute('cx', cx(i));
+      live.setAttribute('cy', cy(cum[i]));
+      live.classList.add('on');
+      const r = ev.target.getBoundingClientRect();
+      showTip(r.left + r.width / 2, r.top + 10,
+        `${monthLabel(m.key)} · ${m.plays} play${m.plays === 1 ? '' : 's'}` +
+        `<b>${money(m.total)}</b><i>running total ${money(cum[i])}</i>`);
+    });
+    hit.addEventListener('pointerleave', () => {
+      lit.classList.remove('on');
+      bars[i].classList.remove('hot');
+      live.classList.remove('on');
+      hideTip();
+    });
     s.appendChild(hit);
   });
 
-  // End marker + the one direct label the line needs.
-  const last = pts[pts.length - 1];
-  s.appendChild(svgEl('circle', { class: 'mark-dot', cx: last.x, cy: last.y, r: 4.5 }));
-  const lab = svgEl('text', { class: 'val-text', x: last.x + 9, y: last.y + 4 });
-  lab.textContent = compact(last.v);
-  s.appendChild(lab);
-
   host.appendChild(s);
+
+  if (!REDUCED && !host.dataset.drawn) {
+    bars.forEach((b, i) => { b.style.animationDelay = (i * 55) + 'ms'; b.classList.add('grow'); });
+    if (strokes.length) drawStroke(strokes, polyLength(pts));
+  }
+  host.dataset.drawn = '1';
 }
 
-/* Outcomes. Status colours, and every bar carries its name and count as text —
-   so the categories never depend on colour to be told apart. Read from the
-   Tracking tab's own summary, which keeps one source of truth on the page. */
+/* -------------------------------------------------------------- where it paid
+   The hero figure, split by the broker the sell actually happened at. Not a
+   second estimate of anything: summed down the rows it is the hero figure to
+   the cent. It answers the one question the month chart cannot — which of YOUR
+   accounts is carrying this — and it moves the instant the profile does.
+
+   A broker you hold accounts at that no sell alert ever named is absent rather
+   than drawn at zero: it earned nothing because nothing sold there, and a row
+   of zeroes reads as a failure instead of a non-event. */
+function brokerChart(host, brokers) {
+  if (!host) return;
+  if (!brokers.length) {
+    return emptyChart(host, 'No sell alert in this period named a broker you hold.');
+  }
+
+  const W = boxWidth(host, NARROW), L = 96, R = 54, rowH = 23, bh = 11, T = 2;
+  const H = brokers.length * rowH + T + 4;
+  const iw = W - L - R;
+  const max = Math.max(...brokers.map(b => b.total));
+
+  host.innerHTML = '';
+  const s = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img' });
+  const g = uid('bgrad');
+  const defs = svgEl('defs');
+  defs.appendChild(linearGrad(g, [[0, 'var(--accent-2)', .9], [1, 'var(--c-series)', .95]], false));
+  s.appendChild(defs);
+
+  const bars = [];
+  brokers.forEach((b, i) => {
+    const y = T + i * rowH + 6;
+    const w = Math.max(3, (b.total / max) * iw);
+
+    const name = svgEl('text', { class: 'ax-text name', x: L - 10, y: y + bh - 1.5, 'text-anchor': 'end' });
+    name.textContent = b.name;
+    s.appendChild(name);
+
+    // The track, so a small broker still reads as a share of something rather
+    // than as a stub floating in space.
+    s.appendChild(svgEl('rect', { class: 'track', x: L, y, width: iw, height: bh, rx: bh / 2 }));
+
+    const bar = svgEl('rect', {
+      class: 'mark-hbar', x: L, y, width: w, height: bh, rx: bh / 2,
+      style: `fill:url(#${g})`,
+    });
+    s.appendChild(bar);
+    bars.push(bar);
+
+    const val = svgEl('text', { class: 'val-text', x: W - 2, y: y + bh - 1.5, 'text-anchor': 'end' });
+    val.textContent = compact(b.total);
+    s.appendChild(val);
+
+    const hit = svgEl('rect', { class: 'hit', x: 0, y: y - 6, width: W, height: rowH });
+    hit.addEventListener('pointerenter', ev => {
+      bar.classList.add('hot');
+      const r = ev.target.getBoundingClientRect();
+      showTip(r.left + r.width / 2, r.top + 4,
+        `${b.name} · ${b.accounts} account${b.accounts === 1 ? '' : 's'}` +
+        `<b>${money(b.total)}</b><i>${b.plays} play${b.plays === 1 ? '' : 's'} sold here</i>`);
+    });
+    hit.addEventListener('pointerleave', () => { bar.classList.remove('hot'); hideTip(); });
+    s.appendChild(hit);
+  });
+
+  host.appendChild(s);
+
+  if (!REDUCED && !host.dataset.drawn) {
+    bars.forEach((b, i) => { b.style.animationDelay = (i * 45) + 'ms'; b.classList.add('growx'); });
+  }
+  host.dataset.drawn = '1';
+}
+
+/* ------------------------------------------------------------- the hero spark
+   The running total again, at thumbnail size, under the number it produced.
+   No axes and no labels: it is a shape, not a reading, and the chart below
+   carries the same series properly for anyone who wants the values. */
+function heroSpark(host, months) {
+  if (!host) return;
+  host.innerHTML = '';
+  if (months.length < 2) return;
+
+  // Full-bleed: the band runs edge to edge across the foot of the card, so no
+  // horizontal inset, and just enough top room that the stroke never clips.
+  const W = boxWidth(host, 320), H = 46, TOP = 7;
+  let run = 0;
+  const cum = months.map(m => (run += m.total));
+  const top = run || 1;
+  const pts = cum.map((v, i) => ({
+    x: W * (i / (cum.length - 1)),
+    y: TOP + (H - TOP - 2) * (1 - v / top),
+  }));
+
+  const s = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true', focusable: 'false' });
+  const g = uid('spark');
+  const defs = svgEl('defs');
+  defs.appendChild(linearGrad(g, [[0, 'var(--c-series)', .34], [1, 'var(--c-series)', 0]]));
+  s.appendChild(defs);
+
+  const line = pts.map(p => `${p.x} ${p.y}`).join('L');
+  s.appendChild(svgEl('path', {
+    class: 'spark-area', style: `fill:url(#${g})`,
+    d: `M${pts[0].x} ${H}L${line}L${pts[pts.length - 1].x} ${H}Z`,
+  }));
+  const stroke = svgEl('path', { class: 'spark-line', d: `M${line}` });
+  s.appendChild(stroke);
+  // No end marker. The last point sits exactly on the card's right edge, where
+  // a dot would be sliced in half by the clip and read as a rendering fault.
+
+  host.appendChild(s);
+  if (!REDUCED && !host.dataset.drawn) drawStroke([stroke], polyLength(pts), .1);
+  host.dataset.drawn = '1';
+}
+
+/* ---------------------------------------------------------------- the count
+   Counts the hero up on first paint and on a period change. A keystroke in
+   the accounts panel sets it outright instead: animating a number the reader
+   is actively steering makes it unreadable.
+
+   tickTo, not a private rAF loop. Clicking two period chips in quick
+   succession would start a second animation over the first, and two loops
+   writing to one node make the total visibly count backwards — the exact
+   failure the odometer above was built to cancel. Reusing it also inherits
+   the retarget, which resumes from what is on screen instead of snapping
+   back to zero. */
+function heroCount(el, to, animate) {
+  if (!el) return;
+  if (REDUCED || !animate) { cancelTick(el); el.textContent = money(to); return; }
+  tickTo(el, 0, to, 850, money);
+}
+
+/* ----------------------------------------------------------------- outcomes
+   What every split the feed has ever carried actually DID, as one stacked bar
+   with a named legend under it. It was four horizontal bars at 30px a row —
+   the same four numbers, three times the height, and the reader still had to
+   do the division to see that most of them round up.
+
+   Read from the Tracking tab's own summary, which keeps one source of truth on
+   the page. Colour is a second channel here, never the only one: every segment
+   is named and counted in the legend, and the shares are printed. */
+const OUTCOME_FILL = {
+  rounded_up:   'var(--c-good)',
+  fractional:   'var(--c-warn)',
+  cash_in_lieu: 'rgba(184,137,43,.55)',
+  pending:      'rgba(124,120,255,.5)',
+  new:          'rgba(124,120,255,.5)',
+};
+const outcomeFill = s => OUTCOME_FILL[s] || 'var(--c-null)';
+
 function outcomeChart(host) {
   if (!host) return;
   const src = $$('.statbar .sb');
@@ -935,40 +1195,77 @@ function outcomeChart(host) {
   })).filter(r => r.n > 0).sort((a, b) => b.n - a.n);
   if (!rows.length) return emptyChart(host, 'No outcomes recorded yet.');
 
-  const fill = s => s === 'rounded_up' ? 'var(--c-good)'
-    : (s === 'fractional' || s === 'cash_in_lieu') ? 'var(--c-warn)' : 'var(--c-null)';
-
-  const W = 620, L = 150, R = 52, rowH = 30, bh = 14;
-  const H = rows.length * rowH + 8;
-  const max = Math.max(...rows.map(r => r.n));
-  const iw = W - L - R;
+  const all = rows.reduce((a, r) => a + r.n, 0);
+  // A 100% bar is a wide, short shape, so it gets the full page width and a
+  // legend that wraps beside it rather than a column of rows underneath.
+  const W = boxWidth(host, 1000), bh = 22, H = bh;
 
   host.innerHTML = '';
   const s = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img' });
 
+  // One rounded clip over square segments: the bar keeps its pill ends without
+  // every segment having to know whether it is an end.
+  const clip = uid('clip');
+  const defs = svgEl('defs');
+  const cp = svgEl('clipPath', { id: clip });
+  cp.appendChild(svgEl('rect', { x: 0, y: 0, width: W, height: bh, rx: bh / 2 }));
+  defs.appendChild(cp);
+  s.appendChild(defs);
+
+  const stack = svgEl('g', { 'clip-path': `url(#${clip})` });
+  s.appendChild(stack);
+
+  let x = 0;
   rows.forEach((r, i) => {
-    const y = i * rowH + 8;
-    const w = Math.max(2, (r.n / max) * iw);
-    const rad = Math.min(4, w / 2);
+    const w = (r.n / all) * W;
+    const seg = svgEl('rect', {
+      class: 'seg', x, y: 0, width: Math.max(0, w - (i === rows.length - 1 ? 0 : 1.5)),
+      height: bh, style: `fill:${outcomeFill(r.status)}`,
+    });
+    stack.appendChild(seg);
 
-    const name = svgEl('text', { class: 'ax-text', x: L - 12, y: y + bh - 2, 'text-anchor': 'end' });
-    name.textContent = r.label;
-    s.appendChild(name);
+    // The share, inside the segment, only where it fits without crowding.
+    if (w > 74) {
+      const t = svgEl('text', { class: 'seg-text', x: x + w / 2, y: bh / 2 + 3.5, 'text-anchor': 'middle' });
+      t.textContent = Math.round((r.n / all) * 100) + '%';
+      stack.appendChild(t);
+    }
 
-    // style= rather than fill=: a CSS variable in a presentation attribute is
-    // not portable, and these colours have to come from the token set.
-    s.appendChild(svgEl('path', {
-      style: `fill:${fill(r.status)}`,
-      d: `M${L} ${y}L${L + w - rad} ${y}Q${L + w} ${y} ${L + w} ${y + rad}` +
-         `L${L + w} ${y + bh - rad}Q${L + w} ${y + bh} ${L + w - rad} ${y + bh}L${L} ${y + bh}Z`,
-    }));
+    const hit = svgEl('rect', { class: 'hit', x, y: 0, width: w, height: bh });
+    hit.addEventListener('pointerenter', ev => {
+      seg.classList.add('hot');
+      const rect = ev.target.getBoundingClientRect();
+      showTip(rect.left + rect.width / 2, rect.top,
+        `${r.label}<b>${r.n} of ${all}</b><i>${((r.n / all) * 100).toFixed(1)}% of every alert</i>`);
+    });
+    hit.addEventListener('pointerleave', () => { seg.classList.remove('hot'); hideTip(); });
+    s.appendChild(hit);
 
-    const val = svgEl('text', { class: 'val-text', x: L + w + 9, y: y + bh - 2 });
-    val.textContent = r.n;
-    s.appendChild(val);
+    x += w;
   });
 
   host.appendChild(s);
+
+  // The legend in HTML, not SVG: it has to wrap at whatever width the card
+  // ends up, and text that wraps is a job for the layout engine, not for
+  // arithmetic that guesses where the line breaks.
+  const legend = document.createElement('div');
+  legend.className = 'chartkey';
+  rows.forEach(r => {
+    const item = document.createElement('span');
+    item.className = 'ck';
+    const sw = document.createElement('i');
+    sw.style.background = outcomeFill(r.status);
+    item.append(sw, r.label);
+    const n = document.createElement('b');
+    n.textContent = r.n;
+    item.append(n);
+    legend.appendChild(item);
+  });
+  host.appendChild(legend);
+
+  if (!REDUCED && !host.dataset.drawn) stack.classList.add('growx');
+  host.dataset.drawn = '1';
 }
 
 /* ------------------------------------------------------------ the dashboard */
@@ -980,18 +1277,28 @@ function initPlaysDash() {
   try { rows = JSON.parse(data.textContent || '[]'); } catch (e) { rows = []; }
 
   const heroTotal = $('#hero-total'), heroSub = $('#hero-sub'), heroPeriod = $('#hero-period');
+  const heroSparkEl = $('#hero-spark');
   const kpiPer = $('#kpi-permonth'), kpiBest = $('#kpi-best'), kpiWhen = $('#kpi-best-when');
-  const monthly = $('#chart-monthly'), cumulative = $('#chart-cumulative');
+  const monthly = $('#chart-monthly'), brokersEl = $('#chart-brokers');
   const tableBody = $('#monthly-table tbody');
 
+  // The funnel's last stage is the only one that moves with the profile: the
+  // three before it are counts of what the FEED did, which no account setting
+  // can change. The bar is scaled against the same base the server used.
+  const funnel = $('#funnel');
+  const paidN = $('#fn-paid'), paidBar = $('#fn-paid-bar'), paidPct = $('#fn-paid-pct');
+  const funnelBase = Math.max(0, parseInt(funnel?.dataset.base || '0', 10));
+
   const auditBody = $('#audit-table tbody');
+  const names = brokerNames();
   let month = '';                      // '' = all time
   let accounts = {};
+  let animate = true;
 
   const paint = () => {
-    const s = summarise(rows, accounts, month);
+    const s = summarise(rows, accounts, month, names);
 
-    if (heroTotal) heroTotal.textContent = money(s.total);
+    heroCount(heroTotal, s.total, animate);
     if (heroSub) {
       heroSub.textContent = s.plays
         ? `across ${s.plays} plays with a confirmed sell, in the brokers each one actually sold at`
@@ -1025,8 +1332,23 @@ function initPlaysDash() {
       });
     }
 
-    monthlyChart(monthly, s.months);
-    cumulativeChart(cumulative, s.months);
+    if (paidN) paidN.textContent = s.plays;
+    // toFixed(1) to match the server's `| round(1)` exactly. Without it this
+    // bar lands a few hundredths of a percent wider than the stage above it,
+    // which is the one thing a funnel is not allowed to do.
+    if (paidBar) {
+      paidBar.style.width =
+        (funnelBase ? (100 * s.plays / funnelBase).toFixed(1) : 0) + '%';
+    }
+    if (paidPct) {
+      paidPct.textContent = funnelBase
+        ? Math.round(100 * s.plays / funnelBase) + '% of alerts' : '';
+    }
+
+    profitChart(monthly, s.months);
+    brokerChart(brokersEl, s.brokers);
+    heroSpark(heroSparkEl, s.months);
+    animate = false;
   };
 
   $$('#range-row .chip').forEach(btn => {
@@ -1034,6 +1356,11 @@ function initPlaysDash() {
       $$('#range-row .chip').forEach(b => b.classList.toggle('on', b === btn));
       month = btn.dataset.month || '';
       if (heroPeriod) heroPeriod.textContent = month || 'all time';
+      // A period change is a deliberate act and a whole new series, so let it
+      // draw itself again. Typing in the accounts panel is not: that fires per
+      // keystroke, and re-running the animation forty times is a strobe.
+      [monthly, brokersEl, heroSparkEl].forEach(el => { if (el) delete el.dataset.drawn; });
+      animate = true;
       paint();
     });
   });
@@ -1043,6 +1370,16 @@ function initPlaysDash() {
   outcomeChart($('#chart-outcomes'));
   paint();
   addEventListener('scroll', hideTip, { passive: true });
+
+  // The charts draw at the width of the card, so a resize has to redraw them
+  // or the type ends up scaled. Debounced, and past the animation gate, so a
+  // dragged window edge is one repaint at the end and not a flicker of
+  // bars growing out of the floor at sixty frames a second.
+  let rz;
+  addEventListener('resize', () => {
+    clearTimeout(rz);
+    rz = setTimeout(() => { paint(); outcomeChart($('#chart-outcomes')); }, 180);
+  }, { passive: true });
 }
 
 /* ---------------------------------------------------------------- the pager

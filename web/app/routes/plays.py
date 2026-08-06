@@ -150,7 +150,6 @@ def _board_page(request: Request, user: User | None, db: Session):
         status_labels=playsfeed.STATUS_LABELS,
         fractional_brokers=playsfeed.FRACTIONAL_BROKERS,
         plan=plans.resolve(user.plan) if user else None,
-        can_automate=plans.can(user, plans.TERMINAL),
     )
 
 
