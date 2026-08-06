@@ -186,13 +186,36 @@ class PlayLife:
 
     @property
     def paid_in(self) -> str:
-        """Where this play left anything behind, in words."""
+        """Where this play paid, in words — and the three ways it can pay
+        nowhere, which are NOT the same thing and must not read the same.
+
+        A play that rounded up and hasn't been sold yet still has a whole share
+        sitting in the account. Printing 'nothing to sell' beside a green
+        ROUNDED UP badge says the opposite of what happened, and undermines the
+        one table the rest of the page rests on.
+        """
         brokers = self.paying_brokers
-        if not brokers:
+        if brokers:
+            if len(brokers) >= len(SUPPORTED_BROKERS):
+                return "every broker"
+            return ", ".join(brokers)
+        if self.status in ("rounded_up", "fractional"):
+            return "not sold yet"
+        if self.status in ("cash_in_lieu", "canceled"):
             return "nothing to sell"
-        if len(brokers) >= len(SUPPORTED_BROKERS):
-            return "every broker"
-        return ", ".join(brokers)
+        return "—"                      # pending, alerted, unconfirmed
+
+    @property
+    def booked_on(self) -> str:
+        """When this play actually paid: the exit, or the round-up confirmation.
+
+        Empty when neither has happened. `resolved_on` falls back to the last
+        buy date so a play always has SOME date to sort by; showing that in a
+        column headed "Booked" would date money that was never made.
+        """
+        if self.exits:
+            return self.exits[-1].sell_date or ""
+        return self.confirmed_date or ""
 
     @property
     def sold_at(self) -> str:
