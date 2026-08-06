@@ -34,19 +34,25 @@
       <p class="pitch">The alert feed, nothing else. You place the trades at your own brokers.</p>
 
       <div class="price">
-        <span class="amt" data-monthly="Free" data-annual="Free">Free</span>
+        <span class="amt" data-monthly="$15" data-annual="$12">$15</span>
+        <span class="per">/ month</span>
       </div>
-      <div class="bill-note" data-monthly="No card required" data-annual="No card required">No card required</div>
+      <div class="bill-note" data-monthly="Billed monthly" data-annual="$144 billed yearly">Billed monthly</div>
 
-      <a class="btn btn-ghost btn-block" href="/signup?plan=plays">Start with Plays Only</a>
-      <p class="reassure">Free forever</p>
+      {# Plays is sold as a password, not an account: the board at /plays takes
+         one and asks for nothing else. Pointing this at signup would send a
+         buyer to a form they don't need. #}
+      <a class="btn btn-ghost btn-block" href="/plays">Open the plays board</a>
+      <p class="reassure">Password, no account · cancel anytime</p>
 
       <ul class="feats">
         <li class="head">What you get</li>
         <li>Every reverse-split alert we track — <b>ticker and effective date</b></li>
         <li>Each one classified <b>standard, OTC, or conditional</b></li>
         <li>A split calendar, sorted by the date that matters</li>
-        <li>Web dashboard — nothing to install</li>
+        <li><b>What each split actually did</b> — rounded up, fractional, or cash in lieu</li>
+        <li>The full record: every past alert and how it ended</li>
+        <li>Web board — nothing to install</li>
         <li class="no">No desktop terminal</li>
         <li class="no">No broker connections, no execution</li>
       </ul>

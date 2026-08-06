@@ -221,14 +221,30 @@ def test_pricing_has_three_tiers_one_badge_and_both_billing_periods(pricing):
     assert pricing.count('class="badge"') == 1, "exactly one tier may be flagged"
     assert 'class="tier star"' in pricing
 
-    # Plays Only is free — no price and no annual arithmetic on that card.
-    assert 'data-monthly="Free" data-annual="Free"' in pricing
-    assert "Free forever" in pricing
-
-    for monthly, annual, yearly in (("$79", "$66", "$790"),
+    for monthly, annual, yearly in (("$15", "$12", "$144"),
+                                    ("$79", "$66", "$790"),
                                     ("$149", "$124", "$1,490")):
         assert f'data-monthly="{monthly}" data-annual="{annual}"' in pricing
         assert f'data-annual="{yearly} billed yearly"' in pricing
+
+
+def test_the_advertised_price_is_the_price_the_code_charges(pricing):
+    """The page and plans.py must not drift. A card that says one number while
+    the entitlement table holds another is how someone gets billed wrong."""
+    from app import plans
+    for key in ("plays", "automation"):
+        assert f'data-monthly="${plans.PLANS[key].monthly}"' in pricing
+
+
+def test_every_annual_price_keeps_the_two_months_free_promise(pricing):
+    """The toggle advertises '2 months free', so a year must cost no more than
+    ten months. Checked against the figures ON the card, since those are the
+    ones a customer is actually quoted."""
+    monthly = [int(m.replace(",", "")) for m in re.findall(r'data-monthly="\$([\d,]+)"', pricing)]
+    yearly = [int(m.replace(",", "")) for m in re.findall(r'data-annual="\$([\d,]+) billed yearly"', pricing)]
+    assert len(monthly) == len(yearly) == 3, "a tier lost its price or its yearly note"
+    for m, y in zip(monthly, yearly):
+        assert y <= m * 10, f"${y}/yr is more than ten months of ${m}"
 
 
 def test_pricing_toggle_is_a_real_labelled_checkbox(pricing):
