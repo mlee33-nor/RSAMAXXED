@@ -266,3 +266,41 @@ def test_new_pages_carry_the_risk_disclaimer(path):
     for phrase in ("not investment advice", "you can lose money",
                    "varies by broker", "terms of service"):
         assert phrase in flat, f"{path} lost the disclaimer phrase: {phrase!r}"
+
+
+# ------------------------------------------------------------------- caching
+#
+# These went out with no Cache-Control, no ETag and no Last-Modified. A
+# response carrying no freshness information does not mean "do not cache" — it
+# lets the browser pick a lifetime for itself, and mobile browsers do. The
+# symptom is a phone serving a stale board from its own cache while the same
+# URL on a desktop is current.
+
+@pytest.mark.parametrize("path", ("/", "/how-it-works", "/pricing", "/plays"))
+def test_pages_are_never_written_to_a_browser_cache(path):
+    """Every page here is personalised, gated, or live data. /plays especially:
+    it sits behind a shared password, so a copy of it must not survive on the
+    disk of a device someone else can pick up."""
+    with TestClient(app) as c:
+        r = c.get(path, follow_redirects=False)
+    cc = r.headers.get("cache-control", "")
+    assert "no-store" in cc, f"{path} sent Cache-Control: {cc!r}"
+    assert "cookie" in r.headers.get("vary", "").lower(), f"{path} does not vary on the session"
+
+
+def test_a_versioned_asset_may_be_pinned_but_a_bare_one_may_not():
+    """The ?v= stamp is derived from the file's own size and mtime, so a
+    versioned URL changes whenever the file does and can safely be kept
+    forever. The same path without it has no way to be busted."""
+    with TestClient(app) as c:
+        pinned = c.get("/static/js/site.js?v=deadbeef").headers.get("cache-control", "")
+        bare = c.get("/static/js/site.js").headers.get("cache-control", "")
+    assert "immutable" in pinned and "max-age=31536000" in pinned
+    assert "immutable" not in bare, "an unbustable URL was pinned for a year"
+
+
+def test_every_asset_url_carries_the_version_stamp(home):
+    """If a template ever links an asset bare, that asset picks up the short
+    cache life above and the pinning is silently doing nothing."""
+    for ref in re.findall(r'(?:href|src)="(/static/[^"]+)"', home):
+        assert "?v=" in ref, f"{ref} is linked without a cache-busting stamp"

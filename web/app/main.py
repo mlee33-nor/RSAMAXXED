@@ -110,4 +110,32 @@ async def _security_headers(request: Request, call_next):
         response.headers.setdefault(
             "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
         )
+
+    # ---- caching
+    #
+    # These pages went out with NO cache directive of any kind: no
+    # Cache-Control, no ETag, no Last-Modified. A response with no freshness
+    # information is not "uncached" — it licenses the browser to invent a
+    # lifetime of its own, and mobile browsers take that licence. The symptom
+    # is a phone showing yesterday's board on a back-navigation or on re-entry
+    # from the home screen, while the same URL on a desktop is current.
+    #
+    # It is also wrong in kind: /plays is behind a password and renders against
+    # the reader's own session, so it must never be written to a disk cache
+    # that another person on the device can read.
+    if request.url.path.startswith("/static/"):
+        # Assets are safe to pin because the templates stamp every URL with
+        # ?v=<size+mtime hash>: when the file changes the URL changes with it.
+        # An unversioned request gets a short life instead — nothing should be
+        # pinned for a year on a URL that has no way to be busted.
+        response.headers.setdefault(
+            "Cache-Control",
+            "public, max-age=31536000, immutable"
+            if "v=" in request.url.query
+            else "public, max-age=300",
+        )
+    else:
+        # Everything else here is personalised, gated, or live data.
+        response.headers.setdefault("Cache-Control", "no-store")
+        response.headers.setdefault("Vary", "Cookie")
     return response
