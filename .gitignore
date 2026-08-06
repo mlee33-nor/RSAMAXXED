@@ -47,3 +47,7 @@ picks.json
 # Operator-only scheduler wrapper. Customers never publish, so this
 # stays off the public repo alongside the feed key it depends on.
 publish_feed_task.bat
+
+# The full feed archive — the product itself. Never on the public repo.
+feed_archive.json
+feed_archive.corrupt.json
