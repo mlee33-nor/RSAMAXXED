@@ -198,6 +198,22 @@
           <figure class="spark" id="hero-spark" aria-hidden="true"></figure>
         </div>
         <div class="tiles compact">
+          {# The month in progress. Deliberately NOT scoped by the period chips
+             above — "what has this month made so far" has the same answer
+             whichever period is on screen — and the month key comes from the
+             server rather than the browser's clock, so the tile cannot
+             disagree with the page it sits on either side of midnight. #}
+          <div class="tile" id="tile-thismonth" data-month="{{ totals.this_month.key }}">
+            <div class="k">This month</div>
+            <div class="v num" id="kpi-thismonth">{{ totals.this_month.total | money }}</div>
+            <div class="k2" id="kpi-thismonth-note">
+              {% if totals.this_month.plays %}
+                {{ totals.this_month.plays }} paid · {{ totals.this_month.key }}
+              {% else %}
+                nothing booked yet
+              {% endif %}
+            </div>
+          </div>
           <div class="tile">
             <div class="k">Avg per month</div>
             <div class="v num" id="kpi-permonth">{{ totals.per_month | money }}</div>
@@ -291,7 +307,11 @@
         <div class="card chart-card">
           <div class="card-h">
             <h3>Profit by month</h3>
-            <span class="muted" style="font-size:12px">bars, the month · line, the running total</span>
+            {# "the month alerted" is not decoration: a play alerted in July and
+               sold in August books to JULY, and This Month inherits that rule.
+               Dropping the basis from this line while adding a tile that
+               depends on it would have been a quiet way to mislead. #}
+            <span class="muted" style="font-size:12px">bars, the month alerted · line, the running total</span>
           </div>
           <figure class="chart" id="chart-monthly"
                   aria-label="Theoretical profit booked per month, with the running total"></figure>

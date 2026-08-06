@@ -18,6 +18,7 @@ import pathlib
 import re
 import sys
 import tempfile
+from datetime import date
 
 import pytest
 
@@ -603,3 +604,30 @@ def test_paid_is_not_a_subset_of_rounded_up(fractional_sale):
     assert not paying <= rounded, (
         "every paying play happens to be a round-up here, so this test has "
         "stopped demonstrating why rounded-up cannot be the funnel's parent")
+
+
+# ------------------------------------------------------------- this month
+#
+# The tile a reader checking back looks at first. It cannot be served by the
+# period chips: those exist only for months that HAVE payouts, so that no chip
+# can select nothing — and the month in progress is very often such a month,
+# especially early in it, which is exactly when someone wants to see it.
+
+def test_this_month_is_present_even_when_it_has_paid_nothing(payouts):
+    _, board = payouts
+    totals = board.totals(today=date(2099, 12, 25))
+    assert totals["this_month"]["key"] == "2099-12"
+    assert totals["this_month"]["total"] == 0.0, "a month with no payouts must read zero"
+    assert totals["this_month"]["plays"] == 0
+    assert totals["this_month"] not in totals["months"], \
+        "an empty month must not be invented as a period chip"
+
+
+def test_this_month_reports_that_month_and_not_the_whole_record(payouts):
+    _, board = payouts
+    months = board.totals()["months"]
+    assert months, "the fixture stopped publishing anything payable"
+    picked = months[0]
+    totals = board.totals(today=date.fromisoformat(picked["key"] + "-15"))
+    assert totals["this_month"]["total"] == pytest.approx(picked["total"])
+    assert totals["this_month"]["total"] <= totals["total"] + 1e-9

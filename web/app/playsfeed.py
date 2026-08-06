@@ -552,7 +552,8 @@ class Board:
         """(display name, key, holds fractions) for the settings panel."""
         return [(b, broker_key(b), b in FRACTIONAL_BROKERS) for b in SUPPORTED_BROKERS]
 
-    def totals(self, accounts: dict[str, int] | None = None) -> dict:
+    def totals(self, accounts: dict[str, int] | None = None,
+               today: date | None = None) -> dict:
         """Money, against an account profile. Same rule the browser applies.
 
         `accounts` maps broker key -> how many accounts you hold there. Default
@@ -582,12 +583,23 @@ class Board:
             bucket["plays"] += 1
         months = [by_month[k] for k in sorted(by_month)]
         best = max(months, key=lambda m: m["total"], default=None)
+
+        # The calendar month in progress, present whether or not it has paid
+        # anything yet — a zero here is an answer ("nothing has booked in
+        # August so far"), and it is the question a reader checking back asks
+        # first. It cannot come from the period chips: those exist only for
+        # months that HAVE payouts, deliberately, so that no chip can select
+        # nothing. This month frequently is such a month, especially early in
+        # it, which is exactly when someone wants to see it.
+        this_key = (today or date.today()).strftime("%Y-%m")
         return {
             "total": total,
             "plays": paid,
             "months": months,
             "best": best,
             "per_month": (total / len(months)) if months else 0.0,
+            "this_month": by_month.get(
+                this_key, {"key": this_key, "total": 0.0, "plays": 0}),
         }
 
     # ---- the calendar
