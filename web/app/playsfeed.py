@@ -5,19 +5,25 @@ lives here so the web page, the JSON API and the tests agree on what "open"
 means without three copies of the rule.
 
 The organising idea the whole Plays page rests on: a play has a **life**, and
-the feed reports it in three separate places.
+the feed reports it in four separate places.
 
-    BUY alert  ─►  (you buy, the split happens)  ─►  round-up confirmed  ─►  EXIT
+    BUY alert ─► (you buy, the split happens) ─► TRACK status ─► round-up ─► EXIT
 
-So an entry in the feed is not one row, it is up to three rows joined on the
+So an entry in the feed is not one row, it is up to four rows joined on the
 ticker. `link_lifecycle()` does that join, which is what turns a wall of alerts
 into something a customer can act on: *this one is still open and expires in
 two days*, *that one rounded up and here is what it exited at*.
+
+The join is also why the board carries a **history**: once the four streams are
+linked, every alert the feed has ever carried can state its own outcome — what
+the split did, whether the fraction rounded up, what it exited at — and that
+record is the only honest evidence the mechanism works at all.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -26,24 +32,66 @@ from typing import Iterable, Sequence
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import Play, PlayExit, PlayRoundUp
+from .models import Play, PlayExit, PlayLifecycle, PlayRoundUp
 
 # How far back the page looks. Exits older than this are still in the database
 # and still in the API; they just don't belong on a screen about what to trade.
 EXIT_WINDOW_DAYS = 45
 # A closed buy stays visible this long so you can see what you just missed.
 CLOSED_GRACE_DAYS = 10
+# Ceiling on the all-time history section. Generous enough that nothing real is
+# hidden today, low enough that one page can't try to render five years at once.
+# When it bites, the page says so rather than quietly showing a subset.
+HISTORY_LIMIT = 400
+
+# What each TRACK status means in plain words. The board publishes glyphs
+# (⏳ ✅ 🧩 💵); nobody outside the alert channel knows what they stand for, so
+# the page never shows one without the sentence next to it.
+STATUS_LABELS = {
+    "new": "Alerted",
+    "pending": "Split pending",
+    "rounded_up": "Rounded up",
+    "fractional": "Came back fractional",
+    "cash_in_lieu": "Cash in lieu",
+    "canceled": "Split canceled",
+    "low_odds": "Low odds",
+    "unknown": "Unconfirmed",
+}
+# Statuses that mean the split has happened and there is nothing left to wait
+# for. Anything else is still in flight.
+RESOLVED_STATUSES = frozenset({"rounded_up", "fractional", "cash_in_lieu", "canceled"})
+
+# WHERE a resolved play actually left something behind. Mirrors
+# `lifecycle.brokers_for()` and `rsa_feed.FRACTIONAL_BROKERS` in the desktop
+# app, duplicated rather than imported because this package deploys on its own
+# (Railway root = web/) and cannot see the terminal's modules. Same arrangement
+# as analytics.py mirroring app.py — if the desktop's list changes, change both.
+#
+# This is the distinction the whole profit calculation turns on:
+#
+#   rounded_up   a WHOLE share exists everywhere, so every account paid.
+#   fractional   a fraction came back only at the three brokers that hold
+#                fractions at all; the other seven settled it to cash, so
+#                there is nothing left in them to sell.
+#
+# Multiplying every alert by "how many accounts do you have" ignores that, and
+# overstates the fractional ones by more than three times.
+FRACTIONAL_BROKERS = ("Public", "Robinhood", "SoFi")
+CASH_IN_LIEU_BROKER_COUNT = 7
 
 
 # ------------------------------------------------------------------ lifecycle
 
 @dataclass
 class PlayLife:
-    """One ticker's whole story: the alert, whether it rounded up, how it exited."""
+    """One ticker's whole story: the alert, what the split did to it, whether
+    the fraction rounded up, and how it exited."""
 
     play: Play
     rounded_up: bool = False
     exits: list[PlayExit] = field(default_factory=list)
+    roundups: list[PlayRoundUp] = field(default_factory=list)
+    life: PlayLifecycle | None = None
 
     @property
     def symbol(self) -> str:
@@ -57,6 +105,111 @@ class PlayLife:
     def booked_high(self) -> float:
         return sum(e.proceeds_high or e.proceeds_low or 0.0 for e in self.exits)
 
+    # ---- what the split did, straight off the TRACK board
+
+    @property
+    def status(self) -> str:
+        """The TRACK status, or the best thing we can say without one.
+
+        A confirmed round-up outranks a missing board row: the round-up message
+        is direct evidence, the absent board row is only silence.
+        """
+        if self.life and self.life.status:
+            return self.life.status
+        if self.rounded_up:
+            return "rounded_up"
+        return "unknown"
+
+    @property
+    def status_label(self) -> str:
+        return STATUS_LABELS.get(self.status, self.status.replace("_", " ").title())
+
+    @property
+    def resolved(self) -> bool:
+        """The split has run and the outcome is known."""
+        return self.status in RESOLVED_STATUSES
+
+    @property
+    def paid_everywhere(self) -> bool:
+        """A whole share came back, in every account at every broker."""
+        return self.status == "rounded_up"
+
+    @property
+    def fraction_only(self) -> bool:
+        """Something is left to sell, but only at the three fractional brokers.
+        Accounts at the other seven were settled to cash and hold nothing."""
+        return self.status == "fractional"
+
+    @property
+    def paid_in(self) -> str:
+        """Where this play left anything behind. Drives the calculator column."""
+        if self.paid_everywhere:
+            return "every account"
+        if self.fraction_only:
+            return " / ".join(FRACTIONAL_BROKERS) + " only"
+        return "nothing to sell"
+
+    @property
+    def sell_symbol(self) -> str:
+        """The ticker an order can actually be placed in.
+
+        A reverse split usually renames the company (AGAE -> AIFA). Holdings sit
+        under the old symbol; only the new one is tradeable, and a customer who
+        doesn't know that types the wrong ticker.
+        """
+        return (self.life.sell_symbol if self.life else "") or self.play.symbol
+
+    @property
+    def renamed(self) -> bool:
+        return self.sell_symbol != self.play.symbol
+
+    @property
+    def confirmed_date(self) -> str:
+        """When the round-up was confirmed, if it ever was."""
+        for r in self.roundups:
+            if r.confirmed_date:
+                return r.confirmed_date
+        return ""
+
+    @property
+    def ratio_n(self) -> int | None:
+        """The N in a 1-for-N split.
+
+        Prefers the parsed column, then reads it back out of the ratio string
+        the alert published ('1:20', '1-for-20'). Worth the fallback: a play
+        with a ratio nobody parsed is still a play whose payout is knowable, and
+        dropping it would quietly shrink every total on the page.
+        """
+        p = self.play
+        if p.ratio_n and p.ratio_n > 1:
+            return p.ratio_n
+        nums = re.findall(r"\d+", p.ratio or "")
+        if nums:
+            n = int(nums[-1])
+            if n > 1:
+                return n
+        return None
+
+    @property
+    def per_account_profit(self) -> float | None:
+        """What ONE account would have made on this play, in theory.
+
+            entry x (ratio - 1)
+
+        The site's one formula (see site.js `RSA`): you paid `entry` for a share
+        that a round-up hands back whole at `entry x ratio`. Falls back to the
+        alert's own estimate when the ratio or the entry price wasn't published,
+        and returns None when neither is knowable — a play we cannot price must
+        drop out of the arithmetic rather than count as zero.
+        """
+        p = self.play
+        n = self.ratio_n
+        if p.entry_price and n:
+            return p.entry_price * (n - 1)
+        if p.est_profit:
+            return p.est_profit
+        return None
+
     @property
     def stage(self) -> str:
         """Where this play is in its life. Drives the badge on the page."""
@@ -69,22 +222,46 @@ class PlayLife:
         return "open"
 
 
+def _life_key(alert_date: str, symbol: str) -> str:
+    """The lifecycle identity, matching `rsa_feed.LifecycleRow.key`."""
+    return f"{alert_date or ''}:{(symbol or '').upper()}"
+
+
 def link_lifecycle(
     plays: Sequence[Play],
     roundups: Iterable[PlayRoundUp],
     exits: Iterable[PlayExit],
+    lifecycle: Iterable[PlayLifecycle] = (),
 ) -> list[PlayLife]:
-    """Join the three streams on ticker.
+    """Join the four streams on ticker.
 
     Ticker is the only key the feed gives us — the sell message never names the
     alert it closes. That is good enough because the same name rarely reverse
     splits twice inside one window, and a wrong link shows a customer MORE
     information about a symbol they hold, not less.
+
+    The TRACK board is the exception: it is keyed 'date:SYMBOL', so it is matched
+    on the exact alert first and only falls back to the ticker. The fallback
+    matters because the board and the alert sometimes disagree by a day, and the
+    status is worth more than the strictness.
     """
     confirmed = {r.symbol for r in roundups}
+    ru_by_symbol: dict[str, list[PlayRoundUp]] = defaultdict(list)
+    for r in roundups:
+        ru_by_symbol[r.symbol].append(r)
+
     by_symbol: dict[str, list[PlayExit]] = defaultdict(list)
     for e in exits:
         by_symbol[e.symbol].append(e)
+
+    life_by_key: dict[str, PlayLifecycle] = {}
+    life_by_symbol: dict[str, PlayLifecycle] = {}
+    for row in lifecycle:
+        life_by_key[row.source_id or _life_key(row.alert_date, row.symbol)] = row
+        # Newest alert_date wins the ticker-only fallback.
+        prev = life_by_symbol.get(row.symbol)
+        if prev is None or (row.alert_date or "") >= (prev.alert_date or ""):
+            life_by_symbol[row.symbol] = row
 
     lives = []
     for p in plays:
@@ -95,6 +272,9 @@ def link_lifecycle(
             (e for e in by_symbol.get(p.symbol, ()) if e.sell_date >= (p.alert_date or "")),
             key=lambda e: e.sell_date,
         )
+        life.roundups = ru_by_symbol.get(p.symbol, [])
+        life.life = (life_by_key.get(_life_key(p.alert_date, p.symbol))
+                     or life_by_symbol.get(p.symbol))
         lives.append(life)
     return lives
 
@@ -111,6 +291,21 @@ class Board:
     exits_by_date: "OrderedDict[str, list[PlayExit]]" = field(default_factory=OrderedDict)
     roundup_symbols: set[str] = field(default_factory=set)
     generated_at: datetime | None = None
+
+    # Every alert the feed has ever carried, newest first, each one stating its
+    # own outcome. The window above is about what to trade; this is the record.
+    history: list[PlayLife] = field(default_factory=list)
+    # TRACK rows we hold a status for but no matching BUY alert — usually a play
+    # alerted before the feed existed, or one whose alert message was edited.
+    # Surfaced rather than dropped: a customer may still be holding it, and
+    # "your position resolved" is the whole job of the board.
+    orphan_lifecycle: list[PlayLifecycle] = field(default_factory=list)
+    # True when older alerts exist beyond HISTORY_LIMIT. The page says so out
+    # loud: a silently-cut list reads as "this is everything" when it isn't.
+    history_truncated: bool = False
+    # When the feed itself last changed — not when this page was rendered. The
+    # difference is the whole question "is this thing still being updated?".
+    last_update: datetime | None = None
 
     # ---- summary numbers, all derived, none stored
     @property
@@ -143,7 +338,81 @@ class Board:
 
     @property
     def has_anything(self) -> bool:
-        return bool(self.open_plays or self.closed_plays or self.exits)
+        return bool(self.open_plays or self.closed_plays or self.exits or self.history)
+
+    # ---- the round-up record, over everything the feed has ever carried
+    @property
+    def resolved_history(self) -> list[PlayLife]:
+        """Alerts whose split has actually run. The only fair denominator: a
+        play still waiting on its split has neither won nor lost yet."""
+        return [l for l in self.history if l.resolved]
+
+    @property
+    def rounded_history(self) -> list[PlayLife]:
+        return [l for l in self.resolved_history if l.status == "rounded_up"]
+
+    @property
+    def roundup_rate(self) -> float | None:
+        """Share of resolved alerts that rounded up, 0..1. None when nothing has
+        resolved — a rate off two data points is noise dressed as evidence."""
+        resolved = self.resolved_history
+        if len(resolved) < 3:
+            return None
+        return len(self.rounded_history) / len(resolved)
+
+    # ---- the theoretical-profit basis, for the calculator on the page
+    #
+    # Two buckets, because the tracker says they paid in two different places.
+    # Adding them together and multiplying by one account count is the mistake
+    # this split exists to prevent.
+    @property
+    def profit_basis(self) -> list[PlayLife]:
+        """Confirmed round-ups we can price. These paid in EVERY account: the
+        tracker says a whole share came back, and a whole share is a whole share
+        at all ten brokers."""
+        return [l for l in self.rounded_history if l.per_account_profit]
+
+    @property
+    def fractional_basis(self) -> list[PlayLife]:
+        """Plays that came back as a fraction. Sellable ONLY at the three
+        brokers that hold fractions — the other seven paid cash in lieu and hold
+        nothing. Priced separately for that reason, and never folded into the
+        round-up total."""
+        return [l for l in self.history if l.fraction_only and l.per_account_profit]
+
+    @property
+    def per_account_profit(self) -> float:
+        """One account, one share in each confirmed round-up on this board."""
+        return sum(l.per_account_profit or 0.0 for l in self.profit_basis)
+
+    @property
+    def per_fractional_account(self) -> float:
+        """The same figure for the fraction-only plays, per account held at one
+        of the three. Upper bound, not profit: a fraction that stays a fraction
+        is worth roughly what was paid for it, and only moves with the price."""
+        return sum(l.per_account_profit or 0.0 for l in self.fractional_basis)
+
+    @property
+    def profit_unpriced(self) -> int:
+        """Round-ups left OUT of the number above for want of a price. Shown on
+        the page: a total that quietly drops rows overstates its own coverage."""
+        return len(self.rounded_history) - len(self.profit_basis)
+
+    @property
+    def history_by_status(self) -> list[tuple[str, str, int]]:
+        """(status, human label, count), in the order a split actually happens.
+
+        Carries the label with it so the template never has to know the
+        vocabulary — the words for these statuses belong next to the statuses.
+        """
+        counts: dict[str, int] = defaultdict(int)
+        for l in self.history:
+            counts[l.status] += 1
+        order = list(STATUS_LABELS)
+        return [
+            (s, STATUS_LABELS.get(s, s.replace("_", " ").title()), counts[s])
+            for s in sorted(counts, key=lambda s: order.index(s) if s in order else 99)
+        ]
 
 
 def _by_date_desc(rows: Iterable, key: str) -> "OrderedDict[str, list]":
@@ -153,32 +422,68 @@ def _by_date_desc(rows: Iterable, key: str) -> "OrderedDict[str, list]":
     return OrderedDict(sorted(buckets.items(), key=lambda kv: kv[0], reverse=True))
 
 
-def load_board(db: Session, *, today: date | None = None) -> Board:
-    """The whole page in one call: three queries, joined in memory.
+def _newest(rows: Iterable, *attrs: str) -> datetime | None:
+    """The latest timestamp across some rows, ignoring the ones that have none."""
+    stamps = [
+        v for r in rows for a in attrs
+        if isinstance(v := getattr(r, a, None), datetime)
+    ]
+    # Every column here is a UtcDateTime, so they come back aware on both
+    # backends (see types.py) and max() over the mix is safe.
+    return max(stamps) if stamps else None
 
-    Three queries rather than one join because the streams have no foreign key
+
+def load_board(db: Session, *, today: date | None = None,
+               history_limit: int = HISTORY_LIMIT) -> Board:
+    """The whole page in one call: four queries, joined in memory.
+
+    Four queries rather than one join because the streams have no foreign key
     between them — they're joined on ticker, and doing that in Python keeps the
     rule (see `link_lifecycle`) readable instead of buried in SQL.
+
+    Everything is read once and then windowed in Python: the trading board wants
+    the last few weeks, the history section wants all of it, and they must agree
+    about every play they both show. Two queries with two different floors is
+    how they'd stop agreeing.
     """
     today = today or date.today()
-    exit_floor = (today - timedelta(days=EXIT_WINDOW_DAYS)).isoformat()
-    play_floor = (today - timedelta(days=EXIT_WINDOW_DAYS)).isoformat()
 
     plays = list(db.scalars(
-        select(Play).where(Play.alert_date >= play_floor).order_by(Play.alert_date.desc(), Play.id.desc())
+        select(Play).order_by(Play.alert_date.desc(), Play.id.desc()).limit(history_limit + 1)
     ))
+    board_truncated = len(plays) > history_limit
+    if board_truncated:
+        plays = plays[:history_limit]
+
     exits = list(db.scalars(
-        select(PlayExit).where(PlayExit.sell_date >= exit_floor).order_by(PlayExit.sell_date.desc(), PlayExit.id.desc())
+        select(PlayExit).order_by(PlayExit.sell_date.desc(), PlayExit.id.desc())
     ))
     roundups = list(db.scalars(select(PlayRoundUp).order_by(PlayRoundUp.id.desc())))
+    lifecycle = list(db.scalars(select(PlayLifecycle)))
 
-    lives = link_lifecycle(plays, roundups, exits)
+    lives = link_lifecycle(plays, roundups, exits, lifecycle)
 
-    board = Board(exits=exits, generated_at=datetime.now())
-    board.roundup_symbols = {r.symbol for r in roundups}
+    exit_floor = (today - timedelta(days=EXIT_WINDOW_DAYS)).isoformat()
+    play_floor = exit_floor
     closed_floor = (today - timedelta(days=CLOSED_GRACE_DAYS)).isoformat()
+    recent_exits = [e for e in exits if (e.sell_date or "") >= exit_floor]
+
+    board = Board(exits=recent_exits, generated_at=datetime.now())
+    board.roundup_symbols = {r.symbol for r in roundups}
+    board.history = lives                       # already newest-alert-first
+    board.history_truncated = board_truncated
+    claimed = {id(l.life) for l in lives if l.life is not None}
+    board.orphan_lifecycle = sorted(
+        (row for row in lifecycle if id(row) not in claimed),
+        key=lambda r: (r.alert_date or "", r.symbol), reverse=True,
+    )
+    board.last_update = _newest(
+        [*plays, *exits, *roundups], "posted_at", "created_at",
+    ) or _newest(lifecycle, "updated_at", "status_changed_at")
 
     for life in lives:
+        if (life.play.alert_date or "") < play_floor:
+            continue                            # history only, not the trading board
         if life.play.is_open(today):
             board.open_plays.append(life)
         elif (life.play.last_buy_date or life.play.alert_date or "") >= closed_floor:
@@ -187,7 +492,7 @@ def load_board(db: Session, *, today: date | None = None) -> Board:
     # Soonest deadline first — that is the order you'd work the list in.
     board.open_plays.sort(key=lambda l: (l.play.days_left() if l.play.days_left() is not None else 999,
                                          l.play.symbol))
-    board.exits_by_date = _by_date_desc(exits, "sell_date")
+    board.exits_by_date = _by_date_desc(recent_exits, "sell_date")
     return board
 
 

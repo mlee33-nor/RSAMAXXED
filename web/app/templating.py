@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 
 from fastapi import Request
 from fastapi.templating import Jinja2Templates
@@ -35,9 +36,44 @@ def price(v: float | None) -> str:
     return f"${v:,.2f}"
 
 
+def ago(v: datetime | None) -> str:
+    """How long ago, in words. The Plays board's honesty check.
+
+    A timestamp tells a reader nothing about whether the feed is still alive;
+    "4 hours ago" tells them immediately, and "3 days ago" tells them something
+    has broken. Days are deliberately not smoothed into weeks — on a board where
+    the publisher runs hourly, a number of days IS the alarm.
+    """
+    if v is None:
+        return "never"
+    now = datetime.now(timezone.utc)
+    if v.tzinfo is None:
+        v = v.replace(tzinfo=timezone.utc)
+    secs = (now - v).total_seconds()
+    if secs < 0:
+        return "just now"          # clock skew; don't print "in -3 minutes"
+    if secs < 90:
+        return "just now"
+    mins = secs / 60
+    if mins < 60:
+        return f"{int(mins)} minutes ago"
+    hours = mins / 60
+    if hours < 24:
+        n = int(hours)
+        return "1 hour ago" if n == 1 else f"{n} hours ago"
+    days = int(hours / 24)
+    return "1 day ago" if days == 1 else f"{days} days ago"
+
+
+def pct(v: float | None) -> str:
+    return "—" if v is None else f"{v * 100:.0f}%"
+
+
 templates.env.filters["money"] = money
 templates.env.filters["qty"] = qty
 templates.env.filters["price"] = price
+templates.env.filters["ago"] = ago
+templates.env.filters["pct"] = pct
 
 
 def csrf_for(request: Request) -> str:

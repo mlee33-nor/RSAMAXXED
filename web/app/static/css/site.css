@@ -1135,4 +1135,147 @@
   .upsell h3{font-size:17px;margin:0 0 5px}
   .upsell p{margin:0;font-size:13.5px;max-width:56ch}
   .upsell .btn{flex:none}
+
+  /* ============================================================ PLAYS TABS
+     Radio inputs and sibling selectors, not JavaScript. The board is the thing
+     people paid for; it must not depend on a script to be readable, and the CSP
+     forbids the inline handler that would be the lazy way to do it. */
+
+  .tabs{margin-top:14px}
+  .tabs > input{
+    position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;
+  }
+  .tabbar{
+    display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;
+    border-bottom:1px solid var(--line);padding-bottom:10px;
+  }
+  .tabbar label{
+    display:inline-flex;align-items:center;gap:8px;cursor:pointer;
+    padding:8px 14px;border-radius:99px;font-size:13.5px;font-weight:550;
+    color:var(--text-3);border:1px solid transparent;
+    transition:color .15s var(--ease),background .15s var(--ease),border-color .15s var(--ease);
+  }
+  .tabbar label:hover{color:var(--text-2);background:rgba(255,255,255,.04)}
+  .tabbar label b{
+    font-family:var(--mono);font-size:11px;font-weight:600;
+    padding:2px 6px;border-radius:5px;background:rgba(255,255,255,.06);color:var(--text-3);
+  }
+  .sd.gold{background:var(--amber);box-shadow:0 0 9px rgba(242,193,78,.5)}
+
+  .tabs > .pane{display:none;margin:0}
+  #tab-buys:checked   ~ .p-buys,
+  #tab-sells:checked  ~ .p-sells,
+  #tab-track:checked  ~ .p-track,
+  #tab-profit:checked ~ .p-profit{display:block}
+
+  #tab-buys:checked   ~ .tabbar label[for="tab-buys"],
+  #tab-sells:checked  ~ .tabbar label[for="tab-sells"],
+  #tab-track:checked  ~ .tabbar label[for="tab-track"],
+  #tab-profit:checked ~ .tabbar label[for="tab-profit"]{
+    color:var(--text);background:rgba(255,255,255,.06);border-color:var(--line-2);
+  }
+  #tab-buys:checked   ~ .tabbar label[for="tab-buys"] b,
+  #tab-sells:checked  ~ .tabbar label[for="tab-sells"] b,
+  #tab-track:checked  ~ .tabbar label[for="tab-track"] b,
+  #tab-profit:checked ~ .tabbar label[for="tab-profit"] b{color:var(--text-2)}
+
+  /* Keyboard users get a visible target on the tab they are actually on;
+     mouse users never see it. */
+  #tab-buys:focus-visible   ~ .tabbar label[for="tab-buys"],
+  #tab-sells:focus-visible  ~ .tabbar label[for="tab-sells"],
+  #tab-track:focus-visible  ~ .tabbar label[for="tab-track"],
+  #tab-profit:focus-visible ~ .tabbar label[for="tab-profit"]{
+    outline:2px solid var(--accent);outline-offset:2px;
+  }
+
+  /* Inside a tab there is one full-width card, so the rows pair up on desktop
+     instead of stretching to the width of the page. */
+  .plist.grid2{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+  @media(max-width:900px){ .plist.grid2{grid-template-columns:1fr} }
+
+  /* ------------------------------------------------------- the calculator */
+  .calc-in{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+  .calc-in label{font-size:13.5px;color:var(--text-2)}
+  .calc-in input{
+    width:110px;padding:9px 12px;border-radius:10px;font-family:var(--mono);
+    font-size:15px;font-weight:600;color:var(--text);
+    background:rgba(255,255,255,.04);border:1px solid var(--line-2);
+  }
+  .calc-in input:focus{outline:2px solid var(--accent);outline-offset:1px}
+  .calc-in .hint{font-size:11.5px;color:var(--text-3)}
+  .calc-in + .calc-in{margin-top:-8px}
+
+  .calc-out{display:flex;gap:34px;flex-wrap:wrap;margin-bottom:16px}
+  .calc-out .k{
+    font-size:9.5px;letter-spacing:.11em;text-transform:uppercase;color:var(--text-3);
+    margin-bottom:5px;
+  }
+  .calc-out .v{font-family:var(--mono);font-size:24px;font-weight:640;letter-spacing:-.02em}
+  .calc-out .big .v{font-size:38px}
+
+  .calc-note{font-size:12.5px;color:var(--text-3);line-height:1.6;max-width:70ch;margin:0 0 10px}
+  .calc-note b{color:var(--text-2);font-family:var(--mono)}
+  .calc-warn{
+    font-size:12.5px;line-height:1.6;max-width:70ch;margin:0 0 18px;
+    padding:11px 13px;border-radius:10px;
+    background:rgba(242,193,78,.06);border:1px solid rgba(242,193,78,.16);color:var(--amber);
+  }
+
+  /* ---- page header side: freshness stamp + the lock-this-browser control */
+  .head-side{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .eyebrow.stale{color:var(--amber);border-color:rgba(242,193,78,.3)}
+  .eyebrow.stale .pip{background:var(--amber)}
+
+  /* ---- what the split did. Colour groups the outcomes; the label states it. */
+  .ptag.st{font-size:9.5px}
+  .ptag.st.ok  {color:var(--green);background:rgba(52,211,158,.13)}
+  .ptag.st.warn{color:var(--amber);background:rgba(242,193,78,.13)}
+  .ptag.st.wait{color:var(--text-2);background:rgba(124,120,255,.13)}
+  .ptag.st.off {color:var(--text-3);background:rgba(255,255,255,.05)}
+  .ptag.st.dim {color:var(--text-3);background:rgba(255,255,255,.035)}
+
+  /* The post-split rename. Loud on purpose: an order in the old ticker fails. */
+  .rename{
+    color:var(--accent-2);font-size:11.5px;
+  }
+  .rename b{font-family:var(--mono);font-weight:650}
+
+  /* ======================================================== THE RECORD
+     Every alert ever published, with its outcome. A table, not cards: the
+     question this section answers is "how often does this actually work",
+     which is a question about columns you can run your eye down. */
+
+  .hist{margin-top:14px}
+  .sd.hist{background:var(--text-3);box-shadow:none}
+
+  .statbar{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+  .sb{
+    font-size:11.5px;padding:5px 10px;border-radius:99px;
+    border:1px solid var(--line-2);color:var(--text-3);white-space:nowrap;
+  }
+  .sb b{font-family:var(--mono);color:var(--text-2);font-weight:650;margin-right:3px}
+  .sb-rounded_up{border-color:rgba(52,211,158,.32);color:var(--green)}
+  .sb-rounded_up b{color:var(--green)}
+  .sb-fractional,.sb-cash_in_lieu{border-color:rgba(242,193,78,.26);color:var(--amber)}
+  .sb-fractional b,.sb-cash_in_lieu b{color:var(--amber)}
+
+  /* The table scrolls inside its own box; the page never scrolls sideways. */
+  .htable-wrap{overflow-x:auto;margin:0 -4px;padding:0 4px}
+  .htable{width:100%;border-collapse:collapse;font-size:12.5px;min-width:920px}
+  .htable th{
+    text-align:left;font-size:9.5px;letter-spacing:.11em;text-transform:uppercase;
+    color:var(--text-3);font-weight:600;padding:0 12px 9px 0;white-space:nowrap;
+    border-bottom:1px solid var(--line);
+  }
+  .htable td{
+    padding:9px 12px 9px 0;border-bottom:1px solid var(--line);vertical-align:middle;
+    white-space:nowrap;
+  }
+  .htable tbody tr:hover{background:rgba(255,255,255,.018)}
+  .htable tbody tr:last-child td{border-bottom:0}
+  .htable .mono{font-family:var(--mono)}
+  .htable .dim{color:var(--text-3)}
+  .htable .small{font-size:11.5px;white-space:normal;max-width:22ch}
+  .htable .arrow{color:var(--accent-2);font-family:var(--mono);font-size:11.5px;margin-left:4px}
+  @media(max-width:700px){ .htable{font-size:12px} }
 }

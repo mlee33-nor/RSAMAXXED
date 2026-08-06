@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Plays — RSAMAXXED{% endblock %}
+{% block nav_plays %}on{% endblock %}
+
+{#
+  One password, no account. This page exists so that handing someone the board
+  is a single sentence — "go to rsamaxxed.com/plays, the password is X" — with
+  no signup, no email, no plan to pick.
+#}
+
+{% block content %}
+<div class="auth">
+  <aside class="aside">
+    <span class="eyebrow"><i class="pip"></i> Updated every hour</span>
+    <h2>Every alert, and what the split actually did.</h2>
+    <p class="quote">
+      What's open and how long you have left to buy it, what exited and at what
+      price, and the record behind it — every past alert with the outcome it
+      ended in, round-up or not.
+    </p>
+    <div class="mini-stat">
+      <div class="s"><div class="v num">1</div><div class="k">Password</div></div>
+      <div class="s"><div class="v num">0</div><div class="k">Accounts needed</div></div>
+      <div class="s"><div class="v num">24/7</div><div class="k">Auto-published</div></div>
+    </div>
+  </aside>
+
+  <div class="pane">
+    <form method="post" action="/plays">
+      <h1>Plays</h1>
+      <p class="sub">Enter the password you were given.</p>
+
+      {% if error %}<div class="notice err">{{ error }}</div>{% endif %}
+      {% if not configured %}
+        <div class="notice err">
+          No password is set on this deployment yet, so nobody can get in.
+          Set <code>PLAYS_PASSWORD</code> as a service variable.
+        </div>
+      {% endif %}
+
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password"
+             required autofocus placeholder="••••••••">
+
+      <button class="btn btn-block" type="submit">Open the board</button>
+      <p class="alt">
+        Want it placed for you? <a href="/pricing">See Automation</a>
+      </p>
+    </form>
+  </div>
+</div>
+{% endblock %}

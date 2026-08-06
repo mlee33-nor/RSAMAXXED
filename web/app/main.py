@@ -11,7 +11,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from . import config, playsfeed
 from .db import SessionLocal, init_db
-from .routes import api, auth, dashboard, site
+from .routes import api, auth, dashboard, plays, site
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -78,6 +78,7 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=os.path.join(_HERE, "static")), name="static")
 
 app.include_router(site.router)
+app.include_router(plays.router)
 app.include_router(auth.router)
 app.include_router(dashboard.router)
 app.include_router(api.router)

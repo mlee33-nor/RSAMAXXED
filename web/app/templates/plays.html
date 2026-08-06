@@ -3,15 +3,22 @@
 {% block nav_plays %}on{% endblock %}
 
 {#
-  The Plays board. Two columns, and the split is the whole design:
+  The Plays board. Four tabs, because a play has four different questions asked
+  of it and they are asked at different moments:
 
-    LEFT   BUYS  — what is still open, soonest deadline first. This is a
-                   to-do list, so it is ordered by urgency, never by date.
-    RIGHT  SELLS — what has exited, newest first, grouped by day. This is a
-                   record, so it is ordered by time.
+    BUYS      what is still open, soonest deadline first. A to-do list, so it is
+              ordered by urgency and never by date.
+    SELLS     what has exited and at what price. A record, so it is ordered by
+              time and grouped by day.
+    TRACKING  what the split actually DID — rounded up, came back fractional,
+              paid cash. The stream nobody outside the alert channel can see,
+              and the only evidence the mechanism works.
+    PROFIT    what that record would have been worth at YOUR account count.
 
-  A play appears on the left while you can still act on it and on the right
-  once it has closed. Same ticker, two different jobs.
+  The tabs are radio inputs and CSS, deliberately: the page has to work before
+  (and without) JavaScript, and the content security policy forbids inline
+  script. Only the calculator needs JS, and only the calculator loses anything
+  without it.
 #}
 
 {% macro kindtag(kind) -%}
@@ -19,6 +26,18 @@
   {%- elif kind == 'conditional' -%}<span class="ptag cond">Conditional</span>
   {%- else -%}<span class="ptag std">Standard</span>{%- endif -%}
 {%- endmacro %}
+
+{#  The TRACK status, as a badge. Colour carries the good/bad/waiting split;
+    the words carry the actual meaning, because colour alone never has. #}
+{% macro statuslabel(status, label) -%}
+  {%- if status == 'rounded_up' -%}<span class="ptag st ok">{{ label }}</span>
+  {%- elif status in ('fractional', 'cash_in_lieu') -%}<span class="ptag st warn">{{ label }}</span>
+  {%- elif status == 'canceled' -%}<span class="ptag st off">{{ label }}</span>
+  {%- elif status in ('pending', 'new') -%}<span class="ptag st wait">{{ label }}</span>
+  {%- else -%}<span class="ptag st dim">{{ label }}</span>{%- endif -%}
+{%- endmacro %}
+
+{% macro statustag(l) -%}{{ statuslabel(l.status, l.status_label) }}{%- endmacro %}
 
 {% macro countdown(days) -%}
   {%- if days is none -%}<span class="cd none">no deadline</span>
@@ -36,18 +55,31 @@
     <div>
       <h1 style="font-size:26px;letter-spacing:-.02em;margin:0">Plays</h1>
       <p class="muted" style="font-size:13px;margin:5px 0 0">
-        Reverse-split round-up alerts, split into what's still open and what has exited.
+        Reverse-split round-up alerts: what's still open, what has exited, and
+        what every past one ended in.
       </p>
     </div>
-    <span class="eyebrow"><i class="pip"></i> {{ plan.name }}</span>
+    <div class="head-side">
+      {# The freshness stamp reports the FEED's last change, not this page load,
+         so a publisher that died is visible instead of disguised. #}
+      <span class="eyebrow{% if not board.last_update %} stale{% endif %}">
+        <i class="pip"></i> Updated {{ board.last_update | ago }}
+      </span>
+      {% if not user %}
+        <form method="post" action="/plays/lock" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="linkish" type="submit" title="Forget the password on this browser">Lock</button>
+        </form>
+      {% endif %}
+    </div>
   </div>
 
   {% if not board.has_anything %}
     <div class="card empty">
       <h2>No alerts yet.</h2>
       <p>
-        The feed publishes as alerts land. Nothing has come through in the
-        last {{ 45 }} days — this page fills itself in the moment one does.
+        The feed publishes as alerts land. Nothing has come through — this page
+        fills itself in the moment one does.
       </p>
       <a class="btn btn-ghost" href="/how-it-works">What lands here</a>
     </div>
@@ -69,17 +101,32 @@
     </div>
     <div class="tile">
       <div class="k">Round-ups confirmed</div>
-      <div class="v num">{{ board.roundup_symbols | length }}</div>
+      <div class="v num">{{ board.rounded_history | length }}</div>
+    </div>
+    <div class="tile">
+      <div class="k">Of resolved alerts</div>
+      <div class="v num">{{ board.roundup_rate | pct }}</div>
     </div>
   </div>
 
-  <!-- ============================================================== BOARD -->
-  <div class="board">
+  <!-- =============================================================== TABS -->
+  <div class="tabs">
+    <input type="radio" name="ptab" id="tab-buys" checked>
+    <input type="radio" name="ptab" id="tab-sells">
+    <input type="radio" name="ptab" id="tab-track">
+    <input type="radio" name="ptab" id="tab-profit">
+
+    <nav class="tabbar" aria-label="Plays sections">
+      <label for="tab-buys"><span class="sd buy" aria-hidden="true"></span>Buys<b>{{ board.open_count }}</b></label>
+      <label for="tab-sells"><span class="sd sell" aria-hidden="true"></span>Sells<b>{{ board.exit_count }}</b></label>
+      <label for="tab-track"><span class="sd hist" aria-hidden="true"></span>Tracking<b>{{ board.history | length }}</b></label>
+      <label for="tab-profit"><span class="sd gold" aria-hidden="true"></span>Profit</label>
+    </nav>
 
     <!-- ------------------------------------------------------------ BUYS -->
-    <section class="card side buys">
+    <section class="pane p-buys card">
       <div class="card-h">
-        <h3><span class="sd buy" aria-hidden="true"></span>Open plays</h3>
+        <h3>Open plays</h3>
         <span class="muted" style="font-size:12px">soonest deadline first</span>
       </div>
 
@@ -88,14 +135,14 @@
           Nothing open. Every alert in the window has passed its last buy date.
         </p>
       {% else %}
-        <ul class="plist">
+        <ul class="plist grid2">
           {% for l in board.open_plays %}
             {% set p = l.play %}
             <li class="prow {{ l.stage }}{% if not p.is_actionable %} watch{% endif %}">
               <div class="prow-top">
                 <b class="sym">{{ p.symbol }}</b>
                 {{ kindtag(p.kind) }}
-                {% if l.rounded_up %}<span class="ptag ru" title="This ticker's fraction rounded up">rounded up</span>{% endif %}
+                {% if l.life or l.rounded_up %}{{ statustag(l) }}{% endif %}
                 <span class="spacer"></span>
                 {{ countdown(p.days_left()) }}
               </div>
@@ -115,6 +162,15 @@
                 {% if p.roundup_history and p.roundup_history != 'N/A' %}
                   <span class="muted">· history: {{ p.roundup_history }}</span>
                 {% endif %}
+                {% if l.confirmed_date %}
+                  <span class="muted">· round-up confirmed {{ l.confirmed_date }}</span>
+                {% endif %}
+                {# The rename is the one detail that decides whether an order can
+                   be placed at all: holdings sit under the old ticker, only the
+                   new one trades. #}
+                {% if l.renamed %}
+                  <span class="rename">sell as <b>{{ l.sell_symbol }}</b></span>
+                {% endif %}
                 {% if not p.is_actionable %}
                   <span class="warn-note">watch only — the split isn't declared yet</span>
                 {% endif %}
@@ -127,20 +183,23 @@
       {% if board.closed_plays %}
         <details class="closed-fold">
           <summary>{{ board.closed_plays | length }} recently closed</summary>
-          <ul class="plist tight">
+          <ul class="plist tight grid2">
             {% for l in board.closed_plays %}
               {% set p = l.play %}
               <li class="prow past">
                 <div class="prow-top">
                   <b class="sym">{{ p.symbol }}</b>
                   {{ kindtag(p.kind) }}
-                  {% if l.rounded_up %}<span class="ptag ru">rounded up</span>{% endif %}
+                  {% if l.life or l.rounded_up %}{{ statustag(l) }}{% endif %}
                   <span class="spacer"></span>
                   <span class="cd gone">closed {{ p.last_buy_date or p.alert_date }}</span>
                 </div>
                 <div class="prow-facts">
                   <span class="f"><i>Ratio</i><b>{{ p.ratio or '—' }}</b></span>
                   <span class="f"><i>Entry</i><b>{% if p.entry_price is none %}—{% else %}{{ p.entry_price | price }}{% endif %}</b></span>
+                  {% if l.renamed %}
+                    <span class="f"><i>Now trades as</i><b>{{ l.sell_symbol }}</b></span>
+                  {% endif %}
                   {% if l.exits %}
                     <span class="f"><i>Exited</i><b class="pos">{{ l.exits | length }}×</b></span>
                   {% endif %}
@@ -153,10 +212,10 @@
     </section>
 
     <!-- ----------------------------------------------------------- SELLS -->
-    <section class="card side sells">
+    <section class="pane p-sells card">
       <div class="card-h">
-        <h3><span class="sd sell" aria-hidden="true"></span>Exits</h3>
-        <span class="muted" style="font-size:12px">newest first</span>
+        <h3>Exits</h3>
+        <span class="muted" style="font-size:12px">newest first · last 45 days</span>
       </div>
 
       {% if not board.exits %}
@@ -167,7 +226,7 @@
         {% for day, rows in board.exits_by_date.items() %}
           <div class="daygroup">
             <div class="dayhead"><span>{{ day }}</span><i></i></div>
-            <ul class="plist">
+            <ul class="plist grid2">
               {% for e in rows %}
                 <li class="prow exit">
                   <div class="prow-top">
@@ -208,6 +267,213 @@
         {% endfor %}
       {% endif %}
     </section>
+
+    <!-- -------------------------------------------------------- TRACKING -->
+    {# Every alert, and what became of it. Shown in full, including the ones
+       that did not round up: a record that only kept the wins is not a record. #}
+    <section class="pane p-track card">
+      <div class="card-h">
+        <h3>Split tracking</h3>
+        <span class="muted" style="font-size:12px">
+          {{ board.history | length }} alerts · every outcome
+        </span>
+      </div>
+
+      {% if board.history_by_status %}
+        <div class="statbar">
+          {% for status, label, n in board.history_by_status %}
+            <span class="sb sb-{{ status }}"><b>{{ n }}</b> {{ label }}</span>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      <div class="htable-wrap">
+        <table class="htable">
+          <thead>
+            <tr>
+              <th>Alerted</th><th>Ticker</th><th>Type</th><th>Ratio</th>
+              <th>Entry</th><th>Est / acct</th><th>Last buy</th>
+              <th>Outcome</th><th>Confirmed</th><th>Exit</th><th>Proceeds</th>
+              <th>Prior record</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for l in board.history %}
+              {% set p = l.play %}
+              <tr>
+                <td class="mono dim">{{ p.alert_date or '—' }}</td>
+                <td>
+                  <b>{{ p.symbol }}</b>
+                  {% if l.renamed %}<span class="arrow">→ {{ l.sell_symbol }}</span>{% endif %}
+                </td>
+                <td>{{ kindtag(p.kind) }}</td>
+                <td class="mono">{{ p.ratio or '—' }}</td>
+                <td class="mono">{% if p.entry_price is none %}—{% else %}{{ p.entry_price | price }}{% endif %}</td>
+                <td class="mono">{% if p.est_profit is none %}—{% else %}{{ p.est_profit | money }}{% endif %}</td>
+                <td class="mono dim">{{ p.last_buy_date or '—' }}</td>
+                <td>{{ statustag(l) }}</td>
+                <td class="mono dim">{{ l.confirmed_date or '—' }}</td>
+                <td class="mono">
+                  {%- if l.exits -%}{{ l.exits[-1].exit_price | price }}{%- else -%}—{%- endif -%}
+                </td>
+                <td class="mono pos">
+                  {%- if not l.exits -%}—
+                  {%- elif l.booked_high > l.booked_low -%}+{{ l.booked_low | money }}–{{ l.booked_high | money }}
+                  {%- elif l.booked_low -%}+{{ l.booked_low | money }}
+                  {%- else -%}—{%- endif -%}
+                </td>
+                <td class="dim small">{{ p.roundup_history if p.roundup_history and p.roundup_history != 'N/A' else '—' }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      {% if board.history_truncated %}
+        <p class="muted" style="font-size:12px;margin:12px 0 0">
+          Showing the most recent {{ board.history | length }} alerts. Older ones
+          are still in the feed and in the API — this list is capped so one page
+          can't try to render every alert ever published.
+        </p>
+      {% endif %}
+
+      {% if board.orphan_lifecycle %}
+        <details class="closed-fold">
+          <summary>{{ board.orphan_lifecycle | length }} tracked without a matching alert</summary>
+          <p class="muted" style="font-size:12px;margin:10px 0">
+            The tracker holds a status for these, but no buy alert in the window
+            matches them — usually a play alerted before this feed existed. Listed
+            because you may still be holding one.
+          </p>
+          <div class="htable-wrap">
+            <table class="htable">
+              <thead><tr><th>Alerted</th><th>Ticker</th><th>Outcome</th></tr></thead>
+              <tbody>
+                {% for r in board.orphan_lifecycle %}
+                  <tr>
+                    <td class="mono dim">{{ r.alert_date or '—' }}</td>
+                    <td>
+                      <b>{{ r.symbol }}</b>
+                      {% if r.sell_symbol and r.sell_symbol != r.symbol %}
+                        <span class="arrow">→ {{ r.sell_symbol }}</span>
+                      {% endif %}
+                    </td>
+                    <td>{{ statuslabel(r.status, status_labels.get(r.status, r.status)) }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      {% endif %}
+    </section>
+
+    <!-- ---------------------------------------------------------- PROFIT -->
+    <section class="pane p-profit card">
+      <div class="card-h">
+        <h3>Theoretical total</h3>
+        <span class="muted" style="font-size:12px">one share per account</span>
+      </div>
+
+      {% if not board.profit_basis and not board.fractional_basis %}
+        <p class="muted" style="font-size:13.5px;margin:0">
+          Nothing on this board has a resolved split with a published entry
+          price yet, so there is nothing honest to multiply.
+        </p>
+      {% else %}
+        {#
+          Two account boxes, not one, because the tracker says these two groups
+          paid in different places. A play that ROUNDED UP left a whole share in
+          every account. A play that came back FRACTIONAL left something only at
+          Public, Robinhood and SoFi — the other seven settled it to cash and
+          hold nothing to sell. One account count across both would overstate
+          the fractional side by more than three times.
+        #}
+        <div class="calc" id="calc"
+             data-per-account="{{ '%.4f' % board.per_account_profit }}"
+             data-per-frac="{{ '%.4f' % board.per_fractional_account }}">
+          <div class="calc-in">
+            <label for="calc-accounts">Accounts you trade, all brokers</label>
+            <input id="calc-accounts" type="number" inputmode="numeric"
+                   min="0" max="200" step="1" value="10">
+          </div>
+          <div class="calc-in">
+            <label for="calc-frac">Of those, accounts at {{ fractional_brokers | join(', ') }}</label>
+            <input id="calc-frac" type="number" inputmode="numeric"
+                   min="0" max="200" step="1" value="3">
+            <span class="hint">the only three that hand back a fraction</span>
+          </div>
+
+          <div class="calc-out">
+            <div class="co">
+              <div class="k">Rounded up · per account</div>
+              <div class="v num" id="calc-per">{{ board.per_account_profit | money }}</div>
+            </div>
+            <div class="co big">
+              <div class="k">Rounded up · <span id="calc-n">10</span> accounts</div>
+              <div class="v num pos" id="calc-total">{{ (board.per_account_profit * 10) | money }}</div>
+            </div>
+            <div class="co">
+              <div class="k">Fractional · <span id="calc-fn">3</span> eligible accounts</div>
+              <div class="v num" id="calc-frac-total">{{ (board.per_fractional_account * 3) | money }}</div>
+            </div>
+          </div>
+
+          <p class="calc-note">
+            Priced the one way this site prices anything:
+            <b>entry × (ratio − 1)</b>, one share bought per account.
+            The round-up figure covers {{ board.profit_basis | length }} of
+            {{ board.rounded_history | length }} confirmed round-ups{% if board.profit_unpriced %};
+            {{ board.profit_unpriced }}
+            {{ 'is' if board.profit_unpriced == 1 else 'are' }} left out because
+            the feed never published a price for
+            {{ 'it' if board.profit_unpriced == 1 else 'them' }}{% endif %}.
+            Only these paid in every account — the tracker confirmed a whole
+            share came back.
+          </p>
+
+          <p class="calc-warn">
+            The fractional line is not profit. Those splits left a fraction, and
+            only at {{ fractional_brokers | join(', ') }} — the other seven
+            brokers paid cash in lieu and hold nothing to sell. A fraction is
+            worth roughly what was paid for it, so that figure is the position
+            you could still sell, not a gain. Everything here is arithmetic on
+            the past, not a projection: it assumes you bought each play before
+            its deadline in every account, and the tracking tab shows how often
+            a split does something other than round up.
+          </p>
+
+          <div class="htable-wrap">
+            <table class="htable">
+              <thead>
+                <tr><th>Alerted</th><th>Ticker</th><th>Outcome</th><th>Paid in</th>
+                    <th>Entry</th><th>Ratio</th><th>Per account</th><th>At your count</th></tr>
+              </thead>
+              <tbody>
+                {% for l in board.profit_basis + board.fractional_basis %}
+                  <tr>
+                    <td class="mono dim">{{ l.play.alert_date or '—' }}</td>
+                    <td><b>{{ l.play.symbol }}</b></td>
+                    <td>{{ statustag(l) }}</td>
+                    <td class="dim small">{{ l.paid_in }}</td>
+                    <td class="mono">{{ l.play.entry_price | price }}</td>
+                    <td class="mono">{{ l.play.ratio or '—' }}</td>
+                    <td class="mono">{{ l.per_account_profit | money }}</td>
+                    {# data-scope tells the script which account box scales this
+                       row, so a fractional play never multiplies by ten. #}
+                    <td class="mono{% if l.paid_everywhere %} pos{% endif %}"
+                        data-per="{{ '%.4f' % l.per_account_profit }}"
+                        data-scope="{{ 'all' if l.paid_everywhere else 'frac' }}">
+                      {{ (l.per_account_profit * (10 if l.paid_everywhere else 3)) | money }}
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      {% endif %}
+    </section>
   </div>
   {% endif %}
 
@@ -235,7 +501,8 @@
     estimates are quoted as the feed published them and are stale the moment they post.
     Round-up treatment varies by broker and by corporate action, changes without notice,
     and may not happen at all: you can lose money. A confirmed round-up on one ticker
-    never implies the next one behaves the same way.
+    never implies the next one behaves the same way, and the totals above are history,
+    never a forecast.
   </p>
 
 </div>

@@ -126,7 +126,7 @@ def signup(
     # would open on a task they can't do. Send them to what they bought.
     if plan_obj.can(plans.TERMINAL):
         return _redirect("/app/devices?welcome=1")
-    return _redirect("/app/plays")
+    return _redirect("/plays")
 
 
 @router.post("/logout")

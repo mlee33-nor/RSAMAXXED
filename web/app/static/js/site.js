@@ -638,6 +638,79 @@ function initMultiplier() {
   paint();
 }
 
+/* ------------------------------------------------------------- plays board
+   The account multiplier on the Plays page. Every figure is rendered by the
+   server first, at the default count, so the tab is correct and readable with
+   this file blocked — this only makes it interactive.
+
+   Deliberately NOT the RSA scenario constants: these numbers come from the
+   feed's own confirmed round-ups, carried on data attributes. The scenario is
+   an illustration; this is a record.
+
+   Two counts, not one, and that is the whole point: the tracker says a
+   ROUNDED UP play left a whole share in every account, while a FRACTIONAL one
+   left something only at the three brokers that hold fractions. Each row
+   carries data-scope to say which count scales it. */
+function initPlaysCalc() {
+  const box = $('#calc');
+  if (!box) return;
+  const input = $('#calc-accounts');
+  if (!input) return;
+
+  const fracInput = $('#calc-frac');
+  const per = parseFloat(box.dataset.perAccount || '0') || 0;
+  const perFrac = parseFloat(box.dataset.perFrac || '0') || 0;
+  const total = $('#calc-total'), perOut = $('#calc-per'), label = $('#calc-n');
+  const fracTotal = $('#calc-frac-total'), fracLabel = $('#calc-fn');
+  const rows = $$('[data-per]', box);
+
+  /* How many accounts someone trades is a fact about them, not about this
+     visit — so it is remembered locally and never sent anywhere. Wrapped
+     because storage throws outright in a browser with cookies fully blocked,
+     and a calculator must not die over a saved preference. */
+  const STORE = 'rsamaxxed.accounts';
+  const load = () => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORE) || 'null');
+      if (!saved) return;
+      if (saved.all != null) input.value = saved.all;
+      if (fracInput && saved.frac != null) fracInput.value = saved.frac;
+    } catch (e) { /* private mode, blocked storage, corrupt value — ignore */ }
+  };
+  const save = (all, frac) => {
+    try { localStorage.setItem(STORE, JSON.stringify({ all, frac })); }
+    catch (e) { /* nothing to do about it, and nothing worth breaking over */ }
+  };
+
+  load();
+
+  const paint = () => {
+    // Clamp rather than reject: an empty or silly box should show a sane
+    // number, not NaN. The input's own min/max carry the same bounds.
+    const n = clamp(Math.floor(+input.value) || 0, 0, 200);
+    // Eligible accounts can never exceed the total — you cannot hold four of
+    // your three accounts at Robinhood.
+    const f = clamp(Math.floor(+(fracInput ? fracInput.value : 0)) || 0, 0, n);
+
+    if (label) label.textContent = n;
+    if (fracLabel) fracLabel.textContent = f;
+    if (perOut) perOut.textContent = money(per);
+    if (total) total.textContent = money(per * n);
+    if (fracTotal) fracTotal.textContent = money(perFrac * f);
+
+    rows.forEach(el => {
+      const count = el.dataset.scope === 'frac' ? f : n;
+      el.textContent = money(parseFloat(el.dataset.per) * count);
+    });
+
+    save(n, f);
+  };
+
+  input.addEventListener('input', paint, { passive: true });
+  if (fracInput) fracInput.addEventListener('input', paint, { passive: true });
+  paint();
+}
+
 /* -------------------------------------------------------------------- boot */
 function boot() {
   initNav();
@@ -650,6 +723,7 @@ function boot() {
   initFanout();
   initPricing();
   initMultiplier();
+  initPlaysCalc();
 }
 
 if (document.readyState === 'loading') addEventListener('DOMContentLoaded', boot);

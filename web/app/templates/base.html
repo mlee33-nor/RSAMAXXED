@@ -29,8 +29,9 @@
     <nav class="navlinks">
       {% if user %}
         {# Plays leads: it is the product on every tier, and the only page a
-           Plays Only customer has any reason to open. #}
-        <a href="/app/plays" class="{% block nav_plays %}{% endblock %}">Plays</a>
+           Plays Only customer has any reason to open. Same public URL a
+           logged-out visitor uses — a signed-in reader passes the gate. #}
+        <a href="/plays" class="{% block nav_plays %}{% endblock %}">Plays</a>
         <a href="/app" class="{% block nav_dash %}{% endblock %}">Dashboard</a>
         <a href="/app/trades" class="opt-md {% block nav_trades %}{% endblock %}">Trades</a>
         <a href="/app/holdings" class="opt-md {% block nav_hold %}{% endblock %}">Holdings</a>
@@ -41,7 +42,10 @@
         </form>
       {% else %}
         {# On phones the row sheds the optional links (opt-md/opt-sm) so it fits
-           one line inside the bar; both stay reachable from the hero CTA/footer. #}
+           one line inside the bar; both stay reachable from the hero CTA/footer.
+           Plays is never shed: it is the reason most visitors are here, and it
+           needs no account — just the password. #}
+        <a href="/plays" class="{{ self.nav_plays() }}">Plays</a>
         <a href="/how-it-works" class="opt-md {% block nav_how %}{% endblock %}">How it works</a>
         <a href="/pricing" class="{% block nav_price %}{% endblock %}">Pricing</a>
         <a href="/login" class="opt-sm">Sign in</a>
@@ -57,6 +61,7 @@
   <div class="wrap">
     <span>RSAMAXXED — reverse-split round-up trading, automated.</span>
     <span class="muted">
+      <a href="/plays">Plays</a> ·
       <a href="/how-it-works">How it works</a> ·
       <a href="/pricing">Pricing</a> ·
       Broker credentials never leave your computer.

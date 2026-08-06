@@ -60,6 +60,20 @@ FEED_INGEST_KEY = os.environ.get("FEED_INGEST_KEY", "").strip()
 
 MAX_PLAYS_PER_INGEST = 500
 
+# The shared password on the public /plays board. One password, no accounts:
+# anyone who has it sees the plays, and nobody has to be signed up to read them.
+#
+# It is read from the environment and has NO default on purpose. This repository
+# is public, so a literal here would publish the password to everyone who clones
+# it. Unset means the board refuses everyone — the same fail-closed posture as
+# FEED_INGEST_KEY above, and for the same reason: "we forgot to set the
+# variable" must never resolve to "the door is open".
+PLAYS_PASSWORD = os.environ.get("PLAYS_PASSWORD", "").strip()
+
+# Wrong-password throttle for that board, per client address.
+PLAYS_MAX_ATTEMPTS = 10
+PLAYS_ATTEMPT_WINDOW_SECONDS = 15 * 60
+
 # The desktop app persists its current RSA picks to picks.json ({symbol, note,
 # date}). On a single-machine setup the web app can read that same file and load
 # those picks straight into the play feed — no ingest key, no round trip — so the
