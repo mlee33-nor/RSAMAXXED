@@ -483,10 +483,10 @@
                 {# The brokers it actually paid in — the multiplier for every
                    figure on the Dashboard. #}
                 <td class="small{% if l.sold %} dim{% else %} faint{% endif %}"
-                    title="{{ 'named by the sell alert' if l.sold else 'eligible by outcome; no exit published yet' }}">
-                  {{ l.paid_in }}{% if not l.sold and l.paying_brokers %} <i>(eligible)</i>{% endif %}
+                    title="{{ 'brokers named by the sell alert' if l.sold else 'no sell alert has closed this one yet' }}">
+                  {{ l.paid_in }}
                 </td>
-                <td class="mono dim">{{ l.resolved_on or '—' }}</td>
+                <td class="mono dim">{{ l.booked_on or '—' }}</td>
                 <td class="mono">{% if l.per_account_profit %}{{ l.per_account_profit | money }}{% else %}—{% endif %}</td>
                 <td class="mono">
                   {%- if l.exits -%}{{ l.exits[-1].exit_price | price }}{%- else -%}—{%- endif -%}
