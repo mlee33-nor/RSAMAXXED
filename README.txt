@@ -198,13 +198,20 @@ CONTENTS
 
 ┌─ 8. THE FEED — WHERE THE PLAYS COME FROM ───────────────────────────────────
 │
-│  You do not hunt for splits and you do not need Discord. Link the
-│  terminal to a free RSAMAXXED account and three streams arrive on
-│  their own, refreshed every hour:
+│  You do not hunt for splits and you do not need Discord. Put your
+│  plays password in .env and three streams arrive on their own,
+│  refreshed every hour:
+│
+│     RSAMAXXED_PLAYS_KEY=your-password
 │
 │     BUYS    the plays to open       -> Watchlist, and Mirror Trading
 │     BOARD   what each split DID     -> Exits
 │     EXITS   what got sold, where    -> the sell-alert card
+│
+│  It is the same password that opens rsamaxxed.com/plays in a browser,
+│  where the whole board also lives: what is open, what exited, what
+│  every past split ended in, and what that record is worth at your
+│  account count.
 │
 │  The BOARD is the one that matters most and the one you cannot work
 │  out yourself. After a reverse split your position either rounded up
@@ -212,8 +219,11 @@ CONTENTS
 │  and which of those happened decides whether there is anything left
 │  to sell at all. See section 8b.
 │
-│  Nothing is stored about you to receive this. Linking sends a device
-│  name and a random id; no broker credential ever leaves the machine.
+│  No account is required to receive any of it, and nothing is stored
+│  about you: the password identifies the subscription, not you. Linking
+│  a device is optional and only adds the cloud dashboard — it sends a
+│  device name and a random id, and no broker credential ever leaves
+│  the machine.
 │
 └──────────────────────────────────────────────────────────────────────────────
 
@@ -271,14 +281,19 @@ CONTENTS
 │            RSAMAXXED.bat
 │         (or run app.py directly for the GUI, or runner.py for CLI)
 │
-│     3.  THE PLAYS ARE ALREADY THERE. Nothing to do. No account, no
-│         sign-up, no pairing code, no API key, no Discord. The terminal
-│         downloads the buy alerts, the exits and the round-up
+│     3.  TURN ON THE PLAYS. Copy .env.example to .env and set the one
+│         line that makes alerts arrive:
+│
+│            RSAMAXXED_PLAYS_KEY=the password you were given
+│
+│         No account, no sign-up, no pairing code, no Discord. The
+│         terminal downloads the buy alerts, the exits and the round-up
 │         (fractional) board on launch, then refreshes every hour while
 │         it is open.
 │
-│         If the Watchlist looks empty, it is empty — not locked. The
-│         status bar bottom-right shows when the feed last arrived.
+│         Without that line the Watchlist stays empty and the status bar
+│         bottom-right never shows a feed arrival — a missing or wrong
+│         password is the usual cause, not a broken install.
 │
 │     4.  CONNECT YOUR BROKERS. Copy .env.example to .env and fill in
 │         only the brokers you use, or enter them in the Brokers tab and

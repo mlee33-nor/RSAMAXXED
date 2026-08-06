@@ -282,21 +282,23 @@ def whoami(device: Device = Depends(require_device)) -> dict[str, Any]:
 
 
 # =========================================================== THE PLAY FEED ===
-# Two directions, two very different doors:
+# Two directions, three doors:
 #
 #   WRITE  one operator machine, holding FEED_INGEST_KEY, publishes what it
 #          parsed out of the alert channels. Locked, always.
-#   READ   anyone. Identified callers (device token or browser session) get the
-#          /plays routes; everyone else gets the same data from /public/plays.
+#   READ   a paired device or a signed-in browser on a plan that includes the
+#          feed uses /plays. Everyone else uses /public/plays with the shared
+#          board password (PLAYS_PASSWORD) — same bytes, no account.
 #
-# The asymmetry is the point, and it is on the WRITE side only: the feed cannot
-# be forged, and nobody but the operator ever needs Discord credentials.
+# The write asymmetry is the point: the feed cannot be forged, and nobody but
+# the operator ever needs Discord credentials.
 #
-# Reading is deliberately open. The alert feed is free — it is the funnel, not
-# the product (see plans.py) — so gating it bought no revenue and cost the one
-# thing that matters: someone who pulls the software has to be able to run it
-# and start receiving plays, with no account, no pairing and no key. Anything
-# that stands between `git clone` and a populated Watchlist is a bug.
+# Reading used to be wide open, on the reasoning that the alert feed was a free
+# funnel rather than the product. It is now a paid tier (plans.py), so an
+# unauthenticated mirror would have given away the thing being sold — the
+# password door replaced it. The onboarding cost stays near zero, which was the
+# original point: one secret, no signup, no pairing, and a fresh checkout works
+# the moment its owner is told the password.
 
 class PlayIn(BaseModel):
     source_id: str = Field(min_length=1, max_length=80)
@@ -579,24 +581,58 @@ def read_lifecycle(
     ]
 
 
-# ------------------------------------------------------- the open front door
-# Byte-identical payloads to the three routes above, with no caller identity.
-# They exist so a fresh checkout works on first launch: `_get` in cloud_sync.py
-# retries here whenever the machine holds no device token, which is the state
-# every new install starts in and the state most of them stay in.
+# ------------------------------------------------ the account-free front door
+# Byte-identical payloads to the three routes above, for a caller who has the
+# shared board password instead of an account. They exist so a copy of the
+# terminal can read the feed its owner pays for without signing up, pairing, or
+# holding a device token — which is the state most installs are in.
+#
+# `public` in the path is now a misnomer kept for compatibility: these used to
+# be open, and were closed when Plays became a paid tier. One secret gates the
+# web board and this API, so "here is the password" is the whole of onboarding.
 #
 # Keep these read-only and keep them in sync with their authenticated twins —
 # the desktop cannot tell which one answered it, and must not be able to.
 
-@router.get("/public/plays")
+def require_plays_key(
+    request: Request,
+    x_plays_key: str = Header(default=""),
+    db: Session = Depends(get_db),
+) -> None:
+    """The shared board password, as a header or a `?key=`.
+
+    Fail closed when nothing is configured, exactly like `require_ingest_key`:
+    an unset variable must never mean an open feed.
+
+    Two callers skip the password, and both already proved more than it does:
+    a browser that typed it on /plays, and a signed-in customer whose plan
+    includes the feed. The second is not a nicety — anyone who passes the HTML
+    gate must pass this one, or the page renders from data its own session is
+    forbidden to fetch.
+    """
+    from .plays import remembered      # local import: plays.py imports no routes
+
+    if request.session.get("plays_unlocked") or remembered(request):
+        return
+    uid = request.session.get("uid")
+    if uid and plans.can(db.get(User, uid), plans.FEED):
+        return
+    if not config.PLAYS_PASSWORD:
+        raise HTTPException(status_code=503, detail="the play feed is not configured")
+    supplied = x_plays_key or request.query_params.get("key", "")
+    if not hmac.compare_digest(supplied.strip(), config.PLAYS_PASSWORD):
+        raise HTTPException(status_code=401, detail="the play feed needs the board password")
+
+
+@router.get("/public/plays", dependencies=[Depends(require_plays_key)])
 def read_plays_public(db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Buys, closed plays, exits and round-ups. No auth."""
+    """Buys, closed plays, exits and round-ups. Board password required."""
     return playsfeed.feed_json(playsfeed.load_board(db))
 
 
-@router.get("/public/plays/picks")
+@router.get("/public/plays/picks", dependencies=[Depends(require_plays_key)])
 def read_picks_public(db: Session = Depends(get_db)) -> list[dict[str, str]]:
-    """Open plays in the shape picks.json holds. No auth."""
+    """Open plays in the shape picks.json holds. Board password required."""
     notes = {"standard": "Reg Alert", "otc": "OTC", "conditional": "conditional"}
     board = playsfeed.load_board(db)
     return [
@@ -607,13 +643,13 @@ def read_picks_public(db: Session = Depends(get_db)) -> list[dict[str, str]]:
     ]
 
 
-@router.get("/public/plays/lifecycle")
+@router.get("/public/plays/lifecycle", dependencies=[Depends(require_plays_key)])
 def read_lifecycle_public(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    """The TRACK board — what each split actually did. No auth.
+    """The TRACK board — what each split actually did. Board password required.
 
-    Open for the same reason as the rest: without it a new install's Exits page
-    is empty, and 'which of my positions resolved' is the one question the
-    customer cannot answer from anywhere else.
+    Served on this door for the same reason as the rest: without it a terminal
+    that was never paired shows an empty Exits page, and 'which of my positions
+    resolved' is the one question the customer cannot answer from anywhere else.
     """
     rows = db.scalars(
         select(PlayLifecycle).order_by(

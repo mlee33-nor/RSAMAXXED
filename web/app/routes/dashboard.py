@@ -9,7 +9,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import analytics, charts, config, plans, playsfeed, security
+from .. import analytics, charts, config, security
 from ..db import get_db
 from ..deps import require_user
 from ..models import (
@@ -59,24 +59,14 @@ def dashboard(request: Request, user: User = Depends(require_user), db: Session 
 
 
 @router.get("/plays")
-def plays_page(request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)):
-    """The product every tier pays for: what to buy, and what has exited.
+def plays_page():
+    """Moved to /plays, which anyone with the password can open.
 
-    Deliberately reachable on every plan. Plays Only is the entry tier, so this
-    page has to stand on its own without a paired terminal behind it.
+    Kept as a permanent redirect rather than deleted: this URL is in the wild —
+    old bookmarks, the signup redirect, and every link a customer was ever sent.
+    A signed-in reader passes straight through the gate (see routes/plays.py).
     """
-    # Keep the feed current with the desktop app's picks.json (idempotent — only
-    # brand-new alerts insert). No-op when PICKS_FILE is unset or missing.
-    if config.PICKS_FILE:
-        playsfeed.import_picks_file(db, config.PICKS_FILE)
-
-    return render(
-        request, "plays.html",
-        user=user,
-        board=playsfeed.load_board(db),
-        plan=plans.resolve(user.plan),
-        can_automate=plans.can(user, plans.TERMINAL),
-    )
+    return RedirectResponse("/plays", status_code=301)
 
 
 @router.get("/trades")

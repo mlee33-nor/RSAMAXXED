@@ -55,6 +55,11 @@ _FEED_CHUNK = 300        # play rows per ingest request; server caps at 500
 # a customer's copy has it unset and simply never publishes.
 _FEED_KEY_ENV = "RSAMAXXED_FEED_KEY"
 
+# READING the feed without an account takes the shared board password — the same
+# one that opens rsamaxxed.com/plays. A subscriber pastes it here once; a paired
+# device never needs it, because its token already identifies the account.
+_PLAYS_KEY_ENV = "RSAMAXXED_PLAYS_KEY"
+
 
 class CloudError(RuntimeError):
     """Any failure that the GUI should surface to the user verbatim."""
@@ -378,13 +383,36 @@ class CloudSync:
         data = self._get("/plays/picks")
         return data if isinstance(data, list) else []
 
+    @property
+    def plays_key(self) -> str:
+        """The shared board password, for a machine with no account.
+
+        Read from the environment first so a subscriber can paste it into their
+        .env, then from cloud_state.json so the GUI can save it once. Empty on a
+        machine that has neither, which is the same as having no feed.
+        """
+        env = (os.environ.get(_PLAYS_KEY_ENV) or "").strip()
+        if env:
+            return env
+        return str(_read_state().get("plays_key") or "").strip()
+
+    def set_plays_key(self, key: str) -> None:
+        """Remember the board password on this machine."""
+        state = _read_state()
+        cleaned = (key or "").strip()
+        if cleaned:
+            state["plays_key"] = cleaned
+        else:
+            state.pop("plays_key", None)
+        _write_state(state)
+
     def _get(self, path: str) -> Any:
         """Read the feed, with or without an account.
 
-        An unlinked machine reads the open mirror of the same route instead of
-        raising. That is what makes a fresh checkout work the moment it starts:
-        the plays are free, so refusing to serve them to someone who hasn't
-        signed up only ever produced an empty terminal and a support question.
+        An unlinked machine reads the same route on the password door instead of
+        raising. That is what makes a checkout work without signing up: the
+        plays are sold, but they are sold as a password, so anyone who has been
+        given one is a customer as far as this call is concerned.
 
         A linked machine still uses its token, so the server can attribute the
         read and the trade-sync side keeps working exactly as before.
@@ -413,11 +441,24 @@ class CloudSync:
         return r.json()
 
     def _get_public(self, path: str) -> Any:
-        """The same route, unauthenticated. See /public/* in web/app/routes/api.py."""
+        """The same route, on the shared-password door. See /public/* in
+        web/app/routes/api.py.
+
+        A 401 here means one specific, fixable thing, so it says so rather than
+        surfacing a bare status code: this machine has no board password, or the
+        one it has is wrong.
+        """
+        key = self.plays_key
+        headers = {"X-Plays-Key": key} if key else {}
         try:
-            r = requests.get(self._url(f"/public{path}"), timeout=_TIMEOUT)
+            r = requests.get(self._url(f"/public{path}"), headers=headers, timeout=_TIMEOUT)
         except requests.RequestException as exc:
             raise CloudError(f"Can't reach RSAMAXXED Cloud: {exc}") from exc
+        if r.status_code == 401:
+            raise CloudError(
+                "The play feed needs the board password on this machine. Set "
+                f"{_PLAYS_KEY_ENV} in your .env (or link this device to your account)."
+            )
         if r.status_code >= 400:
             raise CloudError(f"RSAMAXXED Cloud returned {r.status_code}")
         return r.json()
