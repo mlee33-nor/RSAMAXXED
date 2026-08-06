@@ -3,22 +3,20 @@
 {% block nav_plays %}on{% endblock %}
 
 {#
-  The Plays board. Four tabs, because a play has four different questions asked
-  of it and they are asked at different moments:
+  The Plays board. Five tabs, because a play gets asked five different questions
+  and they are asked at different moments:
 
-    BUYS      what is still open, soonest deadline first. A to-do list, so it is
-              ordered by urgency and never by date.
-    SELLS     what has exited and at what price. A record, so it is ordered by
-              time and grouped by day.
-    TRACKING  what the split actually DID — rounded up, came back fractional,
-              paid cash. The stream nobody outside the alert channel can see,
-              and the only evidence the mechanism works.
-    PROFIT    what that record would have been worth at YOUR account count.
+    DASHBOARD  what has this been worth, per month, in MY accounts
+    CALENDAR   what shuts on which day
+    BUYS       what is still open, soonest deadline first
+    SELLS      what exited, at what price, across which brokers
+    TRACKING   what every split actually DID — the record everything above rests on
 
-  The tabs are radio inputs and CSS, deliberately: the page has to work before
-  (and without) JavaScript, and the content security policy forbids inline
-  script. Only the calculator needs JS, and only the calculator loses anything
-  without it.
+  Money is finished in the browser, never here. The multiplier is the reader's
+  own per-broker account counts, which live in their localStorage and are never
+  sent to us — so the server renders every figure against a stated default of
+  one account per broker, and the page rewrites them against the real profile.
+  A real number with a stated basis beats a blank, and works with JS blocked.
 #}
 
 {% macro kindtag(kind) -%}
@@ -27,8 +25,6 @@
   {%- else -%}<span class="ptag std">Standard</span>{%- endif -%}
 {%- endmacro %}
 
-{#  The TRACK status, as a badge. Colour carries the good/bad/waiting split;
-    the words carry the actual meaning, because colour alone never has. #}
 {% macro statuslabel(status, label) -%}
   {%- if status == 'rounded_up' -%}<span class="ptag st ok">{{ label }}</span>
   {%- elif status in ('fractional', 'cash_in_lieu') -%}<span class="ptag st warn">{{ label }}</span>
@@ -48,15 +44,50 @@
   {%- else -%}<span class="cd ok">{{ days }} days left</span>{%- endif -%}
 {%- endmacro %}
 
+{% macro playrow(l, closed=false) %}
+  {% set p = l.play %}
+  <li class="prow {{ 'past' if closed else l.stage }}{% if not p.is_actionable %} watch{% endif %}">
+    <div class="prow-top">
+      <b class="sym">{{ p.symbol }}</b>
+      {{ kindtag(p.kind) }}
+      {% if l.life or l.rounded_up %}{{ statustag(l) }}{% endif %}
+      <span class="spacer"></span>
+      {% if closed %}
+        <span class="cd gone">closed {{ p.last_buy_date or p.alert_date }}</span>
+      {% else %}
+        {{ countdown(p.days_left()) }}
+      {% endif %}
+    </div>
+    <div class="prow-facts">
+      <span class="f"><i>Ratio</i><b>{{ p.ratio or '—' }}</b></span>
+      <span class="f"><i>Entry</i><b>{% if p.entry_price is none %}—{% else %}{{ p.entry_price | price }}{% endif %}</b></span>
+      <span class="f"><i>Est / acct</i><b class="pos">{% if p.est_profit is none %}—{% else %}{{ p.est_profit | money }}{% endif %}</b></span>
+      <span class="f"><i>Last buy</i><b>{{ p.last_buy_date or '—' }}</b></span>
+      {% if l.renamed %}<span class="f"><i>Sell as</i><b>{{ l.sell_symbol }}</b></span>{% endif %}
+    </div>
+    <div class="prow-foot">
+      <span class="muted">Alerted {{ p.alert_date }}</span>
+      {% if p.strategy %}<span class="muted">· {{ p.strategy }}</span>{% endif %}
+      {% if p.roundup_history and p.roundup_history != 'N/A' %}
+        <span class="muted">· history: {{ p.roundup_history }}</span>
+      {% endif %}
+      {% if l.confirmed_date %}<span class="muted">· round-up confirmed {{ l.confirmed_date }}</span>{% endif %}
+      {% if not p.is_actionable %}
+        <span class="warn-note">watch only — the split isn't declared yet</span>
+      {% endif %}
+    </div>
+  </li>
+{% endmacro %}
+
 {% block content %}
 <div class="wrap page">
 
-  <div class="card-h" style="margin-bottom:18px">
+  <div class="page-h">
     <div>
-      <h1 style="font-size:26px;letter-spacing:-.02em;margin:0">Plays</h1>
-      <p class="muted" style="font-size:13px;margin:5px 0 0">
-        Reverse-split round-up alerts: what's still open, what has exited, and
-        what every past one ended in.
+      <h1>Plays</h1>
+      <p class="muted sub">
+        Reverse-split round-up alerts, what each split did, and what that record
+        was worth in your accounts.
       </p>
     </div>
     <div class="head-side">
@@ -65,6 +96,7 @@
       <span class="eyebrow{% if not board.last_update %} stale{% endif %}">
         <i class="pip"></i> Updated {{ board.last_update | ago }}
       </span>
+      <label class="gear" for="settings-open" title="Your accounts">⚙<span>Accounts</span></label>
       {% if not user %}
         <form method="post" action="/plays/lock" class="inline">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -74,54 +106,215 @@
     </div>
   </div>
 
+  <!-- ========================================================== SETTINGS -->
+  {#
+    How many accounts you hold AT EACH BROKER. This is not a preference, it is
+    the multiplier for every number on the dashboard: a play that only sold at
+    Chase pays your Chase accounts and nothing else. Stored in this browser and
+    never transmitted.
+  #}
+  <input type="checkbox" id="settings-open" class="drawer-toggle">
+  <section class="card drawer" id="accounts-panel">
+    <div class="card-h">
+      <h3>Your accounts</h3>
+      <span class="muted" style="font-size:12px">saved in this browser only</span>
+    </div>
+    <p class="muted" style="font-size:12.5px;margin:0 0 14px;max-width:74ch">
+      Every figure on the Dashboard is your account count at the brokers a play
+      actually paid out in. A split that only sold at two brokers pays your
+      accounts at those two — not all ten. Leave a broker at 0 if you don't use it.
+    </p>
+    <div class="bgrid">
+      {% for name, key, fractional in board.broker_slots %}
+        <label class="bslot">
+          <span class="bn">{{ name }}{% if fractional %}<i title="One of the three that hand back a fraction">◆</i>{% endif %}</span>
+          <input type="number" min="0" max="99" step="1" value="1"
+                 data-broker="{{ key }}" id="acct-{{ key }}" inputmode="numeric">
+        </label>
+      {% endfor %}
+    </div>
+    <div class="bfoot">
+      <span><b id="acct-total">10</b> accounts · <b id="acct-frac">3</b> at the three that hold fractions <i>◆</i></span>
+      <label class="btn btn-ghost btn-sm" for="settings-open">Done</label>
+    </div>
+  </section>
+
   {% if not board.has_anything %}
     <div class="card empty">
       <h2>No alerts yet.</h2>
-      <p>
-        The feed publishes as alerts land. Nothing has come through — this page
-        fills itself in the moment one does.
-      </p>
+      <p>The feed publishes as alerts land. This page fills itself the moment one does.</p>
       <a class="btn btn-ghost" href="/how-it-works">What lands here</a>
     </div>
   {% else %}
 
-  <!-- ============================================================ SUMMARY -->
-  <div class="tiles">
-    <div class="tile">
-      <div class="k">Open now</div>
-      <div class="v num">{{ board.open_count }}</div>
-    </div>
-    <div class="tile{% if board.urgent %} hot{% endif %}">
-      <div class="k">Closing ≤ 2 days</div>
-      <div class="v num">{{ board.urgent | length }}</div>
-    </div>
-    <div class="tile">
-      <div class="k">Exits, 45 days</div>
-      <div class="v num">{{ board.exit_count }}</div>
-    </div>
-    <div class="tile">
-      <div class="k">Round-ups confirmed</div>
-      <div class="v num">{{ board.rounded_history | length }}</div>
-    </div>
-    <div class="tile">
-      <div class="k">Of resolved alerts</div>
-      <div class="v num">{{ board.roundup_rate | pct }}</div>
-    </div>
-  </div>
-
   <!-- =============================================================== TABS -->
   <div class="tabs">
-    <input type="radio" name="ptab" id="tab-buys" checked>
+    <input type="radio" name="ptab" id="tab-dash" checked>
+    <input type="radio" name="ptab" id="tab-cal">
+    <input type="radio" name="ptab" id="tab-buys">
     <input type="radio" name="ptab" id="tab-sells">
     <input type="radio" name="ptab" id="tab-track">
-    <input type="radio" name="ptab" id="tab-profit">
 
     <nav class="tabbar" aria-label="Plays sections">
-      <label for="tab-buys"><span class="sd buy" aria-hidden="true"></span>Buys<b>{{ board.open_count }}</b></label>
-      <label for="tab-sells"><span class="sd sell" aria-hidden="true"></span>Sells<b>{{ board.exit_count }}</b></label>
-      <label for="tab-track"><span class="sd hist" aria-hidden="true"></span>Tracking<b>{{ board.history | length }}</b></label>
-      <label for="tab-profit"><span class="sd gold" aria-hidden="true"></span>Profit</label>
+      <label for="tab-dash">Dashboard</label>
+      <label for="tab-cal">Calendar<b>{{ board.open_count }}</b></label>
+      <label for="tab-buys">Buys<b>{{ board.open_count }}</b></label>
+      <label for="tab-sells">Sells<b>{{ board.exit_count }}</b></label>
+      <label for="tab-track">Tracking<b>{{ board.history | length }}</b></label>
     </nav>
+
+    <!-- ------------------------------------------------------- DASHBOARD -->
+    <section class="pane p-dash">
+      {# One filter row above everything it scopes — never a filter per card. #}
+      <div class="filters" id="range-row">
+        <span class="flabel">Period</span>
+        <div class="chips" role="group" aria-label="Time period">
+          <button type="button" class="chip" data-range="3">3 months</button>
+          <button type="button" class="chip" data-range="6">6 months</button>
+          <button type="button" class="chip" data-range="12">12 months</button>
+          <button type="button" class="chip on" data-range="0">All time</button>
+        </div>
+        <span class="basis" id="basis-note">1 account at each broker · <label for="settings-open">change</label></span>
+      </div>
+
+      <div class="hero-row">
+        <div class="card hero-card">
+          <div class="k">Theoretical profit · <span id="hero-period">all time</span></div>
+          <div class="hero-fig pos" id="hero-total">{{ totals.total | money }}</div>
+          <div class="hero-sub muted" id="hero-sub">
+            across {{ totals.plays }} plays that paid, in
+            {{ totals.months | length }} month{{ '' if totals.months | length == 1 else 's' }}
+          </div>
+        </div>
+        <div class="tiles compact">
+          <div class="tile">
+            <div class="k">Per month, average</div>
+            <div class="v num" id="kpi-permonth">{{ totals.per_month | money }}</div>
+          </div>
+          <div class="tile">
+            <div class="k">Best month</div>
+            <div class="v num" id="kpi-best">{% if totals.best %}{{ totals.best.total | money }}{% else %}—{% endif %}</div>
+            <div class="k2" id="kpi-best-when">{% if totals.best %}{{ totals.best.key }}{% endif %}</div>
+          </div>
+          <div class="tile">
+            <div class="k">Round-up rate</div>
+            <div class="v num">{{ board.roundup_rate | pct }}</div>
+            <div class="k2">of {{ board.resolved_history | length }} resolved</div>
+          </div>
+          <div class="tile{% if board.urgent %} hot{% endif %}">
+            <div class="k">Closing ≤ 2 days</div>
+            <div class="v num">{{ board.urgent | length }}</div>
+            <div class="k2">{{ board.open_count }} open now</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="chart-grid">
+        <div class="card chart-card">
+          <div class="card-h">
+            <h3>Booked per month</h3>
+            <span class="muted" style="font-size:12px">theoretical, your accounts</span>
+          </div>
+          <figure class="chart" id="chart-monthly" aria-label="Theoretical profit booked per month"></figure>
+          <details class="tableview">
+            <summary>Show as table</summary>
+            <table class="htable" id="monthly-table">
+              <thead><tr><th>Month</th><th>Plays that paid</th><th>Theoretical</th></tr></thead>
+              <tbody>
+                {% for m in totals.months %}
+                  <tr><td class="mono">{{ m.key }}</td><td class="mono">{{ m.plays }}</td>
+                      <td class="mono pos" data-month="{{ m.key }}">{{ m.total | money }}</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </details>
+        </div>
+
+        <div class="card chart-card">
+          <div class="card-h">
+            <h3>Cumulative</h3>
+            <span class="muted" style="font-size:12px">running total</span>
+          </div>
+          <figure class="chart" id="chart-cumulative" aria-label="Cumulative theoretical profit"></figure>
+        </div>
+
+        <div class="card chart-card wide">
+          <div class="card-h">
+            <h3>What the splits did</h3>
+            <span class="muted" style="font-size:12px">{{ board.history | length }} alerts</span>
+          </div>
+          <figure class="chart" id="chart-outcomes" aria-label="Alerts by outcome"></figure>
+        </div>
+      </div>
+
+      {% if board.urgent %}
+        <div class="card">
+          <div class="card-h"><h3>Closing next</h3>
+            <span class="muted" style="font-size:12px">buy window shuts within 2 days</span></div>
+          <ul class="plist grid2">
+            {% for l in board.urgent %}{{ playrow(l) }}{% endfor %}
+          </ul>
+        </div>
+      {% endif %}
+    </section>
+
+    <!-- -------------------------------------------------------- CALENDAR -->
+    <section class="pane p-cal">
+      <div class="calwrap">
+        <div class="card">
+          <div class="card-h">
+            <h3>Buy deadlines</h3>
+            <span class="muted" style="font-size:12px">the day each window shuts</span>
+          </div>
+          <div class="cals">
+            {% for month in board.calendar_months() %}
+              <div class="cal">
+                <div class="calhead">{{ month.label }}</div>
+                <div class="caldow">
+                  {% for d in ['M','T','W','T','F','S','S'] %}<span>{{ d }}</span>{% endfor %}
+                </div>
+                <div class="calgrid">
+                  {% for week in month.weeks %}
+                    {% for d in week %}
+                      {% if d.count %}
+                        <button type="button" class="cday has{% if not d.in_month %} out{% endif %}{% if d.today %} today{% endif %}{% if d.past %} gone{% endif %}"
+                                data-day="{{ d.iso }}" title="{{ d.count }} closing {{ d.iso }}">
+                          {{ d.day }}<i>{{ d.count }}</i>
+                        </button>
+                      {% else %}
+                        <span class="cday{% if not d.in_month %} out{% endif %}{% if d.today %} today{% endif %}{% if d.past %} gone{% endif %}">{{ d.day }}</span>
+                      {% endif %}
+                    {% endfor %}
+                  {% endfor %}
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+          <p class="muted" style="font-size:12px;margin:14px 0 0">
+            A marked day has plays whose last buy date falls on it. Click one to
+            see them; every day is listed below regardless.
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="card-h">
+            <h3>By day</h3>
+            <span class="muted" style="font-size:12px" id="day-filter-note">every open play</span>
+          </div>
+          {% for day, rows in board.by_deadline.items() %}
+            <div class="daygroup dayblock" data-day="{{ day }}">
+              <div class="dayhead">
+                <span>{{ day or 'no deadline published' }}</span><i></i>
+                <span class="muted" style="font-size:11px">{{ rows | length }}</span>
+              </div>
+              <ul class="plist">
+                {% for l in rows %}{{ playrow(l) }}{% endfor %}
+              </ul>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
 
     <!-- ------------------------------------------------------------ BUYS -->
     <section class="pane p-buys card">
@@ -129,54 +322,13 @@
         <h3>Open plays</h3>
         <span class="muted" style="font-size:12px">soonest deadline first</span>
       </div>
-
       {% if not board.open_plays %}
         <p class="muted" style="font-size:13.5px;margin:0">
           Nothing open. Every alert in the window has passed its last buy date.
         </p>
       {% else %}
         <ul class="plist grid2">
-          {% for l in board.open_plays %}
-            {% set p = l.play %}
-            <li class="prow {{ l.stage }}{% if not p.is_actionable %} watch{% endif %}">
-              <div class="prow-top">
-                <b class="sym">{{ p.symbol }}</b>
-                {{ kindtag(p.kind) }}
-                {% if l.life or l.rounded_up %}{{ statustag(l) }}{% endif %}
-                <span class="spacer"></span>
-                {{ countdown(p.days_left()) }}
-              </div>
-
-              {% if p.ratio or p.entry_price is not none or p.est_profit is not none or p.last_buy_date %}
-              <div class="prow-facts">
-                <span class="f"><i>Ratio</i><b>{{ p.ratio or '—' }}</b></span>
-                <span class="f"><i>Entry</i><b>{% if p.entry_price is none %}—{% else %}{{ p.entry_price | price }}{% endif %}</b></span>
-                <span class="f"><i>Est / acct</i><b class="pos">{% if p.est_profit is none %}—{% else %}{{ p.est_profit | money }}{% endif %}</b></span>
-                <span class="f"><i>Last buy</i><b>{{ p.last_buy_date or '—' }}</b></span>
-              </div>
-              {% endif %}
-
-              <div class="prow-foot">
-                <span class="muted">Alerted {{ p.alert_date }}</span>
-                {% if p.strategy %}<span class="muted">· {{ p.strategy }}</span>{% endif %}
-                {% if p.roundup_history and p.roundup_history != 'N/A' %}
-                  <span class="muted">· history: {{ p.roundup_history }}</span>
-                {% endif %}
-                {% if l.confirmed_date %}
-                  <span class="muted">· round-up confirmed {{ l.confirmed_date }}</span>
-                {% endif %}
-                {# The rename is the one detail that decides whether an order can
-                   be placed at all: holdings sit under the old ticker, only the
-                   new one trades. #}
-                {% if l.renamed %}
-                  <span class="rename">sell as <b>{{ l.sell_symbol }}</b></span>
-                {% endif %}
-                {% if not p.is_actionable %}
-                  <span class="warn-note">watch only — the split isn't declared yet</span>
-                {% endif %}
-              </div>
-            </li>
-          {% endfor %}
+          {% for l in board.open_plays %}{{ playrow(l) }}{% endfor %}
         </ul>
       {% endif %}
 
@@ -184,28 +336,7 @@
         <details class="closed-fold">
           <summary>{{ board.closed_plays | length }} recently closed</summary>
           <ul class="plist tight grid2">
-            {% for l in board.closed_plays %}
-              {% set p = l.play %}
-              <li class="prow past">
-                <div class="prow-top">
-                  <b class="sym">{{ p.symbol }}</b>
-                  {{ kindtag(p.kind) }}
-                  {% if l.life or l.rounded_up %}{{ statustag(l) }}{% endif %}
-                  <span class="spacer"></span>
-                  <span class="cd gone">closed {{ p.last_buy_date or p.alert_date }}</span>
-                </div>
-                <div class="prow-facts">
-                  <span class="f"><i>Ratio</i><b>{{ p.ratio or '—' }}</b></span>
-                  <span class="f"><i>Entry</i><b>{% if p.entry_price is none %}—{% else %}{{ p.entry_price | price }}{% endif %}</b></span>
-                  {% if l.renamed %}
-                    <span class="f"><i>Now trades as</i><b>{{ l.sell_symbol }}</b></span>
-                  {% endif %}
-                  {% if l.exits %}
-                    <span class="f"><i>Exited</i><b class="pos">{{ l.exits | length }}×</b></span>
-                  {% endif %}
-                </div>
-              </li>
-            {% endfor %}
+            {% for l in board.closed_plays %}{{ playrow(l, closed=true) }}{% endfor %}
           </ul>
         </details>
       {% endif %}
@@ -217,11 +348,8 @@
         <h3>Exits</h3>
         <span class="muted" style="font-size:12px">newest first · last 45 days</span>
       </div>
-
       {% if not board.exits %}
-        <p class="muted" style="font-size:13.5px;margin:0">
-          No exits in the last 45 days.
-        </p>
+        <p class="muted" style="font-size:13.5px;margin:0">No exits in the last 45 days.</p>
       {% else %}
         {% for day, rows in board.exits_by_date.items() %}
           <div class="daygroup">
@@ -231,9 +359,7 @@
                 <li class="prow exit">
                   <div class="prow-top">
                     <b class="sym">{{ e.symbol }}</b>
-                    {% if e.symbol in board.roundup_symbols %}
-                      <span class="ptag ru">rounded up</span>
-                    {% endif %}
+                    {% if e.symbol in board.roundup_symbols %}<span class="ptag ru">rounded up</span>{% endif %}
                     <span class="spacer"></span>
                     <b class="proceeds pos">
                       {%- if e.proceeds_low is none -%}—
@@ -241,12 +367,10 @@
                       {%- else -%}+{{ e.proceeds_low | money }}{%- endif -%}
                     </b>
                   </div>
-
                   <div class="prow-facts">
                     <span class="f"><i>Sold at</i><b>{% if e.exit_price is none %}—{% else %}{{ e.exit_price | price }}{% endif %}</b></span>
                     <span class="f"><i>Accounts</i><b>{{ e.accounts or '—' }}</b></span>
                   </div>
-
                   {% if e.legs %}
                     <div class="legs">
                       {% for leg in e.legs %}
@@ -256,10 +380,7 @@
                       {% endfor %}
                     </div>
                   {% endif %}
-
-                  {% if e.note %}
-                    <p class="exit-note">{{ e.note }}</p>
-                  {% endif %}
+                  {% if e.note %}<p class="exit-note">{{ e.note }}</p>{% endif %}
                 </li>
               {% endfor %}
             </ul>
@@ -269,14 +390,10 @@
     </section>
 
     <!-- -------------------------------------------------------- TRACKING -->
-    {# Every alert, and what became of it. Shown in full, including the ones
-       that did not round up: a record that only kept the wins is not a record. #}
     <section class="pane p-track card">
       <div class="card-h">
         <h3>Split tracking</h3>
-        <span class="muted" style="font-size:12px">
-          {{ board.history | length }} alerts · every outcome
-        </span>
+        <span class="muted" style="font-size:12px">{{ board.history | length }} alerts · every outcome</span>
       </div>
 
       {% if board.history_by_status %}
@@ -292,9 +409,8 @@
           <thead>
             <tr>
               <th>Alerted</th><th>Ticker</th><th>Type</th><th>Ratio</th>
-              <th>Entry</th><th>Est / acct</th><th>Last buy</th>
-              <th>Outcome</th><th>Confirmed</th><th>Exit</th><th>Proceeds</th>
-              <th>Prior record</th>
+              <th>Entry</th><th>Outcome</th><th>Paid in</th><th>Booked</th>
+              <th>Per account</th><th>Exit</th><th>Prior record</th>
             </tr>
           </thead>
           <tbody>
@@ -309,18 +425,17 @@
                 <td>{{ kindtag(p.kind) }}</td>
                 <td class="mono">{{ p.ratio or '—' }}</td>
                 <td class="mono">{% if p.entry_price is none %}—{% else %}{{ p.entry_price | price }}{% endif %}</td>
-                <td class="mono">{% if p.est_profit is none %}—{% else %}{{ p.est_profit | money }}{% endif %}</td>
-                <td class="mono dim">{{ p.last_buy_date or '—' }}</td>
                 <td>{{ statustag(l) }}</td>
-                <td class="mono dim">{{ l.confirmed_date or '—' }}</td>
+                {# The brokers it actually paid in — the multiplier for every
+                   figure on the Dashboard. #}
+                <td class="small{% if l.sold %} dim{% else %} faint{% endif %}"
+                    title="{{ 'named by the sell alert' if l.sold else 'eligible by outcome; no exit published yet' }}">
+                  {{ l.paid_in }}{% if not l.sold and l.paying_brokers %} <i>(eligible)</i>{% endif %}
+                </td>
+                <td class="mono dim">{{ l.resolved_on or '—' }}</td>
+                <td class="mono">{% if l.per_account_profit %}{{ l.per_account_profit | money }}{% else %}—{% endif %}</td>
                 <td class="mono">
                   {%- if l.exits -%}{{ l.exits[-1].exit_price | price }}{%- else -%}—{%- endif -%}
-                </td>
-                <td class="mono pos">
-                  {%- if not l.exits -%}—
-                  {%- elif l.booked_high > l.booked_low -%}+{{ l.booked_low | money }}–{{ l.booked_high | money }}
-                  {%- elif l.booked_low -%}+{{ l.booked_low | money }}
-                  {%- else -%}—{%- endif -%}
                 </td>
                 <td class="dim small">{{ p.roundup_history if p.roundup_history and p.roundup_history != 'N/A' else '—' }}</td>
               </tr>
@@ -367,114 +482,15 @@
         </details>
       {% endif %}
     </section>
-
-    <!-- ---------------------------------------------------------- PROFIT -->
-    <section class="pane p-profit card">
-      <div class="card-h">
-        <h3>Theoretical total</h3>
-        <span class="muted" style="font-size:12px">one share per account</span>
-      </div>
-
-      {% if not board.profit_basis and not board.fractional_basis %}
-        <p class="muted" style="font-size:13.5px;margin:0">
-          Nothing on this board has a resolved split with a published entry
-          price yet, so there is nothing honest to multiply.
-        </p>
-      {% else %}
-        {#
-          Two account boxes, not one, because the tracker says these two groups
-          paid in different places. A play that ROUNDED UP left a whole share in
-          every account. A play that came back FRACTIONAL left something only at
-          Public, Robinhood and SoFi — the other seven settled it to cash and
-          hold nothing to sell. One account count across both would overstate
-          the fractional side by more than three times.
-        #}
-        <div class="calc" id="calc"
-             data-per-account="{{ '%.4f' % board.per_account_profit }}"
-             data-per-frac="{{ '%.4f' % board.per_fractional_account }}">
-          <div class="calc-in">
-            <label for="calc-accounts">Accounts you trade, all brokers</label>
-            <input id="calc-accounts" type="number" inputmode="numeric"
-                   min="0" max="200" step="1" value="10">
-          </div>
-          <div class="calc-in">
-            <label for="calc-frac">Of those, accounts at {{ fractional_brokers | join(', ') }}</label>
-            <input id="calc-frac" type="number" inputmode="numeric"
-                   min="0" max="200" step="1" value="3">
-            <span class="hint">the only three that hand back a fraction</span>
-          </div>
-
-          <div class="calc-out">
-            <div class="co">
-              <div class="k">Rounded up · per account</div>
-              <div class="v num" id="calc-per">{{ board.per_account_profit | money }}</div>
-            </div>
-            <div class="co big">
-              <div class="k">Rounded up · <span id="calc-n">10</span> accounts</div>
-              <div class="v num pos" id="calc-total">{{ (board.per_account_profit * 10) | money }}</div>
-            </div>
-            <div class="co">
-              <div class="k">Fractional · <span id="calc-fn">3</span> eligible accounts</div>
-              <div class="v num" id="calc-frac-total">{{ (board.per_fractional_account * 3) | money }}</div>
-            </div>
-          </div>
-
-          <p class="calc-note">
-            Priced the one way this site prices anything:
-            <b>entry × (ratio − 1)</b>, one share bought per account.
-            The round-up figure covers {{ board.profit_basis | length }} of
-            {{ board.rounded_history | length }} confirmed round-ups{% if board.profit_unpriced %};
-            {{ board.profit_unpriced }}
-            {{ 'is' if board.profit_unpriced == 1 else 'are' }} left out because
-            the feed never published a price for
-            {{ 'it' if board.profit_unpriced == 1 else 'them' }}{% endif %}.
-            Only these paid in every account — the tracker confirmed a whole
-            share came back.
-          </p>
-
-          <p class="calc-warn">
-            The fractional line is not profit. Those splits left a fraction, and
-            only at {{ fractional_brokers | join(', ') }} — the other seven
-            brokers paid cash in lieu and hold nothing to sell. A fraction is
-            worth roughly what was paid for it, so that figure is the position
-            you could still sell, not a gain. Everything here is arithmetic on
-            the past, not a projection: it assumes you bought each play before
-            its deadline in every account, and the tracking tab shows how often
-            a split does something other than round up.
-          </p>
-
-          <div class="htable-wrap">
-            <table class="htable">
-              <thead>
-                <tr><th>Alerted</th><th>Ticker</th><th>Outcome</th><th>Paid in</th>
-                    <th>Entry</th><th>Ratio</th><th>Per account</th><th>At your count</th></tr>
-              </thead>
-              <tbody>
-                {% for l in board.profit_basis + board.fractional_basis %}
-                  <tr>
-                    <td class="mono dim">{{ l.play.alert_date or '—' }}</td>
-                    <td><b>{{ l.play.symbol }}</b></td>
-                    <td>{{ statustag(l) }}</td>
-                    <td class="dim small">{{ l.paid_in }}</td>
-                    <td class="mono">{{ l.play.entry_price | price }}</td>
-                    <td class="mono">{{ l.play.ratio or '—' }}</td>
-                    <td class="mono">{{ l.per_account_profit | money }}</td>
-                    {# data-scope tells the script which account box scales this
-                       row, so a fractional play never multiplies by ten. #}
-                    <td class="mono{% if l.paid_everywhere %} pos{% endif %}"
-                        data-per="{{ '%.4f' % l.per_account_profit }}"
-                        data-scope="{{ 'all' if l.paid_everywhere else 'frac' }}">
-                      {{ (l.per_account_profit * (10 if l.paid_everywhere else 3)) | money }}
-                    </td>
-                  </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      {% endif %}
-    </section>
   </div>
+
+  {#
+    The dashboard's raw material. A data block, not a script: it is never
+    executed, so the strict CSP that forbids inline script is untouched.
+    Each row is one play that paid — when, how much per account, and the
+    brokers it paid in.
+  #}
+  <script type="application/json" id="payouts">{{ board.payout_json | safe }}</script>
   {% endif %}
 
   <!-- ============================================================== UPSELL -->
@@ -489,20 +505,15 @@
       </div>
       <a class="btn" href="/pricing">See Automation</a>
     </div>
-  {% else %}
-    <p class="muted" style="font-size:12.5px;margin-top:18px">
-      Your terminal pulls this same list automatically. Alerts sync into the trade
-      queue; nothing here needs copying by hand.
-    </p>
   {% endif %}
 
-  <p class="muted" style="max-width:78ch;margin:26px auto 0;text-align:center;font-size:12.4px;line-height:1.65">
+  <p class="muted disclaim">
     Alerts are information, not advice, and not a recommendation to trade. Prices and
     estimates are quoted as the feed published them and are stale the moment they post.
     Round-up treatment varies by broker and by corporate action, changes without notice,
-    and may not happen at all: you can lose money. A confirmed round-up on one ticker
-    never implies the next one behaves the same way, and the totals above are history,
-    never a forecast.
+    and may not happen at all: you can lose money. Every profit figure here is
+    theoretical — it assumes you bought each play before its deadline in the accounts
+    shown, and it is arithmetic on what already happened, never a forecast.
   </p>
 
 </div>

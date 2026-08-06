@@ -137,10 +137,14 @@ def _board_page(request: Request, user: User | None, db: Session):
     if config.PICKS_FILE:
         playsfeed.import_picks_file(db, config.PICKS_FILE)
 
+    board = playsfeed.load_board(db)
     return render(
         request, "plays.html",
         user=user,
-        board=playsfeed.load_board(db),
+        board=board,
+        # Rendered against one account per broker. The browser rewrites these
+        # from the reader's own profile — see the note in plays.html.
+        totals=board.totals(),
         # The vocabulary for TRACK statuses lives with the feed, not in the
         # template — the page renders rows the board didn't get to wrap.
         status_labels=playsfeed.STATUS_LABELS,

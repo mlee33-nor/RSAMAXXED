@@ -21,6 +21,7 @@ record is the only honest evidence the mechanism works at all.
 """
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import re
@@ -77,7 +78,22 @@ RESOLVED_STATUSES = frozenset({"rounded_up", "fractional", "cash_in_lieu", "canc
 # Multiplying every alert by "how many accounts do you have" ignores that, and
 # overstates the fractional ones by more than three times.
 FRACTIONAL_BROKERS = ("Public", "Robinhood", "SoFi")
-CASH_IN_LIEU_BROKER_COUNT = 7
+
+# The ten the terminal executes in, in the order the settings panel lists them.
+# Mirrors rsa_feed.SUPPORTED_BROKERS.
+SUPPORTED_BROKERS = (
+    "BBAE", "Chase", "DSPAC", "Fennel", "Fidelity",
+    "Public", "Robinhood", "Schwab", "SoFi", "Wells Fargo",
+)
+
+
+def broker_key(name: str) -> str:
+    """'Wells Fargo' -> 'wellsfargo'. Mirrors lifecycle.app_key().
+
+    The feed writes display names; the settings panel and the profit maths key
+    on the squashed lowercase form, so the two meet here and nowhere else.
+    """
+    return (name or "").strip().lower().replace(" ", "").replace("*", "")
 
 
 # ------------------------------------------------------------------ lifecycle
@@ -141,13 +157,62 @@ class PlayLife:
         return self.status == "fractional"
 
     @property
-    def paid_in(self) -> str:
-        """Where this play left anything behind. Drives the calculator column."""
+    def paying_brokers(self) -> tuple[str, ...]:
+        """The brokers this play actually paid out in, best evidence first.
+
+        This is the whole profit model, and the order matters:
+
+        1. **The sell alert's legs.** If the play exited, the alert named the
+           brokers it was sold at, with an account count each. That is not a
+           rule about what usually happens — it is the record of which accounts
+           rounded and got sold. Nothing beats it.
+        2. **rounded_up with no exit yet.** A whole share came back, and a whole
+           share is a whole share everywhere, so every broker is eligible.
+        3. **fractional.** Only the three that hold fractions at all; the other
+           seven settled to cash and have nothing to sell.
+        4. **Anything else** — pending, cash in lieu, canceled, unknown — paid
+           nowhere, and contributes nothing to any total.
+
+        Returned as display names; pair with `broker_key()` to match settings.
+        """
+        legs = [leg.get("broker") for e in self.exits for leg in e.legs]
+        named = tuple(dict.fromkeys(b for b in legs if b))   # de-duped, ordered
+        if named:
+            return named
         if self.paid_everywhere:
-            return "every account"
+            return SUPPORTED_BROKERS
         if self.fraction_only:
-            return " / ".join(FRACTIONAL_BROKERS) + " only"
-        return "nothing to sell"
+            return FRACTIONAL_BROKERS
+        return ()
+
+    @property
+    def sold(self) -> bool:
+        """The feed published an exit for this play, so the brokers above are
+        the ones it was really sold at rather than the ones that were eligible."""
+        return bool(self.exits)
+
+    @property
+    def paid_in(self) -> str:
+        """Where this play left anything behind, in words."""
+        brokers = self.paying_brokers
+        if not brokers:
+            return "nothing to sell"
+        if len(brokers) >= len(SUPPORTED_BROKERS):
+            return "every broker"
+        return ", ".join(brokers)
+
+    @property
+    def resolved_on(self) -> str:
+        """The date this play's outcome was established, best evidence first.
+
+        Profit belongs to the month it was booked in, not the month the alert
+        went out — those are routinely weeks apart, and bucketing by the alert
+        would credit a July payout to June.
+        """
+        if self.exits:
+            return self.exits[-1].sell_date or ""
+        return (self.confirmed_date or self.play.last_buy_date
+                or self.play.alert_date or "")
 
     @property
     def sell_symbol(self) -> str:
@@ -397,6 +462,128 @@ class Board:
         """Round-ups left OUT of the number above for want of a price. Shown on
         the page: a total that quietly drops rows overstates its own coverage."""
         return len(self.rounded_history) - len(self.profit_basis)
+
+    # ---- what the dashboard computes from
+    @property
+    def payout_rows(self) -> list[dict]:
+        """Every play that paid something, as plain data for the browser.
+
+        The money is finished on the CLIENT, not here, and that is deliberate:
+        the multiplier is the reader's own per-broker account counts, which live
+        in their browser and are never sent to us. The server ships what it
+        knows — when it paid, how much per account, and WHICH BROKERS it paid in
+        — and the page does the arithmetic against their numbers.
+        """
+        rows = []
+        for l in self.history:
+            per = l.per_account_profit
+            brokers = l.paying_brokers
+            if not per or not brokers:
+                continue
+            rows.append({
+                "sym": l.play.symbol,
+                "on": l.resolved_on,
+                "per": round(per, 4),
+                "brokers": [broker_key(b) for b in brokers],
+                "status": l.status,
+                "sold": l.sold,
+            })
+        return sorted(rows, key=lambda r: r["on"])
+
+    @property
+    def payout_json(self) -> str:
+        return json.dumps(self.payout_rows, separators=(",", ":"))
+
+    @property
+    def broker_slots(self) -> list[tuple[str, str, bool]]:
+        """(display name, key, holds fractions) for the settings panel."""
+        return [(b, broker_key(b), b in FRACTIONAL_BROKERS) for b in SUPPORTED_BROKERS]
+
+    def totals(self, accounts: dict[str, int] | None = None) -> dict:
+        """Money, against an account profile. Same rule the browser applies.
+
+        `accounts` maps broker key -> how many accounts you hold there. Default
+        is one at each broker, which is what the page renders before anyone has
+        opened the settings panel — a real figure with a stated basis beats a
+        blank, and beats a made-up ten.
+        """
+        # `is None` and not a truthiness test: an empty map, or one with every
+        # broker set to zero, is a REAL answer — "I hold nothing anywhere" —
+        # and must total zero. Falling back to the default there would show
+        # someone numbers from accounts they told us they don't have.
+        acc = ({broker_key(b): 1 for b in SUPPORTED_BROKERS}
+               if accounts is None else accounts)
+        by_month: dict[str, dict] = {}
+        total = 0.0
+        paid = 0
+        for r in self.payout_rows:
+            n = sum(acc.get(k, 0) for k in r["brokers"])
+            if not n:
+                continue
+            amount = r["per"] * n
+            total += amount
+            paid += 1
+            key = (r["on"] or "")[:7] or "—"
+            bucket = by_month.setdefault(key, {"key": key, "total": 0.0, "plays": 0})
+            bucket["total"] += amount
+            bucket["plays"] += 1
+        months = [by_month[k] for k in sorted(by_month)]
+        best = max(months, key=lambda m: m["total"], default=None)
+        return {
+            "total": total,
+            "plays": paid,
+            "months": months,
+            "best": best,
+            "per_month": (total / len(months)) if months else 0.0,
+        }
+
+    # ---- the calendar
+    @property
+    def by_deadline(self) -> "OrderedDict[str, list[PlayLife]]":
+        """Open plays grouped by the day their buy window shuts.
+
+        Keyed on last_buy_date because that is the date that can be missed. An
+        alert with no deadline published lands under '' and the page lists it
+        separately rather than inventing a day for it.
+        """
+        buckets: dict[str, list[PlayLife]] = defaultdict(list)
+        for l in self.open_plays:
+            buckets[l.play.last_buy_date or ""].append(l)
+        return OrderedDict(sorted(buckets.items(), key=lambda kv: (kv[0] == "", kv[0])))
+
+    def calendar_months(self, today: date | None = None, months: int = 2) -> list[dict]:
+        """Month grids of buy deadlines, starting with the current month.
+
+        Two months by default: a buy window that shuts inside a fortnight is the
+        only thing this view is for, and a year of empty squares is noise. Days
+        outside the range still appear in the day list under the grid, so a
+        far-off deadline is never hidden — only un-gridded.
+        """
+        today = today or date.today()
+        counts = {d: len(v) for d, v in self.by_deadline.items() if d}
+        out = []
+        y, m = today.year, today.month
+        for _ in range(max(1, months)):
+            weeks = []
+            # Monday-first, matching how the rest of the site reads dates.
+            for week in calendar.Calendar(firstweekday=0).monthdatescalendar(y, m):
+                row = []
+                for d in week:
+                    iso = d.isoformat()
+                    row.append({
+                        "iso": iso,
+                        "day": d.day,
+                        "in_month": d.month == m,
+                        "count": counts.get(iso, 0),
+                        "today": d == today,
+                        "past": d < today,
+                    })
+                weeks.append(row)
+            out.append({"label": f"{calendar.month_name[m]} {y}", "weeks": weeks})
+            m += 1
+            if m > 12:
+                m, y = 1, y + 1
+        return out
 
     @property
     def history_by_status(self) -> list[tuple[str, str, int]]:

@@ -41,6 +41,17 @@
     --red:       #fb6f84;
     --amber:     #f2c14e;
 
+    /* Chart fills. NOT the text tokens above: those are tuned to be read as
+       type on the surface, and are too light to sit as large fills on it.
+       These are the same hues stepped down until all six palette checks pass
+       against the card surface (#0c0e15) in dark mode — lightness band, chroma
+       floor, CVD separation, normal-vision floor and contrast. Re-run the
+       validator if you change one. */
+    --c-series:  #7c78ff;   /* the single series: profit */
+    --c-good:    #1f9e77;   /* rounded up */
+    --c-warn:    #b8892b;   /* fractional / cash in lieu */
+    --c-null:    #3a4152;   /* nothing happened, or nothing to sell */
+
     --glow:      0 0 0 1px rgba(124,120,255,.16), 0 8px 40px -12px rgba(124,120,255,.42);
     --lift:      0 1px 0 0 rgba(255,255,255,.04) inset, 0 20px 50px -24px rgba(0,0,0,.9);
 
@@ -1163,28 +1174,32 @@
   .sd.gold{background:var(--amber);box-shadow:0 0 9px rgba(242,193,78,.5)}
 
   .tabs > .pane{display:none;margin:0}
-  #tab-buys:checked   ~ .p-buys,
-  #tab-sells:checked  ~ .p-sells,
-  #tab-track:checked  ~ .p-track,
-  #tab-profit:checked ~ .p-profit{display:block}
+  #tab-dash:checked  ~ .p-dash,
+  #tab-cal:checked   ~ .p-cal,
+  #tab-buys:checked  ~ .p-buys,
+  #tab-sells:checked ~ .p-sells,
+  #tab-track:checked ~ .p-track{display:block}
 
-  #tab-buys:checked   ~ .tabbar label[for="tab-buys"],
-  #tab-sells:checked  ~ .tabbar label[for="tab-sells"],
-  #tab-track:checked  ~ .tabbar label[for="tab-track"],
-  #tab-profit:checked ~ .tabbar label[for="tab-profit"]{
+  #tab-dash:checked  ~ .tabbar label[for="tab-dash"],
+  #tab-cal:checked   ~ .tabbar label[for="tab-cal"],
+  #tab-buys:checked  ~ .tabbar label[for="tab-buys"],
+  #tab-sells:checked ~ .tabbar label[for="tab-sells"],
+  #tab-track:checked ~ .tabbar label[for="tab-track"]{
     color:var(--text);background:rgba(255,255,255,.06);border-color:var(--line-2);
   }
-  #tab-buys:checked   ~ .tabbar label[for="tab-buys"] b,
-  #tab-sells:checked  ~ .tabbar label[for="tab-sells"] b,
-  #tab-track:checked  ~ .tabbar label[for="tab-track"] b,
-  #tab-profit:checked ~ .tabbar label[for="tab-profit"] b{color:var(--text-2)}
+  #tab-dash:checked  ~ .tabbar label[for="tab-dash"] b,
+  #tab-cal:checked   ~ .tabbar label[for="tab-cal"] b,
+  #tab-buys:checked  ~ .tabbar label[for="tab-buys"] b,
+  #tab-sells:checked ~ .tabbar label[for="tab-sells"] b,
+  #tab-track:checked ~ .tabbar label[for="tab-track"] b{color:var(--text-2)}
 
   /* Keyboard users get a visible target on the tab they are actually on;
      mouse users never see it. */
-  #tab-buys:focus-visible   ~ .tabbar label[for="tab-buys"],
-  #tab-sells:focus-visible  ~ .tabbar label[for="tab-sells"],
-  #tab-track:focus-visible  ~ .tabbar label[for="tab-track"],
-  #tab-profit:focus-visible ~ .tabbar label[for="tab-profit"]{
+  #tab-dash:focus-visible  ~ .tabbar label[for="tab-dash"],
+  #tab-cal:focus-visible   ~ .tabbar label[for="tab-cal"],
+  #tab-buys:focus-visible  ~ .tabbar label[for="tab-buys"],
+  #tab-sells:focus-visible ~ .tabbar label[for="tab-sells"],
+  #tab-track:focus-visible ~ .tabbar label[for="tab-track"]{
     outline:2px solid var(--accent);outline-offset:2px;
   }
 
@@ -1220,6 +1235,146 @@
     padding:11px 13px;border-radius:10px;
     background:rgba(242,193,78,.06);border:1px solid rgba(242,193,78,.16);color:var(--amber);
   }
+
+  /* ================================================= PLAYS PAGE FURNITURE */
+
+  .page-h{
+    display:flex;align-items:flex-start;justify-content:space-between;
+    gap:20px;flex-wrap:wrap;margin-bottom:16px;
+  }
+  .page-h h1{font-size:26px;letter-spacing:-.02em;margin:0}
+  .page-h .sub{font-size:13px;margin:5px 0 0;max-width:64ch}
+  .disclaim{max-width:78ch;margin:26px auto 0;text-align:center;font-size:12.4px;line-height:1.65}
+
+  /* The settings gear. Reachable from every tab, because the account counts
+     scope every number on the page and not just one card. */
+  .gear{
+    display:inline-flex;align-items:center;gap:7px;cursor:pointer;
+    padding:7px 12px;border-radius:99px;border:1px solid var(--line-2);
+    font-size:12.5px;color:var(--text-2);white-space:nowrap;
+    transition:color .15s var(--ease),border-color .15s var(--ease),background .15s var(--ease);
+  }
+  .gear:hover{color:var(--text);border-color:var(--accent);background:rgba(124,120,255,.08)}
+
+  .drawer-toggle{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+  .drawer{display:none;margin-bottom:16px}
+  .drawer-toggle:checked ~ .drawer{display:block}
+  .drawer-toggle:focus-visible ~ .drawer{outline:2px solid var(--accent)}
+
+  .bgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
+  @media(max-width:900px){ .bgrid{grid-template-columns:repeat(3,1fr)} }
+  @media(max-width:560px){ .bgrid{grid-template-columns:repeat(2,1fr)} }
+  .bslot{display:flex;flex-direction:column;gap:6px}
+  .bslot .bn{font-size:11.5px;color:var(--text-3);display:flex;align-items:center;gap:4px}
+  .bslot .bn i{color:var(--accent-2);font-style:normal;font-size:9px}
+  .bslot input{
+    width:100%;padding:8px 10px;border-radius:9px;font-family:var(--mono);
+    font-size:14px;font-weight:600;color:var(--text);
+    background:rgba(255,255,255,.04);border:1px solid var(--line-2);
+  }
+  .bslot input:focus{outline:2px solid var(--accent);outline-offset:1px}
+  .bfoot{
+    display:flex;align-items:center;justify-content:space-between;gap:16px;
+    flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px solid var(--line);
+    font-size:12.5px;color:var(--text-3);
+  }
+  .bfoot b{font-family:var(--mono);color:var(--text);font-weight:650}
+  .bfoot i{color:var(--accent-2);font-style:normal;font-size:9px}
+
+  /* ---- one filter row above everything it scopes */
+  .filters{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+  .flabel{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3)}
+  .chips{display:flex;gap:6px;flex-wrap:wrap}
+  .chip{
+    padding:6px 13px;border-radius:99px;font-size:12.5px;cursor:pointer;
+    background:transparent;border:1px solid var(--line-2);color:var(--text-3);
+    transition:color .15s var(--ease),border-color .15s var(--ease),background .15s var(--ease);
+  }
+  .chip:hover{color:var(--text-2)}
+  .chip.on{color:var(--text);border-color:var(--accent);background:rgba(124,120,255,.1)}
+  .basis{margin-left:auto;font-size:12px;color:var(--text-3)}
+  .basis label{color:var(--accent);cursor:pointer;text-decoration:underline}
+
+  /* ---- the hero figure: exactly one per view */
+  .hero-row{display:grid;grid-template-columns:minmax(260px,1fr) 2fr;gap:12px;align-items:stretch}
+  @media(max-width:900px){ .hero-row{grid-template-columns:1fr} }
+  .hero-card{
+    margin:0;display:flex;flex-direction:column;justify-content:center;
+    background:
+      radial-gradient(120% 100% at 0% 0%, rgba(124,120,255,.12), transparent 70%),
+      var(--bg-2);
+  }
+  .hero-card .k{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3)}
+  /* Proportional figures, not tabular: equal-width digits read loose this big. */
+  .hero-fig{font-size:clamp(36px,4.4vw,52px);font-weight:660;letter-spacing:-.03em;margin:8px 0 6px;line-height:1}
+  .hero-sub{font-size:12.5px}
+  .tiles.compact{grid-template-columns:repeat(4,1fr);margin:0}
+  @media(max-width:900px){ .tiles.compact{grid-template-columns:repeat(2,1fr)} }
+  .tile .k2{font-size:11px;color:var(--text-3);margin-top:3px;font-family:var(--mono)}
+
+  /* ---- charts */
+  .chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+  @media(max-width:900px){ .chart-grid{grid-template-columns:1fr} }
+  .chart-card{margin:0;display:flex;flex-direction:column}
+  .chart-card.wide{grid-column:1 / -1}
+  /* Sized to include the axis band, so the card never grows a nested scrollbar. */
+  .chart{margin:0;width:100%;min-height:196px}
+  .chart svg{display:block;width:100%;height:auto;overflow:visible}
+  .chart .empty-note{font-size:13px;color:var(--text-3);padding:26px 0}
+
+  .ax-line{stroke:var(--line);stroke-width:1}
+  .ax-text{fill:var(--text-3);font-size:10px;font-family:var(--mono)}
+  .val-text{fill:var(--text-2);font-size:10.5px;font-family:var(--mono)}
+  .mark-bar{fill:var(--c-series)}
+  .mark-line{fill:none;stroke:var(--c-series);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+  .mark-area{fill:var(--c-series);opacity:.1}
+  .mark-dot{fill:var(--c-series);stroke:var(--bg-2);stroke-width:2}
+  .hit{fill:transparent;cursor:pointer}
+  .hit:hover + .mark-bar,.mark-bar.hot{fill:var(--accent-hi)}
+
+  .charttip{
+    position:fixed;z-index:60;pointer-events:none;opacity:0;transform:translate(-50%,-115%);
+    background:var(--bg-1);border:1px solid var(--line-2);border-radius:10px;
+    padding:8px 11px;font-size:12px;white-space:nowrap;
+    box-shadow:0 10px 30px rgba(0,0,0,.5);transition:opacity .12s var(--ease);
+  }
+  .charttip.on{opacity:1}
+  .charttip b{font-family:var(--mono);display:block;font-size:13.5px;margin-top:2px}
+
+  .tableview{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}
+  .tableview summary{cursor:pointer;font-size:12.5px;color:var(--text-3);list-style:none}
+  .tableview summary::-webkit-details-marker{display:none}
+  .tableview summary::before{content:"▸ ";font-size:10px}
+  .tableview[open] summary::before{content:"▾ "}
+  .tableview .htable{min-width:0;margin-top:10px}
+
+  /* ---- calendar */
+  .calwrap{display:grid;grid-template-columns:minmax(300px,420px) 1fr;gap:12px;align-items:start}
+  @media(max-width:900px){ .calwrap{grid-template-columns:1fr} }
+  .cals{display:flex;flex-direction:column;gap:22px}
+  .calhead{font-size:13px;font-weight:600;margin-bottom:10px}
+  .caldow,.calgrid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+  .caldow span{
+    text-align:center;font-size:9.5px;letter-spacing:.08em;color:var(--text-3);
+    padding-bottom:6px;
+  }
+  .cday{
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    aspect-ratio:1;border-radius:9px;font-size:12px;font-family:var(--mono);
+    color:var(--text-3);border:1px solid transparent;background:transparent;
+  }
+  .cday.out{opacity:.28}
+  .cday.gone{opacity:.4}
+  .cday.today{border-color:var(--line-2);color:var(--text)}
+  button.cday{
+    cursor:pointer;color:var(--text);background:rgba(124,120,255,.1);
+    border-color:rgba(124,120,255,.38);
+    transition:background .15s var(--ease),border-color .15s var(--ease);
+  }
+  button.cday:hover{background:rgba(124,120,255,.2);border-color:var(--accent)}
+  button.cday.sel{background:var(--accent);border-color:var(--accent);color:#0b0b16}
+  button.cday i{font-style:normal;font-size:9px;opacity:.85;margin-top:1px}
+  .dayblock.hide{display:none}
 
   /* ---- page header side: freshness stamp + the lock-this-browser control */
   .head-side{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
