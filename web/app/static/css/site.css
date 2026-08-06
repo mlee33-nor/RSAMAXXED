@@ -1325,7 +1325,10 @@
   /* Proportional figures, not tabular: equal-width digits read loose this big. */
   .hero-fig{font-size:clamp(36px,4.4vw,52px);font-weight:660;letter-spacing:-.03em;margin:8px 0 6px;line-height:1}
   .hero-sub{font-size:12.5px}
-  .tiles.compact{grid-template-columns:repeat(auto-fit,minmax(148px,1fr));margin:0}
+  /* 126px, so all five KPIs sit on one row beside the hero instead of the
+     fifth wrapping alone and leaving a hole. */
+  .tiles.compact{grid-template-columns:repeat(auto-fit,minmax(126px,1fr));margin:0}
+  @media(max-width:1180px){ .tiles.compact{grid-template-columns:repeat(3,1fr)} }
   @media(max-width:900px){ .tiles.compact{grid-template-columns:repeat(2,1fr)} }
   .tile .k2{font-size:11px;color:var(--text-3);margin-top:3px;font-family:var(--mono)}
 
