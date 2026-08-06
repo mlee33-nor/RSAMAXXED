@@ -96,7 +96,42 @@
       <span class="eyebrow{% if not board.last_update %} stale{% endif %}">
         <i class="pip"></i> Updated {{ board.last_update | ago }}
       </span>
-      <label class="gear" for="settings-open" title="Your accounts">⚙<span>Accounts</span></label>
+
+      {#
+        The accounts popover. How many accounts you hold AT EACH BROKER is the
+        multiplier for every number on the Dashboard, so the control is reachable
+        from every tab — but it is a two-second errand, so it hangs off the gear
+        instead of displacing the board. Stored in this browser, never sent to us.
+      #}
+      <input type="checkbox" id="settings-open" class="drawer-toggle">
+      <label class="drawer-scrim" for="settings-open" aria-hidden="true"></label>
+      <span class="pop-anchor">
+        <label class="gear" for="settings-open" title="Accounts you trade">⚙<span>Accounts</span></label>
+        <section class="card drawer" id="accounts-panel">
+          <div class="card-h">
+            <h3>Your accounts</h3>
+            <label class="xclose" for="settings-open" title="Close">✕</label>
+          </div>
+          <p class="muted" style="font-size:12px;margin:0 0 12px">
+            Saved in this browser only. A split that rounded up pays every account;
+            one that came back fractional pays only the three marked ◆.
+          </p>
+          <div class="bgrid">
+            {% for name, key, fractional in board.broker_slots %}
+              <label class="bslot">
+                <span class="bn">{{ name }}{% if fractional %}<i title="Holds fractions">◆</i>{% endif %}</span>
+                <input type="number" min="0" max="99" step="1" value="1"
+                       data-broker="{{ key }}" id="acct-{{ key }}" inputmode="numeric">
+              </label>
+            {% endfor %}
+          </div>
+          <div class="bfoot">
+            <span><b id="acct-total">10</b> accounts · <b id="acct-frac">3</b> hold fractions <i>◆</i></span>
+            <label class="btn btn-ghost btn-sm" for="settings-open">Done</label>
+          </div>
+        </section>
+      </span>
+
       {% if not user %}
         <form method="post" action="/plays/lock" class="inline">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -105,39 +140,6 @@
       {% endif %}
     </div>
   </div>
-
-  <!-- ========================================================== SETTINGS -->
-  {#
-    How many accounts you hold AT EACH BROKER. This is not a preference, it is
-    the multiplier for every number on the dashboard: a play that only sold at
-    Chase pays your Chase accounts and nothing else. Stored in this browser and
-    never transmitted.
-  #}
-  <input type="checkbox" id="settings-open" class="drawer-toggle">
-  <section class="card drawer" id="accounts-panel">
-    <div class="card-h">
-      <h3>Your accounts</h3>
-      <span class="muted" style="font-size:12px">saved in this browser only</span>
-    </div>
-    <p class="muted" style="font-size:12.5px;margin:0 0 14px;max-width:74ch">
-      Every figure on the Dashboard is your account count at the brokers a play
-      actually paid out in. A split that only sold at two brokers pays your
-      accounts at those two — not all ten. Leave a broker at 0 if you don't use it.
-    </p>
-    <div class="bgrid">
-      {% for name, key, fractional in board.broker_slots %}
-        <label class="bslot">
-          <span class="bn">{{ name }}{% if fractional %}<i title="One of the three that hand back a fraction">◆</i>{% endif %}</span>
-          <input type="number" min="0" max="99" step="1" value="1"
-                 data-broker="{{ key }}" id="acct-{{ key }}" inputmode="numeric">
-        </label>
-      {% endfor %}
-    </div>
-    <div class="bfoot">
-      <span><b id="acct-total">10</b> accounts · <b id="acct-frac">3</b> at the three that hold fractions <i>◆</i></span>
-      <label class="btn btn-ghost btn-sm" for="settings-open">Done</label>
-    </div>
-  </section>
 
   {% if not board.has_anything %}
     <div class="card empty">
@@ -182,8 +184,7 @@
           <div class="k">Theoretical profit · <span id="hero-period">all time</span></div>
           <div class="hero-fig pos" id="hero-total">{{ totals.total | money }}</div>
           <div class="hero-sub muted" id="hero-sub">
-            across {{ totals.plays }} plays that paid, in
-            {{ totals.months | length }} month{{ '' if totals.months | length == 1 else 's' }}
+            if you had bought all {{ totals.plays }} plays the tracker says paid
           </div>
         </div>
         <div class="tiles compact">
@@ -351,9 +352,25 @@
       {% if not board.exits %}
         <p class="muted" style="font-size:13.5px;margin:0">No exits in the last 45 days.</p>
       {% else %}
+        {#
+          Paged by day, a fortnight at a time. Sixty exits is a very long scroll
+          and the newest ones are the ones anyone opens this tab for; the rest
+          stay one click away rather than below a thousand pixels of history.
+          The pager is JS, so with it blocked every page is simply expanded —
+          nothing is ever hidden behind a script.
+        #}
+        <div class="pager" id="exit-pager" data-per="7">
+          <div class="pgnav">
+            <button type="button" class="pgbtn" data-page="prev">← Newer</button>
+            <span class="pgstat"></span>
+            <button type="button" class="pgbtn" data-page="next">Older →</button>
+          </div>
+        </div>
         {% for day, rows in board.exits_by_date.items() %}
-          <div class="daygroup">
-            <div class="dayhead"><span>{{ day }}</span><i></i></div>
+          <div class="daygroup pgitem" data-pgindex="{{ loop.index0 }}">
+            <div class="dayhead"><span>{{ day }}</span><i></i>
+              <span class="muted" style="font-size:11px">{{ rows | length }}</span>
+            </div>
             <ul class="plist grid2">
               {% for e in rows %}
                 <li class="prow exit">

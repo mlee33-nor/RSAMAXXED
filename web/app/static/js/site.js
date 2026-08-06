@@ -992,8 +992,8 @@ function initPlaysDash() {
     if (heroTotal) heroTotal.textContent = money(s.total);
     if (heroSub) {
       heroSub.textContent = s.plays
-        ? `across ${s.plays} plays that paid, in ${s.months.length} month${s.months.length === 1 ? '' : 's'}`
-        : 'no plays paid into your accounts in this period';
+        ? `if you had bought all ${s.plays} plays the tracker says paid`
+        : 'no split in this period paid into the accounts you hold';
     }
     if (kpiPer) kpiPer.textContent = money(s.perMonth);
     if (kpiBest) kpiBest.textContent = s.best ? money(s.best.total) : '—';
@@ -1031,6 +1031,40 @@ function initPlaysDash() {
   addEventListener('scroll', hideTip, { passive: true });
 }
 
+/* ---------------------------------------------------------------- the pager
+   Day-groups, N at a time. Everything is in the DOM already — this only sets
+   `hidden` — so with the script blocked the tab is simply a long complete list
+   rather than an empty one, and no exit is ever gated behind JavaScript. */
+function initPager() {
+  const pager = $('#exit-pager');
+  if (!pager) return;
+  const items = $$('.pgitem');
+  const per = Math.max(1, parseInt(pager.dataset.per || '7', 10));
+  const pages = Math.ceil(items.length / per);
+  const stat = $('.pgstat', pager);
+  if (pages < 2) { pager.hidden = true; return; }
+
+  let page = 0;
+  const draw = () => {
+    items.forEach((it, i) => {
+      it.hidden = Math.floor(i / per) !== page;
+    });
+    if (stat) stat.textContent = `Page ${page + 1} of ${pages}`;
+    $$('.pgbtn', pager).forEach(b => {
+      b.disabled = (b.dataset.page === 'prev' && page === 0) ||
+                   (b.dataset.page === 'next' && page === pages - 1);
+    });
+  };
+
+  $$('.pgbtn', pager).forEach(b => b.addEventListener('click', () => {
+    page = clamp(page + (b.dataset.page === 'next' ? 1 : -1), 0, pages - 1);
+    draw();
+    pager.scrollIntoView({ block: 'nearest', behavior: REDUCED ? 'auto' : 'smooth' });
+  }));
+
+  draw();
+}
+
 /* ------------------------------------------------------------- the calendar
    Click a day to narrow the list beside it; click it again for everything.
    The list is entirely server-rendered, so with this file blocked the calendar
@@ -1064,6 +1098,7 @@ function boot() {
   initMultiplier();
   initPlaysDash();
   initPlaysCalendar();
+  initPager();
 }
 
 if (document.readyState === 'loading') addEventListener('DOMContentLoaded', boot);

@@ -12,6 +12,30 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(_HERE, "templates"))
 
 
+def _asset_version() -> str:
+    """A cache-busting stamp for the stylesheet and script.
+
+    Without this, a browser that cached site.css keeps using it after a deploy —
+    and a page whose CSS is a version behind is not "slightly stale", it is
+    broken: tabs stop hiding panes, so every section renders at once as one long
+    list, and a popover becomes a slab down the middle of the page. That is a
+    real bug report we already got, and no amount of server-side correctness
+    fixes it. Derived from the files' own size+mtime, so it changes exactly when
+    they do and never needs remembering.
+    """
+    stamp = 0
+    for rel in ("static/css/site.css", "static/js/site.js"):
+        try:
+            st = os.stat(os.path.join(_HERE, rel))
+            stamp ^= int(st.st_mtime) ^ (st.st_size << 8)
+        except OSError:
+            pass
+    return format(stamp & 0xFFFFFFF, "x")
+
+
+ASSET_V = _asset_version()
+
+
 def money(v: float | None, sign: bool = False) -> str:
     if v is None:
         return "—"
@@ -88,4 +112,5 @@ def csrf_for(request: Request) -> str:
 def render(request: Request, name: str, **ctx):
     ctx.setdefault("user", None)
     ctx["csrf_token"] = csrf_for(request)
+    ctx["asset_v"] = ASSET_V
     return templates.TemplateResponse(request, name, ctx)

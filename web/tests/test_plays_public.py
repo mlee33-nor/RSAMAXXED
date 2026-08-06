@@ -354,13 +354,16 @@ def _expected(board, acc):
                for r in board.payout_rows)
 
 
-def test_a_play_pays_only_the_brokers_its_sell_alert_named(payouts):
-    """ONLYCHASE rounded up, but the exit says it sold at Chase. Accounts
-    anywhere else earn nothing from it — that is the correction that separates
-    this from multiplying per-account profit by a total account count."""
-    rows, board = payouts
-    assert rows["ONLYCHASE"]["brokers"] == ["chase"]
-    assert "robinhood" not in rows["ONLYCHASE"]["brokers"]
+def test_the_payout_follows_the_tracker_not_the_sell_alert(payouts):
+    """The question the dashboard answers is "if I had bought every alert, what
+    would the splits have paid ME" — so a rounded-up play pays every account you
+    hold, even though the alerter's own sell message listed only the brokers
+    THEY happened to hold. That list is reporting, on the Sells tab; it never
+    narrows the arithmetic."""
+    rows, _ = payouts
+    assert len(rows["ONLYCHASE"]["brokers"]) == 10, (
+        "the sell alert's leg list leaked back into the payout rule")
+    assert "chase" in rows["ONLYCHASE"]["brokers"]
 
 
 def test_the_totals_engine_multiplies_broker_by_broker(payouts):
