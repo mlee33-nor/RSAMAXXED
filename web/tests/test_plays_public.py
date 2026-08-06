@@ -260,67 +260,150 @@ def test_the_board_makes_no_promise(board):
         assert weasel not in flat
 
 
-def test_the_four_sections_are_tabs_that_work_without_javascript(board):
+def test_the_five_sections_are_tabs_that_work_without_javascript(board):
     """CSS tabs, not scripted ones: the CSP forbids inline script, and a board
     someone paid for must render with JS blocked."""
-    for tab in ("tab-buys", "tab-sells", "tab-track", "tab-profit"):
+    for tab in ("tab-dash", "tab-cal", "tab-buys", "tab-sells", "tab-track"):
         assert f'id="{tab}"' in board, f"the {tab} tab went missing"
         assert f'for="{tab}"' in board, f"the {tab} tab has no label to click"
-    assert board.count('type="radio" name="ptab"') == 4
+    assert board.count('type="radio" name="ptab"') == 5
     # Every pane is in the HTML — tabs hide, they don't defer-load.
-    for pane in ("p-buys", "p-sells", "p-track", "p-profit"):
+    for pane in ("p-dash", "p-cal", "p-buys", "p-sells", "p-track"):
         assert f'class="pane {pane}' in board
 
 
-def test_the_profit_tab_multiplies_a_real_basis(board):
-    """The calculator's per-account figure is entry x (ratio - 1) over the
-    CONFIRMED round-ups: 0.4 x 19 = 7.60 for the one in the fixture."""
-    m = re.search(r'data-per-account="([\d.]+)"', board)
-    assert m, "the calculator lost its basis"
-    assert abs(float(m.group(1)) - 7.6) < 0.01
-    # Server-rendered at the default 10 accounts, so it reads correctly with
-    # the script blocked.
-    assert "$76.00" in board
+def test_the_dashboard_reads_before_javascript_runs(board):
+    """Charts need a script; numbers must not. Everything is server-rendered
+    against a stated basis of one account per broker, so a reader with JS
+    blocked still gets real figures and a table."""
+    flat = re.sub(r"\s+", " ", board)
+    assert "Theoretical profit" in flat
+    assert "1 account at each broker" in flat
+    assert 'id="monthly-table"' in board          # the table view twin
+    assert "never a forecast" in flat             # and it says what it isn't
 
 
-def test_only_round_ups_count_toward_every_account(anon):
-    """The rule from lifecycle.brokers_for(): a rounded-up play left a whole
-    share EVERYWHERE, a fractional one left something only at the three brokers
-    that hold fractions. Mixing them into one account count would overstate the
-    fractional side by more than three times."""
+def test_the_settings_gear_offers_every_broker(board):
+    """The account counts are the multiplier for the whole dashboard, so all ten
+    brokers have to be settable — and the three that hold fractions marked."""
+    for key in ("bbae", "chase", "dspac", "fennel", "fidelity",
+                "public", "robinhood", "schwab", "sofi", "wellsfargo"):
+        assert f'data-broker="{key}"' in board, f"no account input for {key}"
+    assert board.count('data-broker=') == 10
+
+
+def test_the_calendar_marks_the_days_a_window_shuts(board):
+    """A deadline you can't see is a deadline you miss."""
+    assert 'class="calgrid"' in board
+    assert 'data-day=' in board
+
+
+# ------------------------------------------------------ the payout arithmetic
+# The rule the whole dashboard rests on, and the one the naive version got
+# wrong: a play pays YOUR accounts AT THE BROKERS IT ACTUALLY PAID IN. Not
+# "per-account profit x total accounts".
+
+def _board_of(anon):
+    from app.db import SessionLocal
+    from app import playsfeed
+    db = SessionLocal()
+    try:
+        return playsfeed.load_board(db)
+    finally:
+        db.close()
+
+
+@pytest.fixture()
+def payouts(anon):
+    """One play sold only at Chase, one that rounded up with no exit yet, and
+    one that came back fractional."""
     anon.post("/api/v1/plays/ingest", headers=KEY, json={
         "buys": [
-            {"source_id": "f:1", "symbol": "WHOLE", "alert_date": "2026-07-10",
+            {"source_id": "p:1", "symbol": "ONLYCHASE", "alert_date": "2026-07-10",
              "ratio": "1:11", "entry_price": 1.0, "last_buy_date": "2026-07-11"},
-            {"source_id": "f:2", "symbol": "FRAC", "alert_date": "2026-07-10",
-             "ratio": "1:21", "entry_price": 1.0, "last_buy_date": "2026-07-11"},
+            {"source_id": "p:2", "symbol": "WHOLE", "alert_date": "2026-07-10",
+             "ratio": "1:11", "entry_price": 1.0, "last_buy_date": "2026-07-11"},
+            {"source_id": "p:3", "symbol": "FRAC", "alert_date": "2026-07-10",
+             "ratio": "1:11", "entry_price": 1.0, "last_buy_date": "2026-07-11"},
         ],
-        "roundups": [{"source_id": "f:r", "symbol": "WHOLE", "confirmed_date": "2026-07-12"}],
+        "sells": [
+            {"source_id": "p:s1", "symbol": "ONLYCHASE", "sell_date": "2026-07-20",
+             "exit_price": 11.0, "proceeds_low": 10.0,
+             "legs": [{"broker": "Chase", "accounts_low": 1, "accounts_high": 1}]},
+        ],
+        "roundups": [
+            {"source_id": "p:r1", "symbol": "ONLYCHASE", "confirmed_date": "2026-07-18"},
+            {"source_id": "p:r2", "symbol": "WHOLE", "confirmed_date": "2026-07-18"},
+        ],
         "lifecycle": [
-            {"source_id": "2026-07-10:WHOLE", "symbol": "WHOLE", "alert_date": "2026-07-10",
-             "status": "rounded_up", "kind": "standard"},
-            {"source_id": "2026-07-10:FRAC", "symbol": "FRAC", "alert_date": "2026-07-10",
-             "status": "fractional", "kind": "standard"},
+            {"source_id": "2026-07-10:ONLYCHASE", "symbol": "ONLYCHASE",
+             "alert_date": "2026-07-10", "status": "rounded_up", "kind": "standard"},
+            {"source_id": "2026-07-10:WHOLE", "symbol": "WHOLE",
+             "alert_date": "2026-07-10", "status": "rounded_up", "kind": "standard"},
+            {"source_id": "2026-07-10:FRAC", "symbol": "FRAC",
+             "alert_date": "2026-07-10", "status": "fractional", "kind": "standard"},
         ],
     })
-    page = _unlock(anon).text
-
-    # WHOLE (1.0 x 10) lands in the round-up basis; FRAC (1.0 x 20) does not.
-    per_all = float(re.search(r'data-per-account="([\d.]+)"', page).group(1))
-    per_frac = float(re.search(r'data-per-frac="([\d.]+)"', page).group(1))
-    assert per_frac >= 20.0, "the fractional play never reached its own bucket"
-    assert per_all < per_frac, "a fractional play leaked into the every-account total"
-
-    # And each row says where it actually paid.
-    assert 'data-scope="frac"' in page
-    assert "Public / Robinhood / SoFi only" in page
-    assert "is not profit" in page
+    board = _board_of(anon)
+    return {r["sym"]: r for r in board.payout_rows}, board
 
 
-def test_the_profit_tab_says_what_it_is_not(board):
-    flat = re.sub(r"\s+", " ", board)
-    assert "not a projection" in flat
-    assert "Theoretical total" in flat
+def _expected(board, acc):
+    """The rule, written out longhand, to check the engine against."""
+    return sum(r["per"] * sum(acc.get(b, 0) for b in r["brokers"])
+               for r in board.payout_rows)
+
+
+def test_a_play_pays_only_the_brokers_its_sell_alert_named(payouts):
+    """ONLYCHASE rounded up, but the exit says it sold at Chase. Accounts
+    anywhere else earn nothing from it — that is the correction that separates
+    this from multiplying per-account profit by a total account count."""
+    rows, board = payouts
+    assert rows["ONLYCHASE"]["brokers"] == ["chase"]
+    assert "robinhood" not in rows["ONLYCHASE"]["brokers"]
+
+
+def test_the_totals_engine_multiplies_broker_by_broker(payouts):
+    """Checked against the rule written out longhand, over several profiles —
+    including lopsided ones, where a flat account count would diverge most."""
+    _, board = payouts
+    for acc in ({}, {"chase": 1}, {"robinhood": 10},
+                {"chase": 2, "sofi": 3}, {"fidelity": 4, "public": 1, "chase": 1}):
+        assert abs(board.totals(acc)["total"] - _expected(board, acc)) < 0.01, acc
+
+
+def test_accounts_at_a_broker_you_do_not_use_add_nothing(payouts):
+    """An empty profile pays nothing at all, and a broker set to zero is the
+    same as not having it."""
+    _, board = payouts
+    assert board.totals({})["total"] == 0
+    assert board.totals({"chase": 0})["total"] == 0
+    assert board.totals({"chase": 2})["total"] == pytest.approx(
+        board.totals({"chase": 1})["total"] * 2, rel=1e-6)
+
+
+def test_a_roundup_with_no_exit_yet_is_eligible_everywhere(payouts):
+    """A whole share is a whole share at every broker — until an exit says
+    otherwise, all ten are eligible."""
+    rows, _ = payouts
+    assert len(rows["WHOLE"]["brokers"]) == 10
+
+
+def test_a_fractional_play_pays_only_the_three_that_hold_fractions(payouts):
+    """The other seven settled to cash and hold nothing to sell."""
+    rows, board = payouts
+    assert sorted(rows["FRAC"]["brokers"]) == ["public", "robinhood", "sofi"]
+    # Accounts at a cash-in-lieu broker earn nothing from it.
+    assert not set(rows["FRAC"]["brokers"]) & {"chase", "fidelity", "schwab"}
+
+
+def test_totals_bucket_by_the_month_the_play_was_booked(payouts):
+    """Not the month it was alerted. ONLYCHASE was alerted in July and sold
+    2026-07-20, so it books to July — crediting it to the alert month would put
+    payouts in the wrong month whenever a split straddles one."""
+    _, board = payouts
+    months = {m["key"] for m in board.totals({"chase": 1})["months"]}
+    assert "2026-07" in months
 
 
 def test_a_tracked_split_with_no_matching_alert_is_still_listed(anon):

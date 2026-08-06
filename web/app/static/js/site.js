@@ -638,77 +638,416 @@ function initMultiplier() {
   paint();
 }
 
-/* ------------------------------------------------------------- plays board
-   The account multiplier on the Plays page. Every figure is rendered by the
-   server first, at the default count, so the tab is correct and readable with
-   this file blocked — this only makes it interactive.
+/* ============================================================================
+   THE PLAYS DASHBOARD
+   ----------------------------------------------------------------------------
+   Money is finished here, in the browser, and never on the server. The
+   multiplier is the reader's own per-broker account counts, which live in this
+   machine's localStorage and are never transmitted.
 
-   Deliberately NOT the RSA scenario constants: these numbers come from the
-   feed's own confirmed round-ups, carried on data attributes. The scenario is
-   an illustration; this is a record.
+   The rule, which is the whole point and is easy to get wrong:
 
-   Two counts, not one, and that is the whole point: the tracker says a
-   ROUNDED UP play left a whole share in every account, while a FRACTIONAL one
-   left something only at the three brokers that hold fractions. Each row
-   carries data-scope to say which count scales it. */
-function initPlaysCalc() {
-  const box = $('#calc');
-  if (!box) return;
-  const input = $('#calc-accounts');
-  if (!input) return;
+       a play pays YOUR accounts AT THE BROKERS IT ACTUALLY PAID IN
 
-  const fracInput = $('#calc-frac');
-  const per = parseFloat(box.dataset.perAccount || '0') || 0;
-  const perFrac = parseFloat(box.dataset.perFrac || '0') || 0;
-  const total = $('#calc-total'), perOut = $('#calc-per'), label = $('#calc-n');
-  const fracTotal = $('#calc-frac-total'), fracLabel = $('#calc-fn');
-  const rows = $$('[data-per]', box);
+   Not "profit per account x how many accounts you have". The server ships each
+   payout with the broker list it was really settled in — taken from the sell
+   alert's legs where one exists, and from the tracker's outcome where it
+   doesn't — and this multiplies against the accounts you hold at exactly those
+   brokers. A split that only sold at Chase pays your Chase accounts. Nothing
+   else. Every figure on the page is server-rendered first at one account per
+   broker, so the numbers are real and readable before this file runs.
+   ========================================================================= */
 
-  /* How many accounts someone trades is a fact about them, not about this
-     visit — so it is remembered locally and never sent anywhere. Wrapped
-     because storage throws outright in a browser with cookies fully blocked,
-     and a calculator must not die over a saved preference. */
-  const STORE = 'rsamaxxed.accounts';
-  const load = () => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(STORE) || 'null');
-      if (!saved) return;
-      if (saved.all != null) input.value = saved.all;
-      if (fracInput && saved.frac != null) fracInput.value = saved.frac;
-    } catch (e) { /* private mode, blocked storage, corrupt value — ignore */ }
+const ACCT_STORE = 'rsamaxxed.accounts.v2';
+
+function readAccounts() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(ACCT_STORE) || 'null');
+    return (raw && typeof raw === 'object') ? raw : null;
+  } catch (e) { return null; }        // blocked storage, private mode, corrupt
+}
+
+function writeAccounts(map) {
+  try { localStorage.setItem(ACCT_STORE, JSON.stringify(map)); } catch (e) { /* fine */ }
+}
+
+/* Compact money for axis ticks, where two decimals are noise. */
+const compact = n =>
+  Math.abs(n) >= 1000 ? '$' + (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k'
+                      : '$' + Math.round(n);
+
+const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const monthLabel = key => {
+  const [y, m] = (key || '').split('-');
+  return MONTH_NAMES[(+m || 1) - 1] + (m ? '' : '') + ' ’' + (y || '').slice(2);
+};
+
+/* ---------------------------------------------------------------- settings */
+function initAccounts(onChange) {
+  const inputs = $$('[data-broker]');
+  if (!inputs.length) return () => ({});
+
+  const saved = readAccounts();
+  if (saved) inputs.forEach(el => {
+    if (saved[el.dataset.broker] != null) el.value = saved[el.dataset.broker];
+  });
+
+  const totalEl = $('#acct-total'), fracEl = $('#acct-frac'), basisEl = $('#basis-note');
+  // The three that hand back a fraction. Marked in the DOM so this list lives
+  // in one place (playsfeed.FRACTIONAL_BROKERS) and is not restated here.
+  const fracKeys = $$('.bslot').filter(s => $('.bn i', s)).map(s => $('[data-broker]', s).dataset.broker);
+
+  const collect = () => {
+    const map = {};
+    inputs.forEach(el => { map[el.dataset.broker] = clamp(Math.floor(+el.value) || 0, 0, 99); });
+    return map;
   };
-  const save = (all, frac) => {
-    try { localStorage.setItem(STORE, JSON.stringify({ all, frac })); }
-    catch (e) { /* nothing to do about it, and nothing worth breaking over */ }
+
+  const sync = (persist) => {
+    const map = collect();
+    const total = Object.values(map).reduce((a, b) => a + b, 0);
+    const frac = fracKeys.reduce((a, k) => a + (map[k] || 0), 0);
+    if (totalEl) totalEl.textContent = total;
+    if (fracEl) fracEl.textContent = frac;
+    if (basisEl) {
+      const used = Object.values(map).filter(Boolean).length;
+      basisEl.innerHTML = `${total} account${total === 1 ? '' : 's'} across ${used} broker${used === 1 ? '' : 's'} · <label for="settings-open">change</label>`;
+    }
+    if (persist) writeAccounts(map);
+    onChange(map);
   };
 
-  load();
+  inputs.forEach(el => el.addEventListener('input', () => sync(true), { passive: true }));
+  sync(false);
+  return collect;
+}
+
+/* ------------------------------------------------------------- the figures */
+function summarise(rows, accounts, monthsBack) {
+  let cutoff = '';
+  if (monthsBack > 0) {
+    const d = new Date();
+    d.setMonth(d.getMonth() - monthsBack);
+    cutoff = d.toISOString().slice(0, 10);
+  }
+
+  const byMonth = new Map();
+  let total = 0, plays = 0;
+  rows.forEach(r => {
+    if (cutoff && (r.on || '') < cutoff) return;
+    // The rule: only accounts at the brokers this play actually paid in.
+    const n = r.brokers.reduce((a, k) => a + (accounts[k] || 0), 0);
+    if (!n) return;
+    const amount = r.per * n;
+    total += amount; plays += 1;
+    const key = (r.on || '').slice(0, 7) || '—';
+    const bucket = byMonth.get(key) || { key, total: 0, plays: 0 };
+    bucket.total += amount; bucket.plays += 1;
+    byMonth.set(key, bucket);
+  });
+
+  const months = [...byMonth.values()].sort((a, b) => a.key < b.key ? -1 : 1);
+  const best = months.reduce((a, m) => (!a || m.total > a.total) ? m : a, null);
+  return { total, plays, months, best, perMonth: months.length ? total / months.length : 0 };
+}
+
+/* --------------------------------------------------------------- the charts
+   Hand-built SVG: no library, and none of the defaults a library brings.
+   Thin marks, hairline axes, one hue per chart, labels only where they earn
+   their place — the value on the tallest column, the value at the end of the
+   line, and the count at the tip of each outcome bar. */
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const svgEl = (tag, attrs = {}) => {
+  const n = document.createElementNS(SVG_NS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+};
+
+let _tip;
+function tipFor(host) {
+  if (!_tip) {
+    _tip = document.createElement('div');
+    _tip.className = 'charttip';
+    document.body.appendChild(_tip);
+  }
+  return _tip;
+}
+function showTip(x, y, html) {
+  const t = tipFor();
+  t.innerHTML = html;
+  t.style.left = x + 'px';
+  t.style.top = y + 'px';
+  t.classList.add('on');
+}
+const hideTip = () => _tip && _tip.classList.remove('on');
+
+/* A "nice" axis ceiling, so ticks land on 1/2/5 x 10^n rather than 3,847. */
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / mag;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
+}
+
+function emptyChart(host, msg) {
+  host.innerHTML = '';
+  const p = document.createElement('p');
+  p.className = 'empty-note';
+  p.textContent = msg;
+  host.appendChild(p);
+}
+
+function monthlyChart(host, months) {
+  if (!host) return;
+  if (!months.length) return emptyChart(host, 'Nothing paid out in this period.');
+
+  const W = 620, H = 200, L = 52, R = 10, T = 16, B = 28;
+  const iw = W - L - R, ih = H - T - B;
+  const max = niceMax(Math.max(...months.map(m => m.total)));
+  const band = iw / months.length;
+  const bw = Math.min(24, band * 0.55);          // cap the mark; leftover is air
+  const y = v => T + ih - (v / max) * ih;
+
+  host.innerHTML = '';
+  const s = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img' });
+
+  // Recessive grid: three solid hairlines, and the ticks that carry the values
+  // no bar is directly labelled with.
+  [0, .5, 1].forEach(f => {
+    const yy = y(max * f);
+    s.appendChild(svgEl('line', { class: 'ax-line', x1: L, x2: W - R, y1: yy, y2: yy }));
+    const t = svgEl('text', { class: 'ax-text', x: L - 8, y: yy + 3, 'text-anchor': 'end' });
+    t.textContent = compact(max * f);
+    s.appendChild(t);
+  });
+
+  const peak = months.reduce((a, m) => m.total > a.total ? m : a, months[0]);
+
+  months.forEach((m, i) => {
+    const x = L + band * i + (band - bw) / 2;
+    const h = Math.max(1, ih - (y(m.total) - T));
+    const r = Math.min(4, bw / 2, h);
+    // Rounded data-end, square at the baseline.
+    const d = `M${x} ${T + ih}L${x} ${T + ih - h + r}Q${x} ${T + ih - h} ${x + r} ${T + ih - h}` +
+              `L${x + bw - r} ${T + ih - h}Q${x + bw} ${T + ih - h} ${x + bw} ${T + ih - h + r}` +
+              `L${x + bw} ${T + ih}Z`;
+
+    const hit = svgEl('rect', { class: 'hit', x: L + band * i, y: T, width: band, height: ih });
+    const bar = svgEl('path', { class: 'mark-bar', d });
+    hit.addEventListener('pointerenter', ev => {
+      bar.classList.add('hot');
+      const r2 = ev.target.getBoundingClientRect();
+      showTip(r2.left + r2.width / 2, r2.top + (y(m.total) - T) * (r2.height / ih),
+        `${monthLabel(m.key)} · ${m.plays} play${m.plays === 1 ? '' : 's'}<b>${money(m.total)}</b>`);
+    });
+    hit.addEventListener('pointerleave', () => { bar.classList.remove('hot'); hideTip(); });
+    s.appendChild(hit);
+    s.appendChild(bar);
+
+    // Label selectively: the peak carries its value, the axis carries the rest.
+    if (m === peak && h > 14) {
+      const t = svgEl('text', { class: 'val-text', x: x + bw / 2, y: y(m.total) - 6, 'text-anchor': 'middle' });
+      t.textContent = compact(m.total);
+      s.appendChild(t);
+    }
+
+    if (months.length <= 10 || i % 2 === 0) {
+      const t = svgEl('text', { class: 'ax-text', x: x + bw / 2, y: H - 9, 'text-anchor': 'middle' });
+      t.textContent = monthLabel(m.key);
+      s.appendChild(t);
+    }
+  });
+
+  host.appendChild(s);
+}
+
+function cumulativeChart(host, months) {
+  if (!host) return;
+  if (months.length < 2) return emptyChart(host, 'Two months of payouts are needed to draw a trend.');
+
+  const W = 620, H = 200, L = 52, R = 42, T = 16, B = 28;
+  const iw = W - L - R, ih = H - T - B;
+  let run = 0;
+  const pts = months.map((m, i) => {
+    run += m.total;
+    return { x: L + (iw * i) / (months.length - 1), y: 0, v: run, key: m.key };
+  });
+  const max = niceMax(run);
+  pts.forEach(p => { p.y = T + ih - (p.v / max) * ih; });
+
+  host.innerHTML = '';
+  const s = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img' });
+
+  [0, .5, 1].forEach(f => {
+    const yy = T + ih - f * ih;
+    s.appendChild(svgEl('line', { class: 'ax-line', x1: L, x2: W - R, y1: yy, y2: yy }));
+    const t = svgEl('text', { class: 'ax-text', x: L - 8, y: yy + 3, 'text-anchor': 'end' });
+    t.textContent = compact(max * f);
+    s.appendChild(t);
+  });
+
+  const line = pts.map(p => `${p.x} ${p.y}`).join('L');
+  s.appendChild(svgEl('path', {
+    class: 'mark-area',
+    d: `M${pts[0].x} ${T + ih}L${line}L${pts[pts.length - 1].x} ${T + ih}Z`,
+  }));
+  s.appendChild(svgEl('path', { class: 'mark-line', d: `M${line}` }));
+
+  pts.forEach((p, i) => {
+    if (months.length <= 10 || i % 2 === 0) {
+      const t = svgEl('text', { class: 'ax-text', x: p.x, y: H - 9, 'text-anchor': 'middle' });
+      t.textContent = monthLabel(p.key);
+      s.appendChild(t);
+    }
+    const hit = svgEl('circle', { class: 'hit', cx: p.x, cy: p.y, r: 14 });
+    hit.addEventListener('pointerenter', ev => {
+      const r = ev.target.getBoundingClientRect();
+      showTip(r.left + r.width / 2, r.top, `${monthLabel(p.key)} · running total<b>${money(p.v)}</b>`);
+    });
+    hit.addEventListener('pointerleave', hideTip);
+    s.appendChild(hit);
+  });
+
+  // End marker + the one direct label the line needs.
+  const last = pts[pts.length - 1];
+  s.appendChild(svgEl('circle', { class: 'mark-dot', cx: last.x, cy: last.y, r: 4.5 }));
+  const lab = svgEl('text', { class: 'val-text', x: last.x + 9, y: last.y + 4 });
+  lab.textContent = compact(last.v);
+  s.appendChild(lab);
+
+  host.appendChild(s);
+}
+
+/* Outcomes. Status colours, and every bar carries its name and count as text —
+   so the categories never depend on colour to be told apart. Read from the
+   Tracking tab's own summary, which keeps one source of truth on the page. */
+function outcomeChart(host) {
+  if (!host) return;
+  const src = $$('.statbar .sb');
+  if (!src.length) return emptyChart(host, 'No outcomes recorded yet.');
+
+  const rows = src.map(node => ({
+    status: (node.className.match(/sb-([a-z_]+)/) || [, ''])[1],
+    label: node.textContent.replace(/^\s*\d+\s*/, '').trim(),
+    n: parseInt($('b', node)?.textContent || '0', 10),
+  })).filter(r => r.n > 0).sort((a, b) => b.n - a.n);
+  if (!rows.length) return emptyChart(host, 'No outcomes recorded yet.');
+
+  const fill = s => s === 'rounded_up' ? 'var(--c-good)'
+    : (s === 'fractional' || s === 'cash_in_lieu') ? 'var(--c-warn)' : 'var(--c-null)';
+
+  const W = 620, L = 150, R = 52, rowH = 30, bh = 14;
+  const H = rows.length * rowH + 8;
+  const max = Math.max(...rows.map(r => r.n));
+  const iw = W - L - R;
+
+  host.innerHTML = '';
+  const s = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img' });
+
+  rows.forEach((r, i) => {
+    const y = i * rowH + 8;
+    const w = Math.max(2, (r.n / max) * iw);
+    const rad = Math.min(4, w / 2);
+
+    const name = svgEl('text', { class: 'ax-text', x: L - 12, y: y + bh - 2, 'text-anchor': 'end' });
+    name.textContent = r.label;
+    s.appendChild(name);
+
+    // style= rather than fill=: a CSS variable in a presentation attribute is
+    // not portable, and these colours have to come from the token set.
+    s.appendChild(svgEl('path', {
+      style: `fill:${fill(r.status)}`,
+      d: `M${L} ${y}L${L + w - rad} ${y}Q${L + w} ${y} ${L + w} ${y + rad}` +
+         `L${L + w} ${y + bh - rad}Q${L + w} ${y + bh} ${L + w - rad} ${y + bh}L${L} ${y + bh}Z`,
+    }));
+
+    const val = svgEl('text', { class: 'val-text', x: L + w + 9, y: y + bh - 2 });
+    val.textContent = r.n;
+    s.appendChild(val);
+  });
+
+  host.appendChild(s);
+}
+
+/* ------------------------------------------------------------ the dashboard */
+function initPlaysDash() {
+  const data = $('#payouts');
+  if (!data) return;
+
+  let rows = [];
+  try { rows = JSON.parse(data.textContent || '[]'); } catch (e) { rows = []; }
+
+  const heroTotal = $('#hero-total'), heroSub = $('#hero-sub'), heroPeriod = $('#hero-period');
+  const kpiPer = $('#kpi-permonth'), kpiBest = $('#kpi-best'), kpiWhen = $('#kpi-best-when');
+  const monthly = $('#chart-monthly'), cumulative = $('#chart-cumulative');
+  const tableBody = $('#monthly-table tbody');
+
+  let range = 0;                       // 0 = all time
+  let accounts = {};
 
   const paint = () => {
-    // Clamp rather than reject: an empty or silly box should show a sane
-    // number, not NaN. The input's own min/max carry the same bounds.
-    const n = clamp(Math.floor(+input.value) || 0, 0, 200);
-    // Eligible accounts can never exceed the total — you cannot hold four of
-    // your three accounts at Robinhood.
-    const f = clamp(Math.floor(+(fracInput ? fracInput.value : 0)) || 0, 0, n);
+    const s = summarise(rows, accounts, range);
 
-    if (label) label.textContent = n;
-    if (fracLabel) fracLabel.textContent = f;
-    if (perOut) perOut.textContent = money(per);
-    if (total) total.textContent = money(per * n);
-    if (fracTotal) fracTotal.textContent = money(perFrac * f);
+    if (heroTotal) heroTotal.textContent = money(s.total);
+    if (heroSub) {
+      heroSub.textContent = s.plays
+        ? `across ${s.plays} plays that paid, in ${s.months.length} month${s.months.length === 1 ? '' : 's'}`
+        : 'no plays paid into your accounts in this period';
+    }
+    if (kpiPer) kpiPer.textContent = money(s.perMonth);
+    if (kpiBest) kpiBest.textContent = s.best ? money(s.best.total) : '—';
+    if (kpiWhen) kpiWhen.textContent = s.best ? s.best.key : '';
 
-    rows.forEach(el => {
-      const count = el.dataset.scope === 'frac' ? f : n;
-      el.textContent = money(parseFloat(el.dataset.per) * count);
-    });
+    if (tableBody) {
+      tableBody.innerHTML = '';
+      s.months.slice().reverse().forEach(m => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td class="mono">${m.key}</td><td class="mono">${m.plays}</td>` +
+                       `<td class="mono pos">${money(m.total)}</td>`;
+        tableBody.appendChild(tr);
+      });
+    }
 
-    save(n, f);
+    monthlyChart(monthly, s.months);
+    cumulativeChart(cumulative, s.months);
   };
 
-  input.addEventListener('input', paint, { passive: true });
-  if (fracInput) fracInput.addEventListener('input', paint, { passive: true });
+  $$('#range-row .chip').forEach(btn => {
+    btn.addEventListener('click', () => {
+      $$('#range-row .chip').forEach(b => b.classList.toggle('on', b === btn));
+      range = parseInt(btn.dataset.range, 10) || 0;
+      if (heroPeriod) {
+        heroPeriod.textContent = range ? `last ${range} months` : 'all time';
+      }
+      paint();
+    });
+  });
+
+  const collect = initAccounts(map => { accounts = map; paint(); });
+  accounts = collect();
+  outcomeChart($('#chart-outcomes'));
   paint();
+  addEventListener('scroll', hideTip, { passive: true });
+}
+
+/* ------------------------------------------------------------- the calendar
+   Click a day to narrow the list beside it; click it again for everything.
+   The list is entirely server-rendered, so with this file blocked the calendar
+   is a static month view above a complete list — never an empty panel. */
+function initPlaysCalendar() {
+  const days = $$('button.cday');
+  if (!days.length) return;
+  const blocks = $$('.dayblock');
+  const note = $('#day-filter-note');
+  let picked = '';
+
+  days.forEach(btn => btn.addEventListener('click', () => {
+    picked = (picked === btn.dataset.day) ? '' : btn.dataset.day;
+    days.forEach(b => b.classList.toggle('sel', b.dataset.day === picked));
+    blocks.forEach(b => b.classList.toggle('hide', !!picked && b.dataset.day !== picked));
+    if (note) note.textContent = picked ? `closing ${picked}` : 'every open play';
+  }));
 }
 
 /* -------------------------------------------------------------------- boot */
@@ -723,7 +1062,8 @@ function boot() {
   initFanout();
   initPricing();
   initMultiplier();
-  initPlaysCalc();
+  initPlaysDash();
+  initPlaysCalendar();
 }
 
 if (document.readyState === 'loading') addEventListener('DOMContentLoaded', boot);
