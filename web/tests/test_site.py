@@ -304,3 +304,92 @@ def test_every_asset_url_carries_the_version_stamp(home):
     cache life above and the pinning is silently doing nothing."""
     for ref in re.findall(r'(?:href|src)="(/static/[^"]+)"', home):
         assert "?v=" in ref, f"{ref} is linked without a cache-busting stamp"
+
+
+# ------------------------------------------------------------ link previews
+#
+# Without these a shared link is a bare grey rectangle on every platform that
+# matters, and that rectangle is the first thing anyone sees of the site —
+# before the site. They are also the easiest thing on the page to break,
+# because nothing on screen changes when they go wrong.
+
+PREVIEW_PAGES = ("/", "/how-it-works", "/pricing", "/plays")
+
+
+@pytest.mark.parametrize("path", PREVIEW_PAGES)
+def test_every_public_page_previews_with_a_card(path, monkeypatch):
+    from app import config
+    monkeypatch.setattr(config, "PUBLIC_BASE_URL", "https://rsamaxxed.com")
+    with TestClient(app) as c:
+        html = c.get(path).text
+    for tag in ("og:title", "og:description", "og:image", "og:url",
+                "twitter:card", 'rel="canonical"'):
+        assert tag in html, f"{path} is missing {tag}"
+    assert 'content="summary_large_image"' in html, f"{path} previews as a thumbnail"
+
+
+@pytest.mark.parametrize("path", PREVIEW_PAGES)
+def test_preview_urls_are_absolute(path, monkeypatch):
+    """A scraper resolves nothing relative: a relative og:image is a card that
+    silently never renders."""
+    from app import config
+    monkeypatch.setattr(config, "PUBLIC_BASE_URL", "https://rsamaxxed.com")
+    with TestClient(app) as c:
+        html = c.get(path).text
+    for url in re.findall(r'(?:og:image|og:url)" content="([^"]+)"', html) + \
+               re.findall(r'rel="canonical" href="([^"]+)"', html):
+        assert url.startswith("https://rsamaxxed.com"), f"{path} emitted a relative {url!r}"
+
+
+def test_the_social_card_is_a_real_png_of_the_right_shape():
+    """Twitter and Facebook do not render SVG, and a card that is not 1200x630
+    gets cropped by whichever platform disagrees with it."""
+    with TestClient(app) as c:
+        r = c.get("/static/img/og.png")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/png"
+    assert r.content[:8] == b"\x89PNG\r\n\x1a\n", "og.png is not a PNG"
+    width = int.from_bytes(r.content[16:20], "big")
+    height = int.from_bytes(r.content[20:24], "big")
+    assert (width, height) == (1200, 630), f"the card is {width}x{height}"
+
+
+def test_the_shared_plays_link_advertises_the_board_not_the_terminal():
+    """A logged-out visitor to /plays gets the GATE, and that is the page every
+    shared link previews as. If it inherits base.html's description, the free
+    board advertises the paid terminal on every share."""
+    with TestClient(app) as c:
+        html = c.get("/plays").text
+    assert 'name="password"' in html, "this test stopped exercising the gate"
+    m = re.search(r'<meta property="og:description" content="([^"]+)"', html)
+    assert m, "the gate has no preview description"
+    assert "automates" not in m.group(1), \
+        "the gate is previewing with the automation pitch"
+    assert "round-up" in m.group(1)
+
+
+def test_crawlers_are_told_what_to_index(monkeypatch):
+    from app import config
+    monkeypatch.setattr(config, "PUBLIC_BASE_URL", "https://rsamaxxed.com")
+    with TestClient(app) as c:
+        robots = c.get("/robots.txt")
+        sitemap = c.get("/sitemap.xml")
+    assert robots.status_code == 200
+    assert "User-agent: *" in robots.text
+    for private in ("/api/", "/login", "/signup"):
+        assert f"Disallow: {private}" in robots.text
+    assert "Sitemap: https://rsamaxxed.com/sitemap.xml" in robots.text
+
+    assert sitemap.status_code == 200
+    assert sitemap.headers["content-type"].startswith("application/xml")
+    for path in ("/", "/how-it-works", "/pricing", "/plays"):
+        assert f"<loc>https://rsamaxxed.com{path}</loc>" in sitemap.text
+
+
+def test_crawler_files_are_cacheable_and_not_marked_private():
+    """They are identical for everyone. The no-store rule that protects the
+    board must not swallow them."""
+    with TestClient(app) as c:
+        for path in ("/robots.txt", "/sitemap.xml"):
+            cc = c.get(path).headers.get("cache-control", "")
+            assert "public" in cc and "no-store" not in cc, f"{path} sent {cc!r}"
