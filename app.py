@@ -8103,9 +8103,44 @@ class App(ctk.CTk):
             activeforeground=TEXT_PRIMARY, font=(FONT_FAMILY, 9, "bold"),
             relief="flat", bd=0, padx=14, pady=7, cursor="hand2",
         )
-        self._sweep_btn.pack(anchor="w", pady=(10, 0))
+        btn_row = tk.Frame(body, bg=BG_CARD)
+        btn_row.pack(anchor="w", pady=(10, 0))
+        self._sweep_btn.pack(in_=btn_row, side="left")
+
+        # "Sold once, ever" is what stops a re-pull selling twice, and it is
+        # also what makes a play that FAILED disappear from the sweep for good.
+        # Without a way back, one bad afternoon — a wedged SoFi login, a
+        # position that had already left the account — silently empties the
+        # worklist and the button starts reporting "nothing to sell" over a
+        # board full of fractionals.
+        self._retry_btn = tk.Button(
+            btn_row, text="Retry skipped", command=self._autosell_clear_skipped,
+            bg=BG_CARD, fg=TEXT_MUTED, activebackground=BG_CARD,
+            activeforeground=TEXT_PRIMARY, font=(FONT_FAMILY, 9),
+            relief="flat", bd=0, padx=12, pady=7, cursor="hand2",
+        )
+        self._retry_btn.pack(side="left", padx=(8, 0))
 
         self._autosell_toggled(save=False)
+
+    def _autosell_clear_skipped(self) -> None:
+        """Forget which plays have been attempted, so the sweep offers them again.
+
+        Deliberately does NOT touch anything else: the journal still knows what
+        actually sold, and the live holdings read still refuses to place an
+        order into an empty account. The worst this can do is make auto-sell
+        look at a play a second time and find nothing there.
+        """
+        n = len(self._autosell_sold)
+        if not n:
+            self._sweep_say("Nothing has been skipped")
+            return
+        self._autosell_sold.clear()
+        self._autosell_fails.clear()
+        self._save_autosell_state()
+        self._log(f"Auto-sell: cleared {n} attempted play(s) — the sweep will "
+                  f"offer them again.")
+        self._sweep_say(f"Cleared {n} — press Sell all fractionals")
 
     def _autosell_toggled(self, save: bool = True) -> None:
         armed = bool(self._autosell_enabled.get())
@@ -8617,12 +8652,24 @@ class App(ctk.CTk):
             self._push_notification("Pull the board first — nothing to sweep.", "warning")
             return
 
-        tasks = [t for t in lifecycle.sell_worklist(self._track_rows)
-                 if t.brokers and t.is_fractional
-                 and self._autosell_key(t) not in self._autosell_sold]
+        fractional = [t for t in lifecycle.sell_worklist(self._track_rows)
+                      if t.brokers and t.is_fractional]
+        tasks = [t for t in fractional
+                 if self._autosell_key(t) not in self._autosell_sold]
         if not tasks:
-            self._sweep_say("Nothing fractional to sell")
-            self._push_notification("No fractional positions to sell.", "info")
+            # "Nothing to sell" and "everything here has already been tried" are
+            # completely different answers, and showing the first when the
+            # second is true is how a full worklist reads as an empty one.
+            held_back = len(fractional)
+            if held_back:
+                self._sweep_say(f"All {held_back} already tried — use Retry skipped",
+                                hold_ms=5000)
+                self._push_notification(
+                    f"{held_back} fractional play(s) on the board have already been "
+                    f"attempted. Retry skipped to try them again.", "info")
+            else:
+                self._sweep_say("Nothing fractional to sell")
+                self._push_notification("No fractional positions to sell.", "info")
             return
 
         state, label, _ = _market_status()

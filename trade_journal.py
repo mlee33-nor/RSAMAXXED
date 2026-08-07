@@ -41,6 +41,7 @@ PRICE_FILL = "fill"
 PRICE_QUOTE = "quote"
 
 
+
 def is_estimated(trade: Dict[str, Any]) -> bool:
     """True when this row's price is a quote rather than an executed fill.
 

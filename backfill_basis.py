@@ -158,6 +158,71 @@ def create_buys(trades: list[dict], symbol: str, price: float) -> list[dict]:
     return made
 
 
+def record_sale(trades: list[dict], symbol: str, broker: str,
+                price: float) -> list[dict]:
+    """Record a sale you placed yourself, in the broker's own app.
+
+    The journal only learns about trades this tool executes. Sell four SoFi
+    accounts by hand and nothing here knows: the position stays "held", the
+    sell worklist keeps offering it, auto-sell keeps queuing it, and each
+    attempt drives another broker login against a position that is already
+    gone. AEMD and GRNQ are both sitting in exactly that state.
+
+    One row per account that still shows a net position at that broker, for
+    the quantity still showing. Marked manual, like everything else here — it
+    is your word, not a broker fill.
+    """
+    net: dict[str, float] = {}
+    for t in trade_journal.split_adjusted(trades):
+        if t["symbol"] != symbol or t["broker"] != broker:
+            continue
+        q = float(t.get("qty") or 0)
+        acct = t["account_id"]
+        net[acct] = net.get(acct, 0.0) + (q if t["side"] == "buy" else -q)
+
+    open_accounts = {a: q for a, q in net.items() if q > 1e-9}
+    if not open_accounts:
+        sys.exit(f"no open {symbol} position at {broker} — nothing to close")
+
+    when = datetime.now(timezone.utc).isoformat()
+    return [{
+        "id": str(uuid.uuid4()),
+        "timestamp": when,
+        "broker": broker,
+        "account_id": acct,
+        "side": "sell",
+        "symbol": symbol,
+        "qty": qty,
+        "fill_price": price,
+        "order_id": None,
+        "price_source": "manual",
+        "backfilled": True,
+    } for acct, qty in sorted(open_accounts.items())]
+
+
+def _write(trades: list[dict]) -> None:
+    """Back up, then write. Never overwrites a previous backup.
+
+    Two runs a second apart — fixing MASK and then TOPT, which is the normal way
+    to use this — collided on a to-the-second stamp, and the second copy
+    captured the file AFTER the first had already changed it. The true original
+    was gone, which is the one thing a backup exists to prevent.
+    """
+    stamp = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
+    backup = FILE.with_suffix(f".{stamp}.bak.json")
+    n = 1
+    while backup.exists():
+        backup = FILE.with_suffix(f".{stamp}-{n}.bak.json")
+        n += 1
+    shutil.copy2(FILE, backup)
+    # Sorted by time: the split lens in trade_journal walks rows in file order,
+    # and a created buy appended after its own sell would never be seen opening
+    # the position it pays for.
+    trades.sort(key=lambda t: str(t.get("timestamp") or ""))
+    FILE.write_text(json.dumps(trades, indent=2), encoding="utf-8")
+    print(f"\nwritten. backup: {backup.name}")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -165,6 +230,9 @@ def main(argv=None) -> int:
     ap.add_argument("--price", type=float, help="what one share cost you")
     ap.add_argument("--create-buys", action="store_true",
                     help="no buy was ever recorded; build one per sell")
+    ap.add_argument("--sell", action="store_true",
+                    help="record a sale you placed yourself, in the broker's app")
+    ap.add_argument("--broker", help="broker key for --sell, e.g. sofi, robinhood")
     ap.add_argument("--apply", action="store_true",
                     help="write it. Without this, nothing changes.")
     args = ap.parse_args(argv)
@@ -182,6 +250,33 @@ def main(argv=None) -> int:
     symbol = args.symbol.upper()
     sold = sum(float(t.get("qty") or 0) * (t.get("fill_price") or 0)
                for t in trades if t["symbol"] == symbol and t["side"] == "sell")
+
+    if args.sell:
+        if not args.broker:
+            sys.exit("--sell needs --broker (e.g. --broker sofi)")
+        made = record_sale(trades, symbol, args.broker.lower().strip(), args.price)
+        trades.extend(made)
+        qty = sum(t["qty"] for t in made)
+        cost = sum(
+            float(t.get("qty") or 0) * (t.get("fill_price") or 0)
+            for t in trades
+            if t["symbol"] == symbol and t["side"] == "buy"
+            and t["broker"] == args.broker.lower().strip()
+        )
+        print(f"{symbol}: recorded your own sale of {qty:g} share(s) across "
+              f"{len(made)} {args.broker} account(s) at ${args.price:,.4f}")
+        print(f"  proceeds     ${qty * args.price:>10,.2f}")
+        print(f"  what you paid ${cost:>9,.2f}")
+        print(f"  realized     ${qty * args.price - cost:>+10,.2f}")
+        for t in made[:4]:
+            print(f"    {t['account_id'][:34]:34} {t['qty']:g} @ ${args.price:,.4f}")
+        if len(made) > 4:
+            print(f"    …and {len(made) - 4} more")
+        if not args.apply:
+            print("\nDRY RUN — nothing written. Re-run with --apply.")
+            return 0
+        _write(trades)
+        return 0
 
     if args.create_buys:
         made = create_buys(trades, symbol, args.price)
@@ -214,24 +309,7 @@ def main(argv=None) -> int:
         print("\nDRY RUN — nothing written. Re-run with --apply.")
         return 0
 
-    # Never overwrite a previous backup. Two runs a second apart -- fixing MASK
-    # and then TOPT, which is the normal way to use this -- collided on a
-    # to-the-second stamp, and the second copy captured the file AFTER the first
-    # had already changed it. The true original was gone, which is the one thing
-    # a backup exists to prevent.
-    stamp = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
-    backup = FILE.with_suffix(f".{stamp}.bak.json")
-    n = 1
-    while backup.exists():
-        backup = FILE.with_suffix(f".{stamp}-{n}.bak.json")
-        n += 1
-    shutil.copy2(FILE, backup)
-    # Sorted by time: the split lens in trade_journal walks rows in file order,
-    # and a created buy appended after its own sell would never be seen opening
-    # the position it pays for.
-    trades.sort(key=lambda t: str(t.get("timestamp") or ""))
-    FILE.write_text(json.dumps(trades, indent=2), encoding="utf-8")
-    print(f"\nwritten. backup: {backup.name}")
+    _write(trades)
     return 0
 
 
