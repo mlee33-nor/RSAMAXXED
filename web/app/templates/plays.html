@@ -421,52 +421,6 @@
         </div>
       </div>
 
-      {#
-        INSIGHTS — the three questions the numbers above cannot answer.
-
-        Everything else on this page reports what DID happen to the money you
-        had. These ask what it means: where you are not holding an account that
-        the alerts keep paying at, how long your capital is tied up before it
-        comes back, and whether the profit is a grind or a handful of lucky
-        names. All three are computed in the browser from the payout rows
-        already on the page — no new figures come down the wire, so nothing
-        here can disagree with the hero above it.
-      #}
-      <div class="insights">
-        <div class="card chart-card">
-          <div class="card-h">
-            <h3>Where you're leaving money</h3>
-            <span class="muted" style="font-size:12px">what ONE account would have earned</span>
-          </div>
-          <figure class="chart" id="chart-missing"
-                  aria-label="All-time profit one account at each broker would have earned"></figure>
-          <p class="muted" style="font-size:11.5px;margin:14px 0 0" id="missing-note"></p>
-        </div>
-
-        <div class="tiles compact insight-tiles">
-          <div class="tile">
-            <div class="k">Money back in</div>
-            <div class="v num" id="kpi-tt-median">—</div>
-            <div class="k2" id="kpi-tt-note">median, alert to sell</div>
-          </div>
-          <div class="tile">
-            <div class="k">Slowest 1 in 10</div>
-            <div class="v num" id="kpi-tt-p90">—</div>
-            <div class="k2">plan capital for this</div>
-          </div>
-          <div class="tile">
-            <div class="k">Top 5 plays</div>
-            <div class="v num" id="kpi-conc">—</div>
-            <div class="k2" id="kpi-conc-note">of all your profit</div>
-          </div>
-          <div class="tile">
-            <div class="k">Best single play</div>
-            <div class="v num" id="kpi-bestplay">—</div>
-            <div class="k2" id="kpi-bestplay-note"></div>
-          </div>
-        </div>
-      </div>
-
       {% if board.urgent %}
         <div class="card">
           <div class="card-h"><h3>Closing next</h3>

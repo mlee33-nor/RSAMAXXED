@@ -1284,135 +1284,6 @@ function outcomeChart(host) {
   host.dataset.drawn = '1';
 }
 
-/* ============================================================================
-   INSIGHTS — what the totals cannot tell you
-   ----------------------------------------------------------------------------
-   Everything above reports what happened to the money you had. These three ask
-   what it means, and all of them are computed from the payout rows already on
-   the page — nothing extra comes down the wire, so none of it can disagree
-   with the hero it sits under.
-   ========================================================================= */
-
-/* What ONE account at each broker would have earned, all time.
-   
-   This is the only figure on the page that is about accounts you DON'T have,
-   and it is the most actionable one here: the alerts name Fennel in seven
-   exits and Schwab in ten, so a reader holding neither is not "missing a
-   little" — the number says exactly how much, in their own money, and whether
-   it is worth the afternoon of opening one. */
-function missedByBroker(rows, accounts, names = {}) {
-  const per = new Map();
-  rows.forEach(r => {
-    (r.brokers || []).forEach(k => {
-      // A broker the accounts panel has never heard of. The alerts name
-      // Webull and Fennel, which are not among the ten this software trades —
-      // that is exactly the reader worth telling, so it is titled rather than
-      // dropped.
-      const label = names[k] || (k.charAt(0).toUpperCase() + k.slice(1));
-      const e = per.get(k) || { key: k, name: label, one: 0, plays: 0 };
-      e.one += r.per;                  // one account's share of this play
-      e.plays += 1;
-      per.set(k, e);
-    });
-  });
-  return [...per.values()].map(e => ({
-    ...e,
-    held: accounts[e.key] || 0,
-    // What holding it is worth going forward, per account. Already-held
-    // brokers stay in the list: seeing that Public earns $X an account is how
-    // you decide whether to open a SECOND one there.
-    yours: (accounts[e.key] || 0) * e.one,
-  })).sort((a, b) => b.one - a.one);
-}
-
-/* Alert to sell, in days. The question is not academic: it is how many plays
-   one pot of money can run at once, and the tail matters more than the middle
-   because that is what strands capital. */
-function timeToMoney(rows) {
-  const days = [];
-  rows.forEach(r => {
-    if (!r.on || !r.booked) return;
-    const a = Date.parse(r.on + 'T00:00:00Z');
-    const b = Date.parse(r.booked + 'T00:00:00Z');
-    if (!isFinite(a) || !isFinite(b)) return;
-    const d = Math.round((b - a) / 86400000);
-    if (d >= 0 && d < 400) days.push(d);
-  });
-  days.sort((x, y) => x - y);
-  if (!days.length) return null;
-  const at = f => days[Math.min(days.length - 1, Math.floor(days.length * f))];
-  return { n: days.length, median: at(0.5), p90: at(0.9), max: days[days.length - 1] };
-}
-
-/* A horizontal ranking, drawn like the broker chart so the two read as a pair.
-   Bars are what ONE account earns; a broker you already hold is stated rather
-   than hidden, because "you have this one" is half the answer. */
-function missedChart(host, list) {
-  if (!host) return;
-  if (!list.length) return emptyChart(host, 'No sell alert has named a broker yet.');
-
-  const rows = list.slice(0, 10);
-  const W = boxWidth(host, NARROW), L = 104, R = 70, rowH = 25, bh = 11, T = 2;
-  const H = rows.length * rowH + T + 4;
-  const iw = W - L - R;
-  const max = Math.max(...rows.map(b => b.one)) || 1;
-
-  host.innerHTML = '';
-  const s = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img' });
-  const gHave = uid('have'), gMiss = uid('miss');
-  const defs = svgEl('defs');
-  defs.appendChild(linearGrad(gHave, [[0, 'var(--accent-2)', .9], [1, 'var(--c-series)', .95]], false));
-  defs.appendChild(linearGrad(gMiss, [[0, 'var(--c-warn)', .85], [1, 'var(--c-warn)', .5]], false));
-  s.appendChild(defs);
-
-  rows.forEach((b, i) => {
-    const y = T + i * rowH + 7;
-    const w = Math.max(3, (b.one / max) * iw);
-    const missing = b.held === 0;
-
-    const name = svgEl('text', {
-      class: 'ax-text name' + (missing ? ' miss' : ''),
-      x: L - 10, y: y + bh - 1.5, 'text-anchor': 'end',
-    });
-    name.textContent = b.name;
-    s.appendChild(name);
-
-    s.appendChild(svgEl('rect', { class: 'track', x: L, y, width: iw, height: bh, rx: bh / 2 }));
-    const bar = svgEl('rect', {
-      class: 'mark-hbar', x: L, y, width: w, height: bh, rx: bh / 2,
-      style: `fill:url(#${missing ? gMiss : gHave})`,
-    });
-    s.appendChild(bar);
-
-    const val = svgEl('text', { class: 'val-text', x: W - 2, y: y + bh - 1.5, 'text-anchor': 'end' });
-    val.textContent = missing ? compact(b.one) + ' ✕' : compact(b.one);
-    s.appendChild(val);
-
-    const hit = svgEl('rect', { class: 'hit', x: 0, y: y - 6, width: W, height: rowH });
-    hit.addEventListener('pointerenter', ev => {
-      bar.classList.add('hot');
-      const r = ev.target.getBoundingClientRect();
-      showTip(r.left + r.width / 2, r.top + 4,
-        `${b.name} · ${b.plays} play${b.plays === 1 ? '' : 's'} paid here` +
-        `<b>${money(b.one)} per account, all time</b>` +
-        (missing
-          ? `<i>you hold none — this is what one would have earned</i>`
-          : `<i>you hold ${b.held}, earning ${money(b.yours)}</i>`));
-    });
-    hit.addEventListener('pointerleave', () => { bar.classList.remove('hot'); hideTip(); });
-    s.appendChild(hit);
-  });
-
-  host.appendChild(s);
-  if (!REDUCED && !host.dataset.drawn) {
-    $$('.mark-hbar', s).forEach((b, i) => {
-      b.style.animationDelay = (i * 45) + 'ms';
-      b.classList.add('growx');
-    });
-  }
-  host.dataset.drawn = '1';
-}
-
 /* ------------------------------------------------------------ the dashboard */
 function initPlaysDash() {
   const data = $('#payouts');
@@ -1532,47 +1403,6 @@ function initPlaysDash() {
     brokerChart(brokersEl, s.brokers);
     heroSpark(heroSparkEl, s.months);
 
-    // ---- insights ---------------------------------------------------------
-    // Deliberately over ALL rows, not the selected period: "should I open a
-    // Fennel account" is not a question about July, and answering it from one
-    // month of data would be the kind of small sample that reads as insight
-    // and behaves as noise.
-    const missed = missedByBroker(rows, accounts, names);
-    missedChart($('#chart-missing'), missed);
-    const missNote = $('#missing-note');
-    if (missNote) {
-      const gap = missed.filter(b => b.held === 0);
-      const worth = gap.reduce((a, b) => a + b.one, 0);
-      missNote.textContent = gap.length
-        ? `Amber bars are brokers you hold no account at. One account at each ` +
-          `would have earned ${money(worth)} all time — ${gap.map(b => b.name).join(', ')}.`
-        : 'You hold an account at every broker these alerts have paid at.';
-    }
-
-    const tt = timeToMoney(rows);
-    const ttMed = $('#kpi-tt-median'), ttP90 = $('#kpi-tt-p90'), ttNote = $('#kpi-tt-note');
-    if (ttMed) ttMed.textContent = tt ? `${tt.median}d` : '—';
-    if (ttP90) ttP90.textContent = tt ? `${tt.p90}d` : '—';
-    if (ttNote) {
-      ttNote.textContent = tt
-        ? `median across ${tt.n} paid play${tt.n === 1 ? '' : 's'}`
-        : 'no play has both dates yet';
-    }
-
-    // Concentration, over the rows that actually paid THIS reader.
-    const paid = s.detail.slice().sort((a, b) => b.amount - a.amount);
-    const conc = $('#kpi-conc'), concNote = $('#kpi-conc-note');
-    const top5 = paid.slice(0, 5).reduce((a, d) => a + d.amount, 0);
-    if (conc) conc.textContent = s.total > 0 ? Math.round(top5 / s.total * 100) + '%' : '—';
-    if (concNote) {
-      concNote.textContent = paid.length
-        ? `of ${money(s.total)} across ${paid.length} plays`
-        : 'of all your profit';
-    }
-    const bp = $('#kpi-bestplay'), bpNote = $('#kpi-bestplay-note');
-    if (bp) bp.textContent = paid.length ? money(paid[0].amount) : '—';
-    if (bpNote) bpNote.textContent = paid.length ? `${paid[0].sym} · ${paid[0].on}` : '';
-
     animate = false;
   };
 
@@ -1584,8 +1414,7 @@ function initPlaysDash() {
       // A period change is a deliberate act and a whole new series, so let it
       // draw itself again. Typing in the accounts panel is not: that fires per
       // keystroke, and re-running the animation forty times is a strobe.
-      [monthly, brokersEl, heroSparkEl, $('#chart-missing')]
-        .forEach(el => { if (el) delete el.dataset.drawn; });
+      [monthly, brokersEl, heroSparkEl].forEach(el => { if (el) delete el.dataset.drawn; });
       animate = true;
       paint();
     });
