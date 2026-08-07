@@ -746,15 +746,24 @@ function brokerNames() {
   return map;
 }
 
-function summarise(rows, accounts, month, names = {}) {
+/* `grain` cuts the same series finer. 'month' keys on YYYY-MM, 'day' on the
+   full date — same rows, same bucketing rule (the date ALERTED, so a play
+   alerted in July and sold in August books to July either way), same running
+   total. Switching resolution must never change the answer, only how finely it
+   is sliced, which is why there is one function rather than two. */
+function summarise(rows, accounts, month, names = {}, grain = 'month') {
+  const cut = key => grain === 'day' ? key : key.slice(0, 7);
   const byMonth = new Map();
   const byBroker = new Map();
   const detail = [];
   let total = 0, plays = 0;
 
   rows.forEach(r => {
-    const key = (r.on || '').slice(0, 7) || '—';
-    if (month && key !== month) return;
+    const on = r.on || '';
+    // The period chips are month-keyed whatever the chart resolution is: "July"
+    // has to mean July on both, or the filter and the bars disagree.
+    if (month && on.slice(0, 7) !== month) return;
+    const key = cut(on) || '—';
     // THE RULE: only your accounts at the brokers this play was sold at. A
     // broker the sell alert never named contributes nothing, however many
     // accounts you hold there.
@@ -1385,6 +1394,20 @@ function initPlaysDash() {
       // draw itself again. Typing in the accounts panel is not: that fires per
       // keystroke, and re-running the animation forty times is a strobe.
       [monthly, brokersEl, heroSparkEl].forEach(el => { if (el) delete el.dataset.drawn; });
+      animate = true;
+      paint();
+    });
+  });
+
+  $$('.chips.grain .chip').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (btn.dataset.grain === grain) return;
+      $$('.chips.grain .chip').forEach(b => b.classList.toggle('on', b === btn));
+      grain = btn.dataset.grain;
+      // A new resolution is a new series, so let it draw itself in — the same
+      // reason a period change does, and the same reason a keystroke in the
+      // accounts panel does not.
+      [monthly, heroSparkEl].forEach(el => { if (el) delete el.dataset.drawn; });
       animate = true;
       paint();
     });

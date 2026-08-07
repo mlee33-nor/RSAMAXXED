@@ -1412,6 +1412,11 @@
     color:var(--accent);cursor:pointer;text-decoration:underline;
   }
 
+  /* Day/month toggle above the profit chart. Its own row under the card
+     header, so the header stays a title and a caption. */
+  .chips.grain{margin:-6px 0 12px;padding:0 2px}
+  .chips.grain .chip.sm{padding:4px 11px;font-size:11.5px}
+
   /* ---- the hero figure: exactly one per view */
   .hero-row{display:grid;grid-template-columns:minmax(240px,.9fr) 2.1fr;gap:12px;align-items:stretch}
   @media(max-width:900px){ .hero-row{grid-template-columns:1fr} }

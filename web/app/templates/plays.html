@@ -348,12 +348,22 @@
       <div class="chart-grid">
         <div class="card chart-card">
           <div class="card-h">
-            <h3>Profit by month</h3>
+            <h3 id="profit-chart-title">Profit by month</h3>
             {# "the month alerted" is not decoration: a play alerted in July and
                sold in August books to JULY, and This Month inherits that rule.
                Dropping the basis from this line while adding a tile that
                depends on it would have been a quiet way to mislead. #}
-            <span class="muted" style="font-size:12px">bars, the month alerted · line, the running total</span>
+            <span class="muted" style="font-size:12px" id="profit-chart-basis">bars, the month alerted · line, the running total</span>
+          </div>
+          {# Day and month are the SAME series at two resolutions — same rows,
+             same bucketing rule, same running total — so switching cannot
+             change the answer, only how finely it is cut. Daily matters
+             because a reverse-split window is days long: "what did the plays
+             I could have bought on Tuesday end up worth" is a question the
+             month view cannot answer. #}
+          <div class="chips grain" role="group" aria-label="Chart resolution">
+            <button type="button" class="chip sm on" data-grain="month">By month</button>
+            <button type="button" class="chip sm" data-grain="day">By day</button>
           </div>
           <figure class="chart" id="chart-monthly"
                   aria-label="Theoretical profit booked per month, with the running total"></figure>
