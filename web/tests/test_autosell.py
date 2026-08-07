@@ -341,7 +341,8 @@ def test_the_sweep_catches_what_auto_sell_structurally_cannot(make_app):
     false for a row that did not just move. Without the sweep the day-one
     backlog sits there forever while every new play sails past it."""
     app = make_app()
-    for name in ("_autosell_sweep", "_autosell_sweep_disarm"):
+    for name in ("_autosell_sweep", "_autosell_sweep_disarm", "_sweep_say",
+                 "_sweep_progress"):
         setattr(app, name, types.MethodType(getattr(desktop_app.App, name), app))
     app._sweep_btn = types.SimpleNamespace(configure=lambda **kw: None)
     app._track_rows = [_row("GRNQ", "fractional"), _row("HCWB", "rounded_up")]
@@ -367,7 +368,8 @@ def test_the_sweep_catches_what_auto_sell_structurally_cannot(make_app):
 def test_the_sweep_will_not_fire_on_one_click(make_app):
     """It can queue a whole backlog at once, so it states the count and waits."""
     app = make_app()
-    for name in ("_autosell_sweep", "_autosell_sweep_disarm"):
+    for name in ("_autosell_sweep", "_autosell_sweep_disarm", "_sweep_say",
+                 "_sweep_progress"):
         setattr(app, name, types.MethodType(getattr(desktop_app.App, name), app))
     seen = []
     app._sweep_btn = types.SimpleNamespace(configure=lambda **kw: seen.append(kw))
@@ -384,7 +386,8 @@ def test_the_sweep_will_not_fire_on_one_click(make_app):
 
 def test_the_sweep_respects_market_hours(make_app):
     app = make_app(market="closed")
-    for name in ("_autosell_sweep", "_autosell_sweep_disarm"):
+    for name in ("_autosell_sweep", "_autosell_sweep_disarm", "_sweep_say",
+                 "_sweep_progress"):
         setattr(app, name, types.MethodType(getattr(desktop_app.App, name), app))
     app._sweep_btn = types.SimpleNamespace(configure=lambda **kw: None)
     app._track_rows = [_row("GRNQ", "fractional")]
@@ -401,7 +404,8 @@ def test_the_sweep_respects_market_hours(make_app):
 def test_the_sweep_skips_what_was_already_sold(make_app):
     """Same record auto-sell uses, so the two cannot double up on each other."""
     app = make_app(sold=["2026-08-06:GRNQ"])
-    for name in ("_autosell_sweep", "_autosell_sweep_disarm"):
+    for name in ("_autosell_sweep", "_autosell_sweep_disarm", "_sweep_say",
+                 "_sweep_progress"):
         setattr(app, name, types.MethodType(getattr(desktop_app.App, name), app))
     app._sweep_btn = types.SimpleNamespace(configure=lambda **kw: None)
     app._track_rows = [_row("GRNQ", "fractional")]
