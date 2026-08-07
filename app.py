@@ -5220,6 +5220,47 @@ class App(ctk.CTk):
         self._dist_canvas.pack(fill="x", padx=20, pady=(0, 16))
 
         # ================================================================
+        # DAILY REALIZED P/L, AND WHICH BROKER MADE IT
+        # ================================================================
+        # Monthly answers "is this working"; daily answers "what happened
+        # today", which is the question actually asked after a sell run. The
+        # per-broker split matters because the brokers are not interchangeable:
+        # only three hold fractions, so a day's profit landing entirely at
+        # Public and Robinhood means something different from the same figure
+        # spread across ten.
+        daily_pl_card = RoundedFrame(scroll_frame, bg_color=BG_CARD,
+                                     border_color=BORDER, radius=14)
+        daily_pl_card.pack(fill="x", pady=(0, 14))
+
+        dp_head = tk.Frame(daily_pl_card.inner, bg=BG_CARD)
+        dp_head.pack(fill="x", padx=20, pady=(16, 8))
+        tk.Label(dp_head, text="Daily Realized P/L", bg=BG_CARD, fg=TEXT_PRIMARY,
+                 font=(FONT_FAMILY, 12, "bold")).pack(side="left")
+        self._daily_pl_sub = tk.Label(dp_head, text="", bg=BG_CARD, fg=TEXT_MUTED,
+                                      font=(FONT_FAMILY, 9))
+        self._daily_pl_sub.pack(side="left", padx=(10, 0))
+
+        self._daily_pl_canvas = tk.Canvas(daily_pl_card.inner, bg=BG_CARD, height=190,
+                                          bd=0, highlightthickness=0)
+        self._daily_pl_canvas.pack(fill="x", padx=20, pady=(0, 10))
+
+        dp_cols = ("date", "pl", "brokers", "trades")
+        self._daily_pl_tree = ttk.Treeview(
+            daily_pl_card.inner, columns=dp_cols, show="headings", height=9,
+            selectmode="none")
+        for col, heading, w, anchor in [
+            ("date", "Day", 100, "w"),
+            ("pl", "Realized", 100, "center"),
+            ("brokers", "Where it came from", 460, "w"),
+            ("trades", "Sells", 60, "center"),
+        ]:
+            self._daily_pl_tree.heading(col, text=heading)
+            self._daily_pl_tree.column(col, width=w, anchor=anchor)
+        self._daily_pl_tree.pack(fill="x", padx=20, pady=(0, 16))
+        self._daily_pl_tree.tag_configure("win", foreground=GREEN)
+        self._daily_pl_tree.tag_configure("loss", foreground=RED)
+
+        # ================================================================
         # CLOSED TRADES TABLE — the money table
         # ================================================================
         closed_card = RoundedFrame(scroll_frame, bg_color=BG_CARD, border_color=BORDER, radius=14)
@@ -5435,6 +5476,7 @@ class App(ctk.CTk):
                 self._redraw_charts()
 
         self._chart_monthly: dict = {}
+        self._chart_daily_pl: dict = {}
         self._chart_returns: list = []
 
         self._equity_canvas.bind("<Configure>", _on_chart_resize)
@@ -5442,6 +5484,7 @@ class App(ctk.CTk):
         self._donut_canvas.bind("<Configure>", _on_chart_resize)
         self._daily_canvas.bind("<Configure>", _on_chart_resize)
         self._monthly_canvas.bind("<Configure>", _on_chart_resize)
+        self._daily_pl_canvas.bind("<Configure>", _on_chart_resize)
         self._dist_canvas.bind("<Configure>", _on_chart_resize)
 
         # Initial load
@@ -5450,12 +5493,14 @@ class App(ctk.CTk):
     def _redraw_charts(self) -> None:
         """Redraw all charts with cached data (called on canvas resize)."""
         if (self._chart_trades or self._chart_sym_data or self._chart_broker_data
-                or self._chart_monthly or self._chart_returns):
+                or self._chart_monthly or self._chart_returns
+                or self._chart_daily_pl):
             self._draw_equity_curve(self._chart_trades, self._chart_all_trades)
             self._draw_symbol_bars(self._chart_sym_data, self._chart_all_trades)
             self._draw_broker_donut(self._chart_broker_data)
             self._draw_daily_activity(self._chart_trades)
             self._draw_monthly_pl(self._chart_monthly)
+            self._draw_daily_pl(self._chart_daily_pl)
             self._draw_return_dist(self._chart_returns)
 
     def _make_kpi_tile(self, parent, title: str, hint: str, row: int, col: int) -> tk.Label:
@@ -5821,6 +5866,84 @@ class App(ctk.CTk):
         c.create_rectangle(W - 55, 8, W - 45, 18, fill=RED, outline="")
         c.create_text(W - 41, 13, text="Sells", fill=TEXT_MUTED, font=(FONT_FAMILY, 7), anchor="w")
 
+    def _draw_daily_pl(self, daily: dict) -> None:
+        """Realized P/L per day, each bar stacked by the broker that made it.
+
+        Stacked rather than grouped: the height is the day's total, which is
+        the number being looked for, and the segments answer "where from"
+        without a second chart. Losses hang below the zero line in the same
+        stack, so a day that made money at Public and lost it at Fidelity reads
+        as the small net it actually was rather than two unrelated bars.
+        """
+        c = self._daily_pl_canvas
+        c.delete("all")
+        c.update_idletasks()
+        W = max(c.winfo_width(), 300)
+        H = max(c.winfo_height(), 170)
+
+        days = sorted(daily.keys())[-30:]        # a month of trading
+        if not days:
+            c.create_text(W // 2, H // 2, text="No closed trades yet",
+                          fill=TEXT_MUTED, font=(FONT_FAMILY, 10))
+            return
+
+        pad_l, pad_r, pad_t, pad_b = 52, 12, 14, 26
+        iw = max(W - pad_l - pad_r, 40)
+        ih = max(H - pad_t - pad_b, 40)
+
+        totals = {d: sum(daily[d].values()) for d in days}
+        hi = max([v for v in totals.values() if v > 0] or [0])
+        lo = min([v for v in totals.values() if v < 0] or [0])
+        span = (hi - lo) or 1.0
+        zero_y = pad_t + ih * (hi / span)
+
+        # zero line + the two extremes, which is all the scale this needs
+        c.create_line(pad_l, zero_y, W - pad_r, zero_y, fill=BORDER)
+        for val, y in ((hi, pad_t), (lo, pad_t + ih)):
+            if val:
+                c.create_text(pad_l - 8, y, text=f"${val:,.0f}", anchor="e",
+                              fill=TEXT_MUTED, font=(FONT_FAMILY, 8))
+
+        # A stable colour per broker, taken from the palette rather than
+        # generated, so the same broker is the same colour every render.
+        palette = [ACCENT, GREEN, YELLOW, "#a78bfa", "#22d3ee", "#fb6f84",
+                   "#5b6172", "#9d9aff", "#34d39e", "#f2c14e"]
+        brokers = sorted({b for d in days for b in daily[d]})
+        colour = {b: palette[i % len(palette)] for i, b in enumerate(brokers)}
+
+        slot = iw / len(days)
+        bw = max(2.0, min(slot * 0.66, 26.0))
+        for i, d in enumerate(days):
+            cx = pad_l + slot * (i + 0.5)
+            up = zero_y
+            down = zero_y
+            for b, v in sorted(daily[d].items(), key=lambda kv: -kv[1]):
+                h = abs(v) / span * ih
+                if h < 0.5:
+                    continue
+                if v > 0:
+                    c.create_rectangle(cx - bw / 2, up - h, cx + bw / 2, up,
+                                       fill=colour[b], outline="")
+                    up -= h
+                else:
+                    c.create_rectangle(cx - bw / 2, down, cx + bw / 2, down + h,
+                                       fill=colour[b], outline="")
+                    down += h
+            # Only label days that fit, newest always.
+            if len(days) <= 10 or i == len(days) - 1 or i % max(1, len(days) // 6) == 0:
+                c.create_text(cx, H - pad_b + 12, text=d[5:], anchor="n",
+                              fill=TEXT_MUTED, font=(FONT_FAMILY, 7))
+
+        # Legend, so a colour never has to be guessed.
+        x = pad_l
+        for b in brokers:
+            c.create_rectangle(x, 2, x + 8, 10, fill=colour[b], outline="")
+            c.create_text(x + 12, 6, text=b.capitalize(), anchor="w",
+                          fill=TEXT_MUTED, font=(FONT_FAMILY, 7))
+            x += 16 + len(b) * 5.5
+            if x > W - 60:
+                break
+
     def _draw_monthly_pl(self, monthly: dict) -> None:
         """Vertical bar chart of realized P/L grouped by month."""
         c = self._monthly_canvas
@@ -6162,6 +6285,54 @@ class App(ctk.CTk):
             sd = bs.setdefault(t["symbol"], {"bought": 0.0, "buy_cost": 0.0})
             sd["bought"] += t["qty"]
             sd["buy_cost"] += (t["fill_price"] or 0) * t["qty"]
+
+        # ---- Daily realized P/L, split by the broker that produced it -------
+        #
+        # Priced per (broker, symbol), NOT off the symbol-wide average. Where a
+        # play was bought is where it was priced, and the same name routinely
+        # costs different amounts at different brokers — ARTL was $1.20 at
+        # Fidelity and $1.2299 at Robinhood. Using one blended figure would
+        # quietly move profit between brokers on this very breakdown.
+        #
+        # A close contributes nothing: a dissolved position was never sold, so
+        # attributing a day's profit to it would be inventing money.
+        daily_pl: Dict[str, Dict[str, float]] = {}
+        daily_sells: Dict[str, int] = {}
+        for t in trades:
+            if t["side"] != "sell":
+                continue
+            day = (t.get("timestamp") or "")[:10]
+            if not day:
+                continue
+            ab = alltime_broker_buy.get(t["broker"], {}).get(t["symbol"])
+            if not ab or not ab["bought"]:
+                continue          # no basis at this broker: cannot be priced
+            avg_b = ab["buy_cost"] / ab["bought"]
+            profit = ((t["fill_price"] or 0) - avg_b) * t["qty"]
+            daily_pl.setdefault(day, {})
+            daily_pl[day][t["broker"]] = daily_pl[day].get(t["broker"], 0.0) + profit
+            daily_sells[day] = daily_sells.get(day, 0) + 1
+
+        self._chart_daily_pl = daily_pl
+        self._draw_daily_pl(daily_pl)
+
+        self._daily_pl_tree.delete(*self._daily_pl_tree.get_children())
+        for day in sorted(daily_pl, reverse=True)[:40]:
+            per = daily_pl[day]
+            tot = sum(per.values())
+            where = "   ".join(
+                f"{b.capitalize()} {v:+,.2f}"
+                for b, v in sorted(per.items(), key=lambda kv: -abs(kv[1])))
+            self._daily_pl_tree.insert("", "end", values=(
+                day, f"${tot:+,.2f}", where, daily_sells.get(day, 0)),
+                tags=("win" if tot > 0 else "loss" if tot < 0 else "",))
+        if daily_pl:
+            best_day = max(daily_pl, key=lambda d: sum(daily_pl[d].values()))
+            self._daily_pl_sub.configure(
+                text=f"{len(daily_pl)} trading days   ·   best "
+                     f"${sum(daily_pl[best_day].values()):+,.2f} on {best_day}")
+        else:
+            self._daily_pl_sub.configure(text="")
 
         # ================================================================
         # UPDATE HERO CARD
