@@ -1313,11 +1313,20 @@ function initPlaysDash() {
   const auditBody = $('#audit-table tbody');
   const names = brokerNames();
   let month = '';                      // '' = all time
+  let grain = 'month';                 // 'month' | 'day' — chart resolution
   let accounts = {};
   let animate = true;
 
+  const grainTitle = $('#profit-chart-title'), grainBasis = $('#profit-chart-basis');
+
   const paint = () => {
-    const s = summarise(rows, accounts, month, names);
+    const s = summarise(rows, accounts, month, names, grain);
+    if (grainTitle) grainTitle.textContent = `Profit by ${grain}`;
+    if (grainBasis) {
+      grainBasis.textContent = grain === 'day'
+        ? 'bars, the day alerted · line, the running total'
+        : 'bars, the month alerted · line, the running total';
+    }
 
     heroCount(heroTotal, s.total, animate);
     if (heroSub) {
@@ -1329,7 +1338,9 @@ function initPlaysDash() {
     // the selected period: switching the chips must not change what this
     // month has made.
     if (kpiThis && thisKey) {
-      const tm = summarise(rows, accounts, thisKey, names);
+      // Explicitly month-grained: this tile answers "what has THIS MONTH
+      // made", and that question does not change when the chart is cut daily.
+      const tm = summarise(rows, accounts, thisKey, names, 'month');
       kpiThis.textContent = money(tm.total);
       if (kpiThisNote) {
         kpiThisNote.textContent = tm.plays
