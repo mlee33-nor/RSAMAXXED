@@ -1379,6 +1379,15 @@ function initPlaysDash() {
         ? Math.round(100 * s.plays / funnelBase) + '% of alerts' : '';
     }
 
+    // The Sells and Tracking tabs list the brokers the ALERT named, which is
+    // the feed's fact and not the reader's. Unmarked, "Schwab x1" on an exit
+    // reads as "you hold one Schwab account" — so a broker the reader holds
+    // nothing at is struck through and says so. It paid them nothing, and the
+    // figures above have always known that; only the page did not show it.
+    $$('[data-broker-tag]').forEach(el => {
+      el.classList.toggle('unheld', !(accounts[el.dataset.brokerTag] > 0));
+    });
+
     profitChart(monthly, s.months);
     brokerChart(brokersEl, s.brokers);
     heroSpark(heroSparkEl, s.months);

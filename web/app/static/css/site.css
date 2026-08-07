@@ -1113,6 +1113,13 @@
   }
   .leg b{font-family:var(--mono);color:var(--text);font-weight:600;margin-left:3px}
 
+  /* A broker the reader holds nothing at. The count beside it belongs to the
+     ALERTER, so it is shown (it is what the alert said) but struck through and
+     dimmed, because it paid this reader nothing. */
+  .unheld{opacity:.4;text-decoration:line-through;text-decoration-thickness:1px}
+  .leg.unheld{border-style:dashed}
+  .leg.unheld b{color:var(--text-3)}
+
   .exit-note{
     margin:10px 0 0;padding:9px 11px;border-radius:9px;font-size:12px;line-height:1.55;
     background:rgba(242,193,78,.06);border:1px solid rgba(242,193,78,.16);color:var(--amber);
