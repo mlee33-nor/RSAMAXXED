@@ -62,6 +62,16 @@ ENV_FILE = ROOT_DIR / ".env"
 LOG_DIR = ROOT_DIR / "logs"  # persistent trade_results.log lives here
 CUSTOM_ACCOUNTS_FILE = ROOT_DIR / "custom_accounts.json"
 MIRROR_STATE_FILE = ROOT_DIR / "mirror_state.json"
+AUTOSELL_STATE_FILE = ROOT_DIR / "autosell_state.json"
+
+# How many plays one TRACK pull is allowed to auto-sell.
+#
+# A cap, not a throttle. If a pull ever reports fifteen plays going fractional
+# at once, the likely cause is a parsing change or a board rebuild rather than
+# fifteen real corporate actions — and the failure mode of "sell everything it
+# thinks it sees" is unrecoverable. Anything over the cap is logged and left for
+# a human, which is the right way round.
+AUTOSELL_MAX_PER_PULL = 4
 
 load_dotenv(ENV_FILE)
 
@@ -1149,6 +1159,17 @@ class App(ctk.CTk):
         self._track_busy: bool = False
         self._track_loop_id: Optional[str] = None
         self._exit_busy: bool = False   # a holdings read for an exit is running
+
+        # Auto-sell. Restored from disk but ALWAYS re-armed deliberately in the
+        # sense that matters: `sold` is what stops a restart re-selling a play
+        # the previous run already closed. Built here, before _build_frames,
+        # because the Exits page renders the toggles.
+        _as = self._load_autosell_state()
+        self._autosell_enabled = tk.BooleanVar(value=bool(_as.get("enabled")))
+        self._autosell_dry_run = tk.BooleanVar(value=bool(_as.get("dry_run", True)))
+        self._autosell_roundups = tk.BooleanVar(value=bool(_as.get("include_roundups")))
+        self._autosell_sold: set = set(_as.get("sold") or [])
+        self._autosell_queue: List[Any] = []
 
         self._configure_styles()
         self._build_shell()
@@ -4571,11 +4592,18 @@ class App(ctk.CTk):
         except Exception:
             return None
 
-    def _fetch_fill_price(self, broker: str, symbol: str, side: str = "buy") -> Optional[float]:
-        """Try to get current price from broker holdings after a trade.
+    def _fetch_quote_price(self, broker: str, symbol: str, side: str = "buy") -> Optional[float]:
+        """The market price around the time of a trade. NOT a fill.
 
-        For sells, the position may be gone from holdings, so fall back to
-        fetching the current market price from Yahoo Finance.
+        Renamed from `_fetch_fill_price`, which is what it was called for as
+        long as it has existed and is the reason nobody noticed: it reads
+        `h.price` out of get_holdings() — the CURRENT market price — and falls
+        back to Yahoo when the position has already gone. Neither is an
+        execution, and on a thin post-split name the two can be far apart.
+
+        Its answer is looked up once per batch and stamped onto every account,
+        so it cannot represent a per-order fill even in principle. Rows written
+        from it are marked PRICE_QUOTE; see trade_journal.is_estimated.
         """
         try:
             mod = _load_broker(broker)
@@ -4660,7 +4688,7 @@ class App(ctk.CTk):
             # (after selling, position may be gone and Yahoo may fail for OTC stocks)
             pre_trade_price = None
             if side == "sell" and not dry_run:
-                pre_trade_price = self._fetch_fill_price(broker, symbol, "buy")
+                pre_trade_price = self._fetch_quote_price(broker, symbol, "buy")
 
             try:
                 output: BrokerOutput = mod.execute_trade(
@@ -4681,7 +4709,7 @@ class App(ctk.CTk):
             has_success = any(a.ok for a in output.accounts)
             if has_success and not dry_run:
                 self.after(0, lambda b=broker: self._log(f"  {b}: fetching fill price..."))
-                fill_price = self._fetch_fill_price(broker, symbol, side)
+                fill_price = self._fetch_quote_price(broker, symbol, side)
                 if fill_price is None and pre_trade_price is not None:
                     fill_price = pre_trade_price
 
@@ -4701,14 +4729,26 @@ class App(ctk.CTk):
                     fail_accounts += 1
                     summary["errors"].append(f"{acct.account_id}: {acct.message}")
                 if acct.ok and not dry_run:
+                    # order_id is the broker's own handle on this order, and it
+                    # is the only thing that makes the real fill recoverable
+                    # later. It was being returned by the API, carried this far,
+                    # and then thrown away.
+                    #
+                    # price_source says what fill_price IS. It is one quote,
+                    # looked up once for the whole batch and stamped onto every
+                    # account -- not an execution. Recording that honestly is
+                    # what stops nine orders spread over seven minutes reading
+                    # as nine fills at an identical price.
                     trade_journal.record_trade(
                         broker=broker, account_id=acct.account_id,
                         side=side, symbol=symbol, qty=float(qty),
                         fill_price=fill_price,
+                        order_id=getattr(acct, "order_id", None),
+                        price_source=trade_journal.PRICE_QUOTE,
                     )
 
             if fill_price is not None:
-                lines.append(f"  Fill price: ${fill_price:.2f}")
+                lines.append(f"  Quoted price: ${fill_price:.2f}")
 
             # Persist the full per-account result (fills AND failures with their
             # reason) so "which accounts didn't buy, and why" is always
@@ -5021,10 +5061,36 @@ class App(ctk.CTk):
         self._hero_avg_return = self._make_hero_mini(hero_right_grid, "AVG RETURN", "—", 1, 2)
 
         # ================================================================
+        # COVERAGE — what the figure above does NOT include
+        # ================================================================
+        # Packed only when there is something to say, so it is never furniture.
+        #
+        # A total that quietly drops rows overstates its own coverage, and this
+        # one drops them in both directions at once: a symbol sold with no
+        # recorded buy vanishes from realized entirely (TOPT, $339), while one
+        # whose buys have no price counts as 100% profit because its cost
+        # divides out to zero (MASK, $6.48). A third kind is subtler and has no
+        # visible symptom at all — LHSW has 26 buys of which 13 carry no price,
+        # so its cost is summed over 13 and divided by 26, and the profit is
+        # simply too big.
+        self._cov_card = RoundedFrame(scroll_frame, bg_color=BG_CARD,
+                                      border_color=YELLOW, radius=RAD_MD)
+        cov_body = tk.Frame(self._cov_card.inner, bg=BG_CARD)
+        cov_body.pack(fill="x", padx=SP_XL, pady=SP_MD)
+        tk.Label(cov_body, text=f"{icon('warning')}  WHAT THIS FIGURE LEAVES OUT",
+                 bg=BG_CARD, fg=YELLOW, font=(ICON_FONT, 10, "bold")).pack(anchor="w")
+        self._cov_lines = tk.Frame(cov_body, bg=BG_CARD)
+        self._cov_lines.pack(fill="x", pady=(8, 0))
+
+        # ================================================================
         # RISK & PERFORMANCE METRICS — quant KPI tiles
         # ================================================================
         adv_card = RoundedFrame(scroll_frame, bg_color=BG_CARD, border_color=BORDER, radius=RAD_MD)
         adv_card.pack(fill="x", pady=(0, SP_LG))
+        # The coverage strip slots in above this one when it has something to
+        # report. Held as a reference so it lands under the hero rather than at
+        # the foot of the page.
+        self._cov_before = adv_card
 
         adv_head = tk.Frame(adv_card.inner, bg=BG_CARD)
         adv_head.pack(fill="x", padx=SP_XL, pady=(SP_LG, SP_SM))
@@ -5982,6 +6048,11 @@ class App(ctk.CTk):
                 losses += 1
                 worst = min(worst, profit)
 
+        # What the figure above cannot see. Computed from the same two maps the
+        # P/L loop just used, so it can never disagree with the number it
+        # qualifies.
+        self._render_coverage(period_sold_syms, alltime_buy, sym_data, all_trades)
+
         closed_count = wins + losses
         win_rate = (wins / closed_count * 100) if closed_count > 0 else 0
         grand_cost = sum(c[4] for c in closed_list)
@@ -6251,6 +6322,85 @@ class App(ctk.CTk):
         self._recent_trades_tree.tag_configure("sell", foreground=RED)
 
         self._log("Stats: refreshed")
+
+    def _render_coverage(self, sold_syms, alltime_buy, sym_data, all_trades) -> None:
+        """Say out loud what the realized figure excludes, or hide entirely.
+
+        Three faults, and they do NOT all push the same way, which is why they
+        are listed separately rather than summed into one apology:
+
+          no recorded buy    the symbol is skipped outright, so real proceeds
+                             are missing from the total. UNDERSTATES.
+          buys with no price   cost divides out to zero and the whole of the
+                             proceeds books as profit. OVERSTATES.
+          some buys unpriced   cost is summed over the priced ones and divided
+                             by all of them, so the average is too low and the
+                             profit too high. OVERSTATES, invisibly — the
+                             symbol is present and nothing looks wrong.
+        """
+        if not hasattr(self, "_cov_lines"):
+            return
+        for w in self._cov_lines.winfo_children():
+            w.destroy()
+
+        no_buy, no_price, partial = {}, {}, {}
+        for sym in sold_syms:
+            ab = alltime_buy.get(sym)
+            rev = (sym_data.get(sym) or {}).get("sell_rev", 0.0)
+            if not ab or not ab["qty"]:
+                no_buy[sym] = rev
+            elif ab["cost"] <= 0:
+                no_price[sym] = rev
+            else:
+                nulls = sum(1 for t in all_trades
+                            if t["symbol"] == sym and t["side"] == "buy"
+                            and t.get("fill_price") is None)
+                if nulls:
+                    total = sum(1 for t in all_trades
+                                if t["symbol"] == sym and t["side"] == "buy")
+                    partial[sym] = (nulls, total)
+
+        estimated = sum(1 for t in all_trades if trade_journal.is_estimated(t))
+
+        rows = []
+        if no_buy:
+            rows.append((RED,
+                         f"${sum(no_buy.values()):,.2f} of sales are missing from this "
+                         f"total — no buy was ever recorded for "
+                         f"{', '.join(sorted(no_buy))}, so there is no cost to subtract."))
+        if no_price:
+            rows.append((YELLOW,
+                         f"${sum(no_price.values()):,.2f} counts as pure profit — every "
+                         f"recorded buy of {', '.join(sorted(no_price))} has no fill "
+                         f"price, so its cost works out to $0.00."))
+        if partial:
+            detail = ", ".join(f"{s} ({n} of {t})" for s, (n, t) in sorted(partial.items()))
+            rows.append((YELLOW,
+                         f"Cost basis is understated where some buys carry no price: "
+                         f"{detail}. Those symbols look more profitable than they were."))
+        if estimated:
+            rows.append((TEXT_MUTED,
+                         f"{estimated:,} of {len(all_trades):,} trades are priced from a "
+                         f"market QUOTE, not an executed fill — one lookup per batch, "
+                         f"stamped onto every account. Treat every figure here as an "
+                         f"estimate until brokers report real fills."))
+
+        if not rows:
+            self._cov_card.pack_forget()
+            return
+
+        for colour, text in rows:
+            tk.Label(self._cov_lines, text="•  " + text, bg=BG_CARD, fg=colour,
+                     font=(FONT_FAMILY, 9), justify="left", anchor="w",
+                     wraplength=820).pack(fill="x", pady=(0, 5))
+        # Directly under the hero it qualifies and above everything derived from
+        # it. `before` a widget captured at build time, not an index into a
+        # child list that changes — pack() on its own would append it to the
+        # bottom of the page, four cards away from the number it is about.
+        if getattr(self, "_cov_before", None) is not None:
+            self._cov_card.pack(fill="x", pady=(0, 14), before=self._cov_before)
+        else:
+            self._cov_card.pack(fill="x", pady=(0, 14))
 
     # ---- Simulator --------------------------------------------------------
 
@@ -7873,9 +8023,74 @@ class App(ctk.CTk):
                                      font=(FONT_FAMILY, 8))
         self._exits_stamp.pack(side="right")
 
+        self._build_autosell_card(frame)
+
         outer, self._exits_list = self._make_vscroll(frame)
         outer.pack(fill="both", expand=True)
         self._render_exits()
+
+    def _build_autosell_card(self, parent) -> None:
+        """The arming switch, and the sentence that says what arming it means.
+
+        Sits at the top of the page it acts on rather than in Settings: this
+        places live orders without asking, and a control like that belongs where
+        its consequences are listed, not two screens away from them.
+        """
+        card = RoundedFrame(parent, bg_color=BG_CARD, border_color=BORDER, radius=RAD_MD)
+        card.pack(fill="x", pady=(0, 12))
+        body = tk.Frame(card.inner, bg=BG_CARD)
+        body.pack(fill="x", padx=SP_XL, pady=SP_MD)
+
+        row = tk.Frame(body, bg=BG_CARD)
+        row.pack(fill="x")
+        tk.Label(row, text=f"{icon('lightning')}  AUTO-SELL FRACTIONALS", bg=BG_CARD,
+                 fg=TEXT_PRIMARY, font=(ICON_FONT, 11, "bold")).pack(side="left")
+        self._autosell_pill = tk.Label(row, text="", bg=BG_CARD,
+                                       font=(FONT_FAMILY, 9, "bold"))
+        self._autosell_pill.pack(side="right")
+
+        tk.Label(body, bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
+                 justify="left", anchor="w", wraplength=760,
+                 text=("A fraction is what's left when a split did NOT round you up — "
+                       "there is no round-up coming, and it drifts down while it sits. "
+                       "When armed, a board pull that turns a play fractional reads your "
+                       "live holdings and sells it at the brokers that hold fractions "
+                       "(Public, Robinhood, SoFi) without asking. Market hours only; "
+                       f"at most {AUTOSELL_MAX_PER_PULL} plays per pull; never the same "
+                       "play twice.")).pack(fill="x", pady=(6, 10))
+
+        opts = tk.Frame(body, bg=BG_CARD)
+        opts.pack(fill="x")
+        for var, text in ((self._autosell_enabled, "Arm auto-sell"),
+                          (self._autosell_dry_run, "Dry run (build the order, don't send it)"),
+                          (self._autosell_roundups, "Round-ups too, not just fractionals")):
+            tk.Checkbutton(
+                opts, text=text, variable=var, command=self._autosell_toggled,
+                bg=BG_CARD, fg=TEXT_SECONDARY, activebackground=BG_CARD,
+                activeforeground=TEXT_PRIMARY, selectcolor=BG_INPUT,
+                font=(FONT_FAMILY, 9), anchor="w", bd=0, highlightthickness=0,
+            ).pack(anchor="w")
+
+        self._autosell_toggled(save=False)
+
+    def _autosell_toggled(self, save: bool = True) -> None:
+        armed = bool(self._autosell_enabled.get())
+        dry = bool(self._autosell_dry_run.get())
+        if not armed:
+            text, colour = "DISARMED", TEXT_MUTED
+        elif dry:
+            text, colour = "ARMED · DRY RUN", YELLOW
+        else:
+            text, colour = "ARMED · LIVE ORDERS", RED
+        if hasattr(self, "_autosell_pill"):
+            self._autosell_pill.configure(text=text, fg=colour)
+        if save:
+            self._save_autosell_state()
+            if armed and not dry:
+                # Said once, plainly, at the moment it becomes true.
+                self._push_notification(
+                    "Auto-sell is live — fractional plays will be sold without "
+                    "confirmation", "warning")
 
     def _exits_group_header(self, parent, title: str, sub: str, count: int) -> None:
         box = tk.Frame(parent, bg=BG_PRIMARY)
@@ -8044,12 +8259,17 @@ class App(ctk.CTk):
             f"Reading {task.symbol} balances at {', '.join(task.brokers)}…", "info")
         self._run_in_thread(self._exit_resolve_worker, task)
 
-    def _exit_resolve_worker(self, task) -> None:
+    def _exit_resolve_worker(self, task, then=None) -> None:
         """Fetch holdings from just the eligible brokers, in parallel.
 
         Only the brokers that can actually fill this order are contacted — a
         fractional play never touches the seven that paid cash, so this is three
         sessions rather than ten.
+
+        `then` receives the ResolvedExit on the UI thread. It defaults to the
+        confirmation dialog, which is what a human clicking Sell wants; auto-sell
+        passes its own so it can reuse this holdings read rather than keeping a
+        second copy of it in step with this one.
         """
         outputs: Dict[str, Any] = {}
         lock = threading.Lock()
@@ -8076,7 +8296,8 @@ class App(ctk.CTk):
             t.join()
 
         resolved = lifecycle.resolve(task, outputs)
-        self.after(0, lambda: self._exit_confirm(resolved))
+        cb = then or self._exit_confirm
+        self.after(0, lambda: cb(resolved))
 
     def _exit_confirm(self, resolved) -> None:
         """Show the resolved order and require a click before anything is sent.
@@ -8225,6 +8446,173 @@ class App(ctk.CTk):
         for leg in resolved.legs:
             self._run_in_thread(self._trade_worker, leg.key, "sell",
                                 task.symbol, leg.qty, dry_run, batch)
+
+    # ---- Auto-sell fractionals ---------------------------------------------
+    #
+    # A fraction is a wasting asset. It exists because a reverse split did NOT
+    # round the position up, so there is no round-up coming and nothing to wait
+    # for — only a thin post-split name that drifts down while it sits. Selling
+    # it the moment the board says "fractional" is the whole of the edge, and
+    # doing that by hand means noticing a notification, opening a tab, reading
+    # holdings and clicking three brokers.
+    #
+    # So this closes the last gap in a pipeline that already existed:
+    #
+    #   lifecycle.pull() -> Transition.became_fractional
+    #   sell_worklist()  -> SellTask, per broker, renamed tickers handled
+    #   resolve()        -> the exact fraction, read from LIVE HOLDINGS
+    #   _exit_fire()     -> the order, with the batch machinery and the
+    #                       double-submit guard a manual sell gets
+    #
+    # It places real orders with nobody watching, so every guard below is load
+    # bearing and none of them is decoration:
+    #
+    #   OFF BY DEFAULT     it must be switched on deliberately, once.
+    #   MARKET HOURS ONLY  a market order into a closed book is how you find out
+    #                      what a wide spread costs. Out of hours it queues.
+    #   ONE AT A TIME      _exit_fire refuses to start while a trade is running,
+    #                      so a queue that fired in parallel would silently drop
+    #                      every play after the first.
+    #   SOLD ONCE, EVER    keyed by alert_date:SYMBOL and remembered on disk. A
+    #                      board that re-reports a row, a restart mid-pull, a
+    #                      re-pull an hour later — none of them may sell twice.
+    #   A CAP PER PULL     see AUTOSELL_MAX_PER_PULL.
+    #   DRY RUN            builds the real ticket against the live session and
+    #                      stops short of submitting, so a full cycle can be
+    #                      watched before any money moves.
+
+    def _load_autosell_state(self) -> Dict[str, Any]:
+        import json
+        if AUTOSELL_STATE_FILE.exists():
+            try:
+                return json.loads(AUTOSELL_STATE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {"enabled": False, "dry_run": True, "include_roundups": False, "sold": []}
+
+    def _save_autosell_state(self) -> None:
+        import json
+        state = {
+            "enabled": bool(self._autosell_enabled.get()),
+            "dry_run": bool(self._autosell_dry_run.get()),
+            "include_roundups": bool(self._autosell_roundups.get()),
+            # Bounded: this only has to outlive a re-pull of the same board, and
+            # an unbounded list would grow for the life of the install.
+            "sold": list(self._autosell_sold)[-500:],
+        }
+        try:
+            AUTOSELL_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        except OSError as exc:
+            self._log(f"Auto-sell: could not save state — {exc}", "warn")
+
+    def _autosell_key(self, task) -> str:
+        """One play's identity. The ALERT symbol, deliberately: a play that
+        renames mid-life (AGAE -> AIFA) is still the same position, and keying
+        on the sell symbol would let it be sold once under each name."""
+        return f"{task.alert_date}:{task.alert_symbol.upper()}"
+
+    def _autosell_consider(self, changes) -> None:
+        """Decide what this TRACK pull should sell, and start the queue."""
+        if not getattr(self, "_autosell_enabled", None) or not self._autosell_enabled.get():
+            return
+
+        want_roundups = bool(self._autosell_roundups.get())
+        fresh = [c for c in changes
+                 if c.became_fractional or (want_roundups and c.became_sellable)]
+        if not fresh:
+            return
+
+        # Only rows this pull moved, and only ones we hold somewhere. The
+        # worklist already scopes brokers by status, so a fractional play offers
+        # only the three that hold fractions.
+        moved = {f"{c.alert_date}:{c.symbol.upper()}" for c in fresh}
+        tasks = [t for t in lifecycle.sell_worklist(self._track_rows)
+                 if f"{t.alert_date}:{t.alert_symbol.upper()}" in moved and t.brokers]
+
+        tasks = [t for t in tasks if self._autosell_key(t) not in self._autosell_sold]
+        if not tasks:
+            return
+
+        if len(tasks) > AUTOSELL_MAX_PER_PULL:
+            held = [t.symbol for t in tasks[AUTOSELL_MAX_PER_PULL:]]
+            self._log(f"Auto-sell: {len(tasks)} plays became sellable at once — "
+                      f"selling {AUTOSELL_MAX_PER_PULL}, leaving {', '.join(held)} "
+                      f"for you. That many at once usually means the board "
+                      f"changed shape, not that {len(tasks)} splits resolved.", "warn")
+            self._push_notification(
+                f"Auto-sell held back {len(held)} plays — check the Exits tab", "warning")
+            tasks = tasks[:AUTOSELL_MAX_PER_PULL]
+
+        state, label, _ = _market_status()
+        if state != "open":
+            # Queued, not dropped. The next pull inside the session picks them
+            # up because they are still unsold and still on the board.
+            self._log(f"Auto-sell: {len(tasks)} play(s) ready but {label.lower()} — "
+                      f"holding until the open.", "meta")
+            self._push_notification(
+                f"{len(tasks)} fractional play(s) waiting for the open", "info")
+            return
+
+        self._autosell_queue.extend(tasks)
+        self._log(f"Auto-sell: queued {len(tasks)} play(s) — "
+                  f"{', '.join(t.symbol for t in tasks)}"
+                  + (" [DRY RUN]" if self._autosell_dry_run.get() else ""))
+        self._autosell_pump()
+
+    def _autosell_pump(self) -> None:
+        """Start the next play once the previous one has finished.
+
+        Strictly sequential: _exit_fire refuses to begin while a trade is in
+        flight, so firing the queue in parallel would place the first order and
+        silently discard the rest.
+        """
+        if not self._autosell_queue:
+            return
+        if getattr(self, "_trade_in_flight", False):
+            self.after(5000, self._autosell_pump)
+            return
+
+        task = self._autosell_queue.pop(0)
+        key = self._autosell_key(task)
+        if key in self._autosell_sold:              # a re-queue between ticks
+            self.after(200, self._autosell_pump)
+            return
+
+        # Claimed BEFORE the holdings read, not after the order. Everything from
+        # here on can fail in ways that leave an order placed, and selling twice
+        # is far worse than not selling automatically once.
+        self._autosell_sold.add(key)
+        self._save_autosell_state()
+
+        self._log(f"Auto-sell: reading {task.symbol} holdings at "
+                  f"{', '.join(task.brokers)}…")
+        self._run_in_thread(self._exit_resolve_worker, task, self._autosell_fire)
+
+    def _autosell_fire(self, resolved) -> None:
+        """Place the resolved sell — the one step a human would have clicked."""
+        task = resolved.task
+        if not resolved.ok:
+            why = []
+            if resolved.missing:
+                why.append(f"no position at {', '.join(resolved.missing)}")
+            if resolved.errors:
+                why.append(f"couldn't read {', '.join(resolved.errors)}")
+            self._log(f"Auto-sell: {task.symbol} — nothing to sell "
+                      f"({'; '.join(why) or 'no balances found'})", "warn")
+            self._push_notification(f"Auto-sell skipped {task.symbol}: "
+                                    f"{'; '.join(why) or 'nothing to sell'}", "warning")
+            self.after(1000, self._autosell_pump)
+            return
+
+        dry = bool(self._autosell_dry_run.get())
+        self._push_notification(
+            f"Auto-selling {task.symbol} — {resolved.describe()}"
+            + (" [DRY RUN]" if dry else ""),
+            "info" if dry else "success")
+        self._exit_fire(resolved, dry_run=dry)
+        # The next play waits for this batch; _autosell_pump re-arms itself
+        # while a trade is in flight rather than racing it.
+        self.after(5000, self._autosell_pump)
 
     # ---- TRACK polling -----------------------------------------------------
 
@@ -8437,6 +8825,15 @@ class App(ctk.CTk):
         if changes:
             self._log(f"TRACK: {len(changes)} row(s) changed, "
                       f"{len(newly)} newly sellable")
+
+        # After the notifications, so the log reads in the order things happened
+        # and a sell is never announced before the board that caused it.
+        try:
+            self._autosell_consider(changes)
+        except Exception as exc:
+            # Auto-sell must never take the TRACK pull down with it: the board
+            # refreshing is worth more than the convenience on top of it.
+            self._log(f"Auto-sell: skipped this pull — {exc}", "warn")
 
         # A fresh board is new data by definition, so drop the cached
         # fingerprint before rendering. _render_exits updates the summary.

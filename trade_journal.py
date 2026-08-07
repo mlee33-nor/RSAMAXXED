@@ -31,6 +31,29 @@ def _save(trades: List[Dict[str, Any]]) -> None:
     _FILE.write_text(json.dumps(trades, indent=2), encoding="utf-8")
 
 
+#: What `fill_price` on a row actually is.
+#:
+#: "fill"  the broker told us what the order executed at. Trustworthy.
+#: "quote" the market price at the moment we placed it, which is NOT the same
+#:         thing and can be far from it on a thin post-split name.
+#: ""      recorded before this field existed, so unknown — treat as "quote".
+PRICE_FILL = "fill"
+PRICE_QUOTE = "quote"
+
+
+def is_estimated(trade: Dict[str, Any]) -> bool:
+    """True when this row's price is a quote rather than an executed fill.
+
+    Every row written before 2026-08-06 is estimated: the app called what it
+    named `_fetch_fill_price`, which asks get_holdings() for the CURRENT market
+    price and falls back to Yahoo — it never read an execution. One lookup per
+    batch was then stamped onto every account in it, which is why the journal
+    contains nine Wells Fargo orders placed across 7.4 minutes all priced at
+    exactly $0.08.
+    """
+    return trade.get("price_source") != PRICE_FILL
+
+
 def record_trade(
     broker: str,
     account_id: str,
@@ -38,8 +61,17 @@ def record_trade(
     symbol: str,
     qty: float,
     fill_price: Optional[float] = None,
+    order_id: Optional[str] = None,
+    price_source: str = "",
 ) -> Dict[str, Any]:
-    """Append a trade entry and return it."""
+    """Append a trade entry and return it.
+
+    `order_id` is the broker's own identifier for the order. It was previously
+    returned by the API, carried as far as AccountOutput.order_id, and then
+    dropped here — which is why no trade in the journal can be checked against
+    the broker that placed it. Keeping it costs one field and is the only thing
+    that makes a fill recoverable after the fact.
+    """
     entry = {
         "id": str(uuid.uuid4()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -49,6 +81,8 @@ def record_trade(
         "symbol": symbol.upper(),
         "qty": float(qty),
         "fill_price": fill_price,
+        "order_id": order_id or None,
+        "price_source": price_source or PRICE_QUOTE,
     }
     with _lock:
         trades = _load()
