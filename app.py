@@ -8588,15 +8588,44 @@ class App(ctk.CTk):
                   f"{', '.join(task.brokers)}…")
         self._run_in_thread(self._exit_resolve_worker, task, self._autosell_fire)
 
+    def _autosell_retry(self, task, why: str) -> None:
+        """Give a play back so a later pull can try it again.
+
+        The claim in _autosell_pump is taken BEFORE the holdings read, because
+        the alternative — claiming it after the order — risks selling twice.
+        The cost of that choice is that anything which fails between the claim
+        and the order would strand the play as "sold" forever, so every such
+        path has to hand it back explicitly.
+        """
+        self._autosell_sold.discard(self._autosell_key(task))
+        self._save_autosell_state()
+        self._log(f"Auto-sell: {task.symbol} put back — {why}", "meta")
+
     def _autosell_fire(self, resolved) -> None:
         """Place the resolved sell — the one step a human would have clicked."""
         task = resolved.task
+
+        # Something else started while we were reading holdings. _exit_fire
+        # would refuse, and the play was claimed before the read — so without
+        # this it is marked sold and never sold.
+        if getattr(self, "_trade_in_flight", False):
+            self._autosell_retry(task, "another trade started mid-read")
+            self._autosell_queue.insert(0, task)
+            self.after(5000, self._autosell_pump)
+            return
+
         if not resolved.ok:
             why = []
             if resolved.missing:
                 why.append(f"no position at {', '.join(resolved.missing)}")
             if resolved.errors:
                 why.append(f"couldn't read {', '.join(resolved.errors)}")
+            # A broker we could not READ is unknown, not empty — a dead session
+            # or a timeout says nothing about whether the shares are there, so
+            # hand it back and let the next pull look again. An empty position
+            # is a real answer (already sold by hand) and stays claimed.
+            if resolved.errors:
+                self._autosell_retry(task, f"couldn't read {', '.join(resolved.errors)}")
             self._log(f"Auto-sell: {task.symbol} — nothing to sell "
                       f"({'; '.join(why) or 'no balances found'})", "warn")
             self._push_notification(f"Auto-sell skipped {task.symbol}: "
