@@ -973,12 +973,26 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
     if not sym:
         return BrokerOutput(broker=BROKER, state="failed", accounts=[], message="Invalid symbol")
 
+    # Float, not int.
+    #
+    # Robinhood is one of the three brokers that actually HOLD fractions (see
+    # rsa_feed.FRACTIONAL_BROKERS), so a reverse split routinely leaves it with
+    # 0.1 of a share to sell. int(float("0.1")) is 0, which failed the guard
+    # below and returned "Invalid qty" without ever reaching an order — making
+    # the broker most likely to be holding a fraction the only one of the three
+    # that could never sell one. Public keeps a Decimal and SoFi keeps a float;
+    # this was the odd one out.
     try:
-        q = int(float(qty))
-        if q <= 0:
+        q_f = float(qty)
+        if q_f <= 0:
             raise ValueError
     except Exception:
         return BrokerOutput(broker=BROKER, state="failed", accounts=[], message=f"Invalid qty: {qty!r}")
+
+    # A whole number stays an int, so every order that works today is submitted
+    # byte-for-byte as it is now and only the fractional case takes a new path.
+    fractional = abs(q_f - round(q_f)) > 1e-9
+    q = q_f if fractional else int(round(q_f))
 
     outs: List[AccountOutput] = []
 
@@ -992,9 +1006,21 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
 
     # Prefer legacy-style obj.order() if present; fallback to order_buy_market/order_sell_market
     orders_obj = getattr(rh, "orders", None)
-    order_fn = getattr(rh, "order", None)
-    if not callable(order_fn) and orders_obj is not None:
-        order_fn = getattr(orders_obj, "order", None)
+
+    def _rh_fn(name: str):
+        """A robin-stocks helper, wherever this build keeps it.
+
+        The library has exposed these on the module and on its `orders`
+        submodule at different versions, and the existing lookup for `order`
+        already had to try both — this just gives the other helpers the same
+        treatment instead of a second copy of it.
+        """
+        f = getattr(rh, name, None)
+        if not callable(f) and orders_obj is not None:
+            f = getattr(orders_obj, name, None)
+        return f if callable(f) else None
+
+    order_fn = _rh_fn("order")
 
     for _acct_i, (display_label, acct_num, pickle_name) in enumerate(_ACCOUNTS or []):
         if _acct_i > 0:
@@ -1008,7 +1034,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
                 f"side: {side_norm.upper()}\n"
                 f"symbol: {sym}\n"
                 f"quantity: {q}\n"
-                f"order_type: MARKET\n"
+                f"order_type: {'MARKET (fractional)' if fractional else 'MARKET'}\n"
                 f"tif: DAY\n"
                 f"account: {display_label}\n"
                 f"account_number: ****{acct_num[-4:] if acct_num else '----'}"
@@ -1023,34 +1049,40 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
 
             resp = None
 
-            if callable(order_fn):
-                # Legacy order call shape
-                try:
-                    resp = order_fn(
-                        symbol=sym,
-                        quantity=q,
-                        side=side_norm,
-                        account_number=acct_num,
-                        timeInForce="gfd",
+            if fractional:
+                # A fraction has to go through the fractional endpoint. The
+                # ordinary market order rejects a quantity below one share, so
+                # falling back to it here would turn a working sell into an API
+                # error rather than a filled order.
+                frac_fn = _rh_fn(f"order_{side_norm}_fractional_by_quantity")
+                if frac_fn is None:
+                    raise RuntimeError(
+                        f"this robin-stocks build has no "
+                        f"order_{side_norm}_fractional_by_quantity, so {q} of a "
+                        f"share cannot be traded"
                     )
-                except TypeError:
-                    # Some versions differ; fall through to market helpers
-                    resp = None
+                resp = frac_fn(sym, q, account_number=acct_num, timeInForce="gfd")
+            else:
+                if callable(order_fn):
+                    # Legacy order call shape
+                    try:
+                        resp = order_fn(
+                            symbol=sym,
+                            quantity=q,
+                            side=side_norm,
+                            account_number=acct_num,
+                            timeInForce="gfd",
+                        )
+                    except TypeError:
+                        # Some versions differ; fall through to market helpers
+                        resp = None
 
-            if resp is None:
-                # Fallback: market helpers
-                if orders_obj is None:
-                    raise RuntimeError("Robinhood orders API not available")
-
-                if side_norm == "buy":
-                    fn = getattr(orders_obj, "order_buy_market", None)
-                else:
-                    fn = getattr(orders_obj, "order_sell_market", None)
-
-                if not callable(fn):
-                    raise RuntimeError("Robinhood market order function not available")
-
-                resp = fn(sym, q, account_number=acct_num)
+                if resp is None:
+                    # Fallback: market helpers
+                    fn = _rh_fn(f"order_{side_norm}_market")
+                    if fn is None:
+                        raise RuntimeError("Robinhood market order function not available")
+                    resp = fn(sym, q, account_number=acct_num)
 
             oid = resp.get("id") if isinstance(resp, dict) else None
             outs.append(AccountOutput(account_id=display_label, ok=True, message="order placed", order_id=oid))
