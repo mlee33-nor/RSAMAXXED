@@ -262,6 +262,97 @@ def test_the_sold_list_survives_a_restart(make_app, tmp_path):
     assert saved["enabled"] is True
 
 
+# -------------------------------------------- against the REAL Transition
+# Everything above drives _autosell_consider with a stand-in, which is fine for
+# the branching and useless for this: these are properties of the real object,
+# and a stand-in that happens to have the right attributes proves nothing about
+# whether the real one does.
+
+def _real_changes(board_before, board_after):
+    """Run two real pulls and return the transitions the second produced."""
+    import rsa_feed
+    from datetime import date
+    today = date(2026, 8, 6)
+    state, _ = lifecycle.apply(
+        rsa_feed.parse_lifecycle_message({"content": board_before}, today=today),
+        {"rows": {}})
+    _, changes = lifecycle.apply(
+        rsa_feed.parse_lifecycle_message({"content": board_after}, today=today),
+        state)
+    return changes
+
+
+PENDING = "\U0001f514 8/6 - GRNQ ⏳"
+FRACTIONAL = "\U0001f514 8/6 - GRNQ \U0001f9e9"
+
+
+def test_the_transition_really_carries_what_auto_sell_reads_off_it():
+    """_autosell_consider keys on c.alert_date and c.symbol. If either were
+    missing the pull handler would swallow the AttributeError and auto-sell
+    would silently never fire — the worst possible failure for this feature."""
+    c = _real_changes(PENDING, FRACTIONAL)[0]
+    assert c.alert_date == "2026-08-06"
+    assert c.symbol == "GRNQ"
+    assert c.became_fractional
+
+
+def test_the_first_pull_on_a_fresh_install_sells_nothing(make_app):
+    """A cold start sees the whole board at once — 80-odd rows, many already
+    fractional. They are seeded, not changed, and auto-selling the lot on first
+    launch would be catastrophic and completely automatic."""
+    import rsa_feed
+    from datetime import date
+    _, changes = lifecycle.apply(
+        rsa_feed.parse_lifecycle_message({"content": FRACTIONAL},
+                                         today=date(2026, 8, 6)),
+        {"rows": {}})
+    assert changes and all(c.seeded for c in changes)
+    assert not any(c.became_fractional for c in changes)
+
+    app = make_app()
+    app._track_rows = [_row("GRNQ", "fractional")]
+    orig = lifecycle.held_accounts
+    lifecycle.held_accounts = lambda trades=None: {"GRNQ": {"Public": 3}}
+    try:
+        app._autosell_consider(changes)
+    finally:
+        lifecycle.held_accounts = orig
+    assert app._autosell_queue == []
+
+
+def test_cash_in_lieu_is_never_sold():
+    """It resolved to CASH. There is no position, so an order would be rejected
+    at best and sell something else at worst."""
+    assert lifecycle.brokers_for("cash_in_lieu") == ()
+    assert lifecycle.sell_worklist(
+        [_row("ALUR", "cash_in_lieu")], {"ALUR": {"Public": 3}}) == []
+
+
+def test_a_play_still_pending_is_never_sold():
+    """The split has not happened. Nothing has come back to sell."""
+    assert lifecycle.brokers_for("pending") == ()
+    assert lifecycle.sell_worklist(
+        [_row("HCWB", "pending")], {"HCWB": {"Public": 3}}) == []
+
+
+def test_a_play_is_handed_back_when_it_could_not_be_read(make_app):
+    """The claim is taken BEFORE the holdings read, because claiming after the
+    order risks selling twice. The price of that is that anything failing in
+    between would strand the play as 'sold' and it would never sell at all.
+
+    A broker we could not READ is unknown, not empty: a dead session says
+    nothing about whether the shares are there."""
+    app = make_app()
+    app._autosell_retry = types.MethodType(desktop_app.App._autosell_retry, app)
+    task = lifecycle.SellTask(
+        symbol="GRNQ", alert_symbol="GRNQ", alert_date="2026-08-06",
+        status="fractional", brokers=("Public",), accounts=3, skipped_brokers=(),
+    )
+    app._autosell_sold.add("2026-08-06:GRNQ")
+    app._autosell_retry(task, "session dead")
+    assert "2026-08-06:GRNQ" not in app._autosell_sold
+
+
 def test_a_renamed_play_is_keyed_by_what_we_bought(make_app):
     """AGAE -> AIFA is one position. Keyed on the sell symbol it could be sold
     once under each name."""
