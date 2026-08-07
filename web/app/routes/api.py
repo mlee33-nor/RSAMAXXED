@@ -438,7 +438,10 @@ def ingest_plays(body: FeedIn, db: Session = Depends(get_db)) -> dict[str, Any]:
             status_code=413, detail=f"send at most {config.MAX_PLAYS_PER_INGEST} rows per request"
         )
 
-    counts = {"buys": 0, "sells": 0, "roundups": 0, "lifecycle": 0}
+    # `notes` counts CORRECTIONS to exits that already existed — see below. It
+    # is reported separately from `sells` because nothing was published; a
+    # caption this parser previously got wrong was repaired.
+    counts = {"buys": 0, "sells": 0, "roundups": 0, "lifecycle": 0, "notes": 0}
 
     def _fresh(model, ids: list[str]) -> set[str]:
         if not ids:
@@ -460,6 +463,30 @@ def ingest_plays(body: FeedIn, db: Session = Depends(get_db)) -> dict[str, Any]:
         counts["buys"] += 1
 
     seen = _fresh(PlayExit, [s.source_id for s in body.sells])
+    # An exit's NOTE is the one field that may be corrected in place.
+    #
+    # Everything else about an exit is a fact the alerter published — a price, a
+    # date, the brokers it cleared at — and insert-only is what makes those
+    # unforgeable. The note is not a fact, it is this parser's reading of the
+    # commentary around the numbers, and a parser bug therefore writes a wrong
+    # note that no amount of republishing can take back.
+    #
+    # That is not hypothetical: a missing "+" on one total line published
+    # "$159.84**" as the caption on BYAH and EDBL, two exits it had nothing to
+    # do with. The parser is fixed, but the rows were already stored and the
+    # skip below is what kept them wrong. Correcting an annotation is not
+    # rewriting history; leaving a known-wrong caption on a paid board is worse
+    # than the narrow write this allows.
+    if body.sells:
+        stored = {row.source_id: row for row in db.scalars(
+            select(PlayExit).where(
+                PlayExit.source_id.in_([s.source_id for s in body.sells])))}
+        for s in body.sells:
+            row = stored.get(s.source_id)
+            if row is not None and (s.note or "")[:2000] != (row.note or ""):
+                row.note = (s.note or "")[:2000]
+                counts["notes"] = counts.get("notes", 0) + 1
+
     for s in body.sells:
         if s.source_id in seen:
             continue

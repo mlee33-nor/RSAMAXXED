@@ -51,3 +51,8 @@ publish_feed_task.bat
 # The full feed archive — the product itself. Never on the public repo.
 feed_archive.json
 feed_archive.corrupt.json
+
+# Backups of the trade journal. trades.json is ignored; its backups must be
+# too — one of them was committed to a PUBLIC repo on 2026-08-07.
+trades.*.bak.json
+autosell_state.json

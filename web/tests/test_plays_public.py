@@ -13,6 +13,7 @@ ruin the page if they broke:
 """
 from __future__ import annotations
 
+import copy
 import os
 import pathlib
 import re
@@ -415,6 +416,54 @@ def test_the_checkbox_is_hidden_until_the_script_that_makes_it_work_has_run():
     assert ".own,.markbar{display:none}" in css
     assert "html.js .own" in css
     assert "classList.add('js')" in js
+
+
+def test_a_parser_bug_in_a_note_can_be_corrected(anon):
+    """An exit's note is the ONE field ingest may rewrite.
+
+    Price, date and brokers are facts the alerter published, and insert-only is
+    what makes them unforgeable. A note is this parser's reading of the prose
+    around them — so a parser bug writes a caption that no amount of
+    republishing can take back. It happened: a missing "+" on one total line
+    published "$159.84**" against two unrelated tickers.
+    """
+    payload = {"sells": [{"source_id": "note:1", "symbol": "BYAH",
+                          "sell_date": "2026-08-07", "exit_price": 3.22,
+                          "proceeds_low": 19.32, "note": "$159.84**",
+                          "legs": [{"broker": "Chase", "accounts_low": 6,
+                                    "accounts_high": 6}]}]}
+    assert anon.post("/api/v1/plays/ingest", headers=KEY,
+                     json=payload).json()["inserted"]["sells"] == 1
+
+    payload["sells"][0]["note"] = ""
+    again = anon.post("/api/v1/plays/ingest", headers=KEY, json=payload).json()
+    assert again["inserted"]["sells"] == 0        # nothing republished
+    assert again["inserted"]["notes"] == 1        # the caption was repaired
+
+    board = _board_of(anon)
+    row = next(e for e in board.exits if e.source_id == "note:1")
+    assert row.note == ""
+    # And the facts are untouched by the correction.
+    assert row.exit_price == 3.22 and row.proceeds_low == 19.32
+
+
+def test_the_money_on_an_exit_can_never_be_rewritten(anon):
+    """The other half of that promise. Re-sending an exit with a different
+    price must change nothing — otherwise anyone holding the ingest key could
+    restate what a play was worth after the fact."""
+    first = {"sells": [{"source_id": "immutable:1", "symbol": "ZZTOP",
+                        "sell_date": "2026-08-07", "exit_price": 1.00,
+                        "proceeds_low": 10.0, "legs": []}]}
+    anon.post("/api/v1/plays/ingest", headers=KEY, json=first)
+
+    tampered = copy.deepcopy(first)
+    tampered["sells"][0]["exit_price"] = 999.0
+    tampered["sells"][0]["proceeds_low"] = 9990.0
+    anon.post("/api/v1/plays/ingest", headers=KEY, json=tampered)
+
+    row = next(e for e in _board_of(anon).exits if e.source_id == "immutable:1")
+    assert row.exit_price == 1.00
+    assert row.proceeds_low == 10.0
 
 
 # ------------------------------------------------------ the payout arithmetic

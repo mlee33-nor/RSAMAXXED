@@ -335,6 +335,86 @@ def test_a_play_still_pending_is_never_sold():
         [_row("HCWB", "pending")], {"HCWB": {"Public": 3}}) == []
 
 
+def test_the_sweep_catches_what_auto_sell_structurally_cannot(make_app):
+    """Auto-sell fires on a TRANSITION, so a position that was already
+    fractional when you armed it is never picked up — `became_fractional` is
+    false for a row that did not just move. Without the sweep the day-one
+    backlog sits there forever while every new play sails past it."""
+    app = make_app()
+    for name in ("_autosell_sweep", "_autosell_sweep_disarm"):
+        setattr(app, name, types.MethodType(getattr(desktop_app.App, name), app))
+    app._sweep_btn = types.SimpleNamespace(configure=lambda **kw: None)
+    app._track_rows = [_row("GRNQ", "fractional"), _row("HCWB", "rounded_up")]
+
+    orig = lifecycle.held_accounts
+    lifecycle.held_accounts = lambda trades=None: {"GRNQ": {"Public": 3},
+                                                   "HCWB": {"Public": 1}}
+    try:
+        # No transitions at all — auto-sell has nothing to react to.
+        app._autosell_consider([])
+        assert app._autosell_queue == []
+
+        app._autosell_sweep()                 # first click arms
+        assert app._autosell_queue == []
+        app._autosell_sweep()                 # second click fires
+    finally:
+        lifecycle.held_accounts = orig
+
+    # GRNQ only: the sweep is for fractionals, and a round-up is not one.
+    assert [t.symbol for t in app._autosell_queue] == ["GRNQ"]
+
+
+def test_the_sweep_will_not_fire_on_one_click(make_app):
+    """It can queue a whole backlog at once, so it states the count and waits."""
+    app = make_app()
+    for name in ("_autosell_sweep", "_autosell_sweep_disarm"):
+        setattr(app, name, types.MethodType(getattr(desktop_app.App, name), app))
+    seen = []
+    app._sweep_btn = types.SimpleNamespace(configure=lambda **kw: seen.append(kw))
+    app._track_rows = [_row("GRNQ", "fractional")]
+    orig = lifecycle.held_accounts
+    lifecycle.held_accounts = lambda trades=None: {"GRNQ": {"Public": 3}}
+    try:
+        app._autosell_sweep()
+    finally:
+        lifecycle.held_accounts = orig
+    assert app._autosell_queue == []
+    assert any("Confirm" in (kw.get("text") or "") for kw in seen)
+
+
+def test_the_sweep_respects_market_hours(make_app):
+    app = make_app(market="closed")
+    for name in ("_autosell_sweep", "_autosell_sweep_disarm"):
+        setattr(app, name, types.MethodType(getattr(desktop_app.App, name), app))
+    app._sweep_btn = types.SimpleNamespace(configure=lambda **kw: None)
+    app._track_rows = [_row("GRNQ", "fractional")]
+    orig = lifecycle.held_accounts
+    lifecycle.held_accounts = lambda trades=None: {"GRNQ": {"Public": 3}}
+    try:
+        app._autosell_sweep()
+        app._autosell_sweep()
+    finally:
+        lifecycle.held_accounts = orig
+    assert app._autosell_queue == []
+
+
+def test_the_sweep_skips_what_was_already_sold(make_app):
+    """Same record auto-sell uses, so the two cannot double up on each other."""
+    app = make_app(sold=["2026-08-06:GRNQ"])
+    for name in ("_autosell_sweep", "_autosell_sweep_disarm"):
+        setattr(app, name, types.MethodType(getattr(desktop_app.App, name), app))
+    app._sweep_btn = types.SimpleNamespace(configure=lambda **kw: None)
+    app._track_rows = [_row("GRNQ", "fractional")]
+    orig = lifecycle.held_accounts
+    lifecycle.held_accounts = lambda trades=None: {"GRNQ": {"Public": 3}}
+    try:
+        app._autosell_sweep()
+        app._autosell_sweep()
+    finally:
+        lifecycle.held_accounts = orig
+    assert app._autosell_queue == []
+
+
 def test_a_play_is_handed_back_when_it_could_not_be_read(make_app):
     """The claim is taken BEFORE the holdings read, because claiming after the
     order risks selling twice. The price of that is that anything failing in
