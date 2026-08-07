@@ -415,6 +415,104 @@ def test_the_sweep_skips_what_was_already_sold(make_app):
     assert app._autosell_queue == []
 
 
+# ------------------------------------------------- the list must keep moving
+# A queue that dies silently is worse than one that never started: the first
+# few plays sold, so you have no reason to go and check the fifth.
+
+class _Pumped(_App):
+    """Records that the pump was re-scheduled instead of swallowing it."""
+
+    def after(self, ms, fn=None):
+        if fn is not None:
+            self.scheduled.append(fn)
+        return None
+
+
+def _resolver(tmp_path, monkeypatch, **kw):
+    monkeypatch.setattr(desktop_app, "AUTOSELL_STATE_FILE",
+                        tmp_path / "autosell_state.json")
+    monkeypatch.setattr(desktop_app, "_market_status", lambda: ("open", "Open", None))
+    app = _Pumped(tmp_path, **kw)
+    app.scheduled = []
+    for name in ("_autosell_resolve", "_autosell_abandon", "_autosell_retry",
+                 "_autosell_fire", "_autosell_key", "_save_autosell_state"):
+        setattr(app, name, types.MethodType(getattr(desktop_app.App, name), app))
+    return app
+
+
+def _task(symbol="GRNQ"):
+    return lifecycle.SellTask(
+        symbol=symbol, alert_symbol=symbol, alert_date="2026-08-06",
+        status="fractional", brokers=("Public",), accounts=3, skipped_brokers=(),
+    )
+
+
+def test_a_play_that_blows_up_does_not_stop_the_list(tmp_path, monkeypatch):
+    """_exit_resolve_worker ends by SCHEDULING its callback. If anything above
+    that line raises, the callback never runs, nothing calls the pump again, and
+    every remaining play sits in the queue forever with no error on screen."""
+    app = _resolver(tmp_path, monkeypatch)
+    app._exit_resolve_worker = lambda task, then: (_ for _ in ()).throw(
+        RuntimeError("broker module exploded"))
+    app._autosell_sold.add("2026-08-06:GRNQ")
+
+    app._autosell_resolve(_task())
+    # the abandon callback was scheduled...
+    assert app.scheduled, "the failure was swallowed"
+    app.scheduled.pop(0)()
+    # ...it unclaimed the play, said so, and queued the next pump
+    assert "2026-08-06:GRNQ" not in app._autosell_sold
+    assert any("failed" in m for m in app.logs)
+    assert app.scheduled, "the queue was not resumed"
+
+
+def test_an_order_that_throws_is_loud_but_stays_claimed(tmp_path, monkeypatch):
+    """The order may or may not have gone out. Re-selling something already
+    filled is the one outcome worse than stopping, so this one does NOT
+    unclaim — it shouts and moves on."""
+    app = _resolver(tmp_path, monkeypatch)
+    app._exit_fire = lambda resolved, dry_run=False: (_ for _ in ()).throw(
+        RuntimeError("session died mid-order"))
+    app._autosell_sold.add("2026-08-06:GRNQ")
+    resolved = types.SimpleNamespace(
+        task=_task(), ok=True, missing=(), errors=(),
+        describe=lambda: "Public x3", legs=[])
+
+    app._autosell_fire(resolved)
+    assert "2026-08-06:GRNQ" in app._autosell_sold      # NOT retried
+    assert any("order failed" in m for m in app.logs)
+    assert app.scheduled, "the queue was not resumed"
+
+
+def test_an_already_sold_position_is_skipped_and_the_list_continues(tmp_path, monkeypatch):
+    """Sold by hand outside the tool, so the journal still thinks we hold it.
+    The live holdings read finds nothing, and that is a real answer — skip it,
+    keep it claimed so it stops reappearing, and carry on."""
+    app = _resolver(tmp_path, monkeypatch)
+    app._autosell_sold.add("2026-08-06:GRNQ")
+    resolved = types.SimpleNamespace(
+        task=_task(), ok=False, missing=("Robinhood",), errors=(),
+        describe=lambda: "", legs=[])
+
+    app._autosell_fire(resolved)
+    assert "2026-08-06:GRNQ" in app._autosell_sold      # stays claimed
+    assert any("nothing to sell" in m for m in app.logs)
+    assert app.scheduled, "the queue was not resumed"
+
+
+def test_a_broker_that_could_not_be_read_is_retried_later(tmp_path, monkeypatch):
+    """Unknown is not empty. A dead session says nothing about the shares."""
+    app = _resolver(tmp_path, monkeypatch)
+    app._autosell_sold.add("2026-08-06:GRNQ")
+    resolved = types.SimpleNamespace(
+        task=_task(), ok=False, missing=(), errors=("Public",),
+        describe=lambda: "", legs=[])
+
+    app._autosell_fire(resolved)
+    assert "2026-08-06:GRNQ" not in app._autosell_sold  # handed back
+    assert app.scheduled
+
+
 def test_a_play_is_handed_back_when_it_could_not_be_read(make_app):
     """The claim is taken BEFORE the holdings read, because claiming after the
     order risks selling twice. The price of that is that anything failing in

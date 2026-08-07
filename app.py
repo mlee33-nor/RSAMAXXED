@@ -73,6 +73,14 @@ AUTOSELL_STATE_FILE = ROOT_DIR / "autosell_state.json"
 # a human, which is the right way round.
 AUTOSELL_MAX_PER_PULL = 4
 
+# The queue polls every 5s while a trade is in flight. 120 ticks = 10 minutes,
+# after which it stops waiting and says which plays it abandoned. A browser
+# broker can genuinely take minutes, so this is well past slow — it is the
+# ceiling on "something is wedged", and the alternative is a queue that waits
+# in silence for the life of the process, which looks exactly like auto-sell
+# being switched off.
+AUTOSELL_WAIT_TICKS = 120
+
 load_dotenv(ENV_FILE)
 
 
@@ -1170,6 +1178,7 @@ class App(ctk.CTk):
         self._autosell_roundups = tk.BooleanVar(value=bool(_as.get("include_roundups")))
         self._autosell_sold: set = set(_as.get("sold") or [])
         self._autosell_queue: List[Any] = []
+        self._autosell_waits: int = 0     # pump ticks spent behind a busy trade
 
         self._configure_styles()
         self._build_shell()
@@ -8635,10 +8644,30 @@ class App(ctk.CTk):
         silently discard the rest.
         """
         if not self._autosell_queue:
+            self._autosell_waits = 0
             return
         if getattr(self, "_trade_in_flight", False):
+            # Wait, but not forever. A broker that hangs holds _trade_in_flight
+            # true, and without a ceiling the rest of the list waits behind it
+            # in silence for the life of the process — which reads exactly like
+            # auto-sell being off. Say so, then stand down rather than spinning
+            # a timer every five seconds until the app is closed.
+            self._autosell_waits = getattr(self, "_autosell_waits", 0) + 1
+            if self._autosell_waits > AUTOSELL_WAIT_TICKS:
+                left = ", ".join(t.symbol for t in self._autosell_queue)
+                self._autosell_waits = 0
+                self._autosell_queue.clear()
+                self._log(f"Auto-sell: a trade has been running for "
+                          f"{AUTOSELL_WAIT_TICKS * 5 // 60} minutes — giving up on "
+                          f"{left}. They stay on the Exits tab to sell by hand.",
+                          "warn")
+                self._push_notification(
+                    f"Auto-sell stalled behind a slow trade — {left} not sold",
+                    "warning")
+                return
             self.after(5000, self._autosell_pump)
             return
+        self._autosell_waits = 0
 
         task = self._autosell_queue.pop(0)
         key = self._autosell_key(task)
@@ -8654,7 +8683,33 @@ class App(ctk.CTk):
 
         self._log(f"Auto-sell: reading {task.symbol} holdings at "
                   f"{', '.join(task.brokers)}…")
-        self._run_in_thread(self._exit_resolve_worker, task, self._autosell_fire)
+        self._run_in_thread(self._autosell_resolve, task)
+
+    def _autosell_resolve(self, task) -> None:
+        """Read holdings for one play, then hand it to _autosell_fire.
+
+        A wrapper, and it is the difference between a queue and a list that
+        stops at the first bad play. _exit_resolve_worker ends by scheduling its
+        callback; if anything above that line raises — a broker module blowing
+        up on import, a session object in a state lifecycle.resolve did not
+        expect — the callback never runs, nothing ever calls the pump again, and
+        every remaining play sits in the queue forever with no error on screen.
+
+        A queue that dies silently is worse than one that never started, because
+        the first four plays sold and you have no reason to check the fifth.
+        """
+        try:
+            self._exit_resolve_worker(task, self._autosell_fire)
+        except Exception as exc:                # noqa: BLE001 — must never escape
+            self.after(0, lambda t=task, e=exc: self._autosell_abandon(t, str(e)))
+
+    def _autosell_abandon(self, task, why: str) -> None:
+        """Give up on one play, say so, and keep going."""
+        self._autosell_retry(task, why)         # unclaim: nothing was placed
+        self._log(f"Auto-sell: {task.symbol} failed — {why}", "error")
+        self._push_notification(f"Auto-sell couldn't handle {task.symbol}: {why}",
+                                "warning")
+        self.after(1000, self._autosell_pump)
 
     def _autosell_retry(self, task, why: str) -> None:
         """Give a play back so a later pull can try it again.
@@ -8706,7 +8761,16 @@ class App(ctk.CTk):
             f"Auto-selling {task.symbol} — {resolved.describe()}"
             + (" [DRY RUN]" if dry else ""),
             "info" if dry else "success")
-        self._exit_fire(resolved, dry_run=dry)
+        try:
+            self._exit_fire(resolved, dry_run=dry)
+        except Exception as exc:                # noqa: BLE001
+            # The order may or may not have gone out, so this does NOT unclaim
+            # the play: a retry that re-sells something already filled is the
+            # one outcome worse than stopping. It is loud instead, and the
+            # queue carries on to the next name.
+            self._log(f"Auto-sell: {task.symbol} order failed — {exc}", "error")
+            self._push_notification(
+                f"{task.symbol} may not have sold — check the broker", "error")
         # The next play waits for this batch; _autosell_pump re-arms itself
         # while a trade is in flight rather than racing it.
         self.after(5000, self._autosell_pump)
