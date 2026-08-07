@@ -212,11 +212,36 @@ def test_dashboard_matches_app_py(paired, real_trades):
     assert f"${expected:+,.2f}" in page, f"dashboard did not render ${expected:+,.2f}"
 
 
-def test_zero_basis_symbol_is_disclosed(paired):
-    """MASK was bought with fill_price=None. Say so; don't quietly book it."""
+def test_zero_basis_symbol_is_disclosed(paired, real_trades):
+    """A buy with fill_price=None costs $0, so its whole proceeds book as
+    profit. Say so; don't quietly book it.
+
+    Named MASK until 2026-08-07, when MASK was given a real basis by
+    backfill_basis.py and the test started failing for the best possible
+    reason. Pinning a symbol pinned a DEFECT in the developer's own journal, so
+    the test broke when the defect was repaired and would have said nothing at
+    all once every symbol was priced. It now asks the page about whatever is
+    actually unpriced today, and skips when the answer is nothing.
+    """
     browser, _device, _token = paired
+    priced, unpriced, sold = set(), set(), set()
+    for t in real_trades:
+        if t.get("side") == "sell":
+            sold.add(t["symbol"])
+            continue
+        (priced if t.get("fill_price") is not None else unpriced).add(t["symbol"])
+    # Mirrors analytics.summarize: a symbol qualifies only when EVERY buy is
+    # unpriced (one priced buy still leaves a cost to divide by) AND it has been
+    # sold. An unsold position with no basis distorts nothing yet — there is no
+    # realized profit for it to overstate.
+    zero_basis = (unpriced - priced) & sold
+    if not zero_basis:
+        pytest.skip("no sold symbol has a zero cost basis — nothing to disclose")
+
     page = browser.get("/app").text
-    assert "MASK" in page and "overstated" in page
+    assert "overstated" in page
+    for sym in zero_basis:
+        assert sym in page, f"{sym} has no cost basis and the page does not say so"
 
 
 def test_csv_export_contains_every_trade(paired, real_trades):

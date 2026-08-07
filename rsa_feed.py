@@ -408,7 +408,24 @@ _SELL_LEG = re.compile(
 )
 
 # '**+$14.36**' / '**+ $22-46**' / '**+23.80**'
-_SELL_TOTAL = re.compile(r"^\s*\*{0,2}\s*\+\s*\$?\s*(?P<amt>[\d,.]+(?:\s*-\s*\$?[\d,.]+)?)\s*\*{0,2}\s*$")
+# The proceeds line that closes a block. The leading "+" is OPTIONAL, and that
+# is not cosmetic: it was mandatory, and on 2026-08-07 an alert whose three
+# blocks ended
+#
+#     **+$19.32**      BYAH
+#     **+$40.80**      EDBL
+#     **$159.84**      FFAI   <- no plus
+#
+# lost FFAI entirely. Its block never closed, so no exit was emitted, and the
+# orphaned line then fell through to the commentary branch and was hung on the
+# other two as a note. One character the alerter happened not to type cost the
+# largest of the three exits, and produced a phantom "$159.84**" caption on the
+# other two. A human reads all three of those lines as a total; so does this.
+_SELL_TOTAL = re.compile(r"^\s*\*{0,2}\s*\+?\s*\$?\s*(?P<amt>[\d,.]+(?:\s*-\s*\$?[\d,.]+)?)\s*\*{0,2}\s*$")
+
+# A line that is only money (and possibly markdown). Never commentary — see the
+# note branch below.
+_BARE_MONEY = re.compile(r"^[\s*+$]*[\d,.]+(?:\s*-\s*\$?[\d,.]+)?[\s*]*$")
 
 
 def _strip_noise(text: str) -> str:
@@ -497,8 +514,20 @@ def parse_sell_message(msg: dict) -> tuple[list[SellAlert], list[RoundUp]]:
 
         # Anything else on its own line is commentary. The fraction warning on
         # VMAR is exactly the kind of thing a customer needs to read.
+        #
+        # A bare money figure never is. It is a proceeds line this parser failed
+        # to claim, and hanging it on every exit in the message publishes a
+        # caption like "$159.84**" against two unrelated tickers — which is
+        # exactly what happened while the "+" above was mandatory. Belt and
+        # braces: the regex now claims that line, and if a future format ever
+        # slips past it again the result is a dropped note rather than a wrong
+        # one attached to somebody else's exit.
+        if _BARE_MONEY.match(line):
+            continue
         if line.startswith("*") or len(line) > 40:
-            notes.append(line.lstrip("*").strip())
+            # Discord bold/italic is markup, not content. Left in, a note reads
+            # as "**mind the fraction**" on a page that renders no markdown.
+            notes.append(line.strip("*_` ").strip())
 
     if notes and sells:
         # The note applies to the message, so hang it on every exit in it.
