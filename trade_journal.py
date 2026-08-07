@@ -40,6 +40,31 @@ def _save(trades: List[Dict[str, Any]]) -> None:
 PRICE_FILL = "fill"
 PRICE_QUOTE = "quote"
 
+#: A position that LEFT an account without a sale this tool placed.
+#:
+#: The journal only learns about trades it executes, so a position can vanish
+#: for reasons it never sees — most often a reverse split settling to CASH IN
+#: LIEU at a broker that does not hold fractions. Seven of the ten do exactly
+#: that, and the shares stop existing the moment the split runs.
+#:
+#: It is its own side because neither existing one can say this honestly:
+#:
+#:   a sell at no price     books the entire cost basis as a loss. $198 of
+#:                          dissolved positions would become $198 of invented
+#:                          losses.
+#:   a sell at some price   invents proceeds nobody received.
+#:   leaving it open        is what produces a $428 "deployed" figure of which
+#:                          $198 is shares that have not existed for weeks.
+#:
+#: So a close records the ONE thing actually known — the position is gone — and
+#: stays out of the profit arithmetic entirely, where `unaccounted()` reports it
+#: rather than letting it quietly become a number.
+SIDE_CLOSE = "close"
+
+#: Why a position was closed. Free text, but these are the ones that recur.
+CLOSE_CASH_IN_LIEU = "cash_in_lieu"
+CLOSE_RECONCILED = "reconciled"     # the broker simply does not have it
+
 
 
 def is_estimated(trade: Dict[str, Any]) -> bool:
@@ -90,6 +115,74 @@ def record_trade(
         trades.append(entry)
         _save(trades)
     return entry
+
+
+def record_close(
+    broker: str,
+    account_id: str,
+    symbol: str,
+    qty: float,
+    reason: str = CLOSE_RECONCILED,
+    note: str = "",
+) -> Dict[str, Any]:
+    """Record that a position is gone, without claiming it was sold.
+
+    See SIDE_CLOSE. This is the only honest entry for a holding that a
+    corporate action dissolved: it removes the position so the sell worklist
+    and the deployed figure stop counting shares that do not exist, and it
+    carries NO price, so nothing downstream can turn it into profit or loss.
+    """
+    entry = {
+        "id": str(uuid.uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "broker": broker.lower(),
+        "account_id": account_id,
+        "side": SIDE_CLOSE,
+        "symbol": symbol.upper(),
+        "qty": float(qty),
+        "fill_price": None,
+        "order_id": None,
+        "price_source": "",
+        "close_reason": reason,
+        "note": note,
+    }
+    with _lock:
+        trades = _load()
+        trades.append(entry)
+        _save(trades)
+    return entry
+
+
+def unaccounted(trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Cost basis removed by closes rather than by sales.
+
+    Reported, never folded in. Cash in lieu DID pay something, so this money is
+    not lost -- it is unknown, and a figure the app calls realized must not
+    pretend either way.
+    """
+    rows = get_trades() if trades is None else list(trades)
+    cost: Dict[str, Dict[str, float]] = {}
+    for t in rows:
+        if t.get("side") == "buy":
+            b = cost.setdefault(t["symbol"], {"qty": 0.0, "cost": 0.0})
+            b["qty"] += float(t.get("qty") or 0)
+            b["cost"] += (t.get("fill_price") or 0) * float(t.get("qty") or 0)
+
+    total = 0.0
+    by_reason: Dict[str, float] = {}
+    n = 0
+    for t in rows:
+        if t.get("side") != SIDE_CLOSE:
+            continue
+        b = cost.get(t["symbol"])
+        if not b or not b["qty"]:
+            continue
+        v = (b["cost"] / b["qty"]) * float(t.get("qty") or 0)
+        total += v
+        n += 1
+        r = t.get("close_reason") or CLOSE_RECONCILED
+        by_reason[r] = by_reason.get(r, 0.0) + v
+    return {"total": total, "positions": n, "by_reason": by_reason}
 
 
 def version() -> tuple:
@@ -176,6 +269,12 @@ def split_adjusted(trades: Optional[List[Dict[str, Any]]] = None) -> List[Dict[s
 
         if side == "buy":
             held[key] = held.get(key, 0.0) + qty
+        elif side == SIDE_CLOSE:
+            # Reduces the position and nothing else. Never restated: a close
+            # carries no price, so there is no proceeds figure to put back into
+            # pre-split units, and a fractional close is simply the fraction
+            # that dissolved.
+            held[key] = max(0.0, held.get(key, 0.0) - qty)
         elif side == "sell":
             have = held.get(key, 0.0)
             # A whole-share sell is an ordinary exit; only a fraction of a share
@@ -215,7 +314,7 @@ def get_portfolio() -> Dict[tuple, Dict[str, Any]]:
             pos["total_cost"] += price * t["qty"]
             pos["qty"] += t["qty"]
             pos["avg_cost"] = pos["total_cost"] / pos["qty"] if pos["qty"] else 0.0
-        elif t["side"] == "sell":
+        elif t["side"] in ("sell", SIDE_CLOSE):
             if pos["qty"] > 0:
                 # reduce position, keep avg_cost the same
                 sold_qty = min(t["qty"], pos["qty"])

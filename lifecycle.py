@@ -288,7 +288,9 @@ def held_accounts(trades: Optional[Iterable[dict]] = None) -> dict[str, dict[str
         side = str(t.get("side") or "").lower()
         if side == "buy":
             net[(sym, broker, acct)] = net.get((sym, broker, acct), 0.0) + qty
-        elif side == "sell":
+        elif side in ("sell", trade_journal.SIDE_CLOSE):
+            # A dissolved position is just as gone as a sold one, and the
+            # worklist must stop offering it either way.
             net[(sym, broker, acct)] = net.get((sym, broker, acct), 0.0) - qty
 
     out: dict[str, dict[str, int]] = {}
