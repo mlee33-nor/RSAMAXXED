@@ -101,6 +101,10 @@ def summarize(trades: Sequence[TradeLike]) -> Summary:
             b["qty"] += qty
             b["cost"] += (price or 0) * qty
             open_qty[key] = open_qty.get(key, 0.0) + qty
+        elif t.side == "close":
+            # A position a corporate action dissolved. It closes the holding and
+            # stays out of realized entirely -- see trade_journal.SIDE_CLOSE.
+            open_qty[key] = open_qty.get(key, 0.0) - qty
         elif t.side == "sell":
             s = sells.setdefault(sym, {"qty": 0.0, "rev": 0.0})
             s["qty"] += qty

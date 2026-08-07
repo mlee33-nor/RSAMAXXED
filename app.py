@@ -4024,6 +4024,11 @@ class App(ctk.CTk):
                 s["qty"] += qty
                 s["rev"] += (price or 0) * qty
                 open_qty[key] = open_qty.get(key, 0.0) - qty
+            elif t["side"] == trade_journal.SIDE_CLOSE:
+                # Closes the position -- which is what stops DEPLOYED counting
+                # shares a corporate action dissolved -- and touches neither
+                # side of the profit arithmetic.
+                open_qty[key] = open_qty.get(key, 0.0) - qty
 
         realized = 0.0
         wins = losses = 0
@@ -5764,7 +5769,7 @@ class App(ctk.CTk):
             d = daily.setdefault(date, {"buys": 0, "sells": 0})
             if t["side"] == "buy":
                 d["buys"] += 1
-            else:
+            elif t["side"] == "sell":
                 d["sells"] += 1
 
         if not daily:
@@ -6017,7 +6022,11 @@ class App(ctk.CTk):
             if t["side"] == "buy":
                 d["bought"] += t["qty"]
                 d["buy_cost"] += price * t["qty"]
-            else:
+            elif t["side"] == "sell":
+                # elif, not else: a "close" is a position that dissolved (cash
+                # in lieu at a broker that holds no fractions), and counting it
+                # as a sale would invent proceeds nobody received — then divide
+                # them into avg_s and report the result as realized profit.
                 d["sold"] += t["qty"]
                 d["sell_rev"] += price * t["qty"]
 
@@ -6135,7 +6144,7 @@ class App(ctk.CTk):
             price = t["fill_price"] or 0
             if t["side"] == "buy":
                 d["buys"] += 1
-            else:
+            elif t["side"] == "sell":
                 d["sells"] += 1
                 bs = broker_sym_sells.setdefault(b, {})
                 sd = bs.setdefault(t["symbol"], {"sold": 0.0, "sell_rev": 0.0})
