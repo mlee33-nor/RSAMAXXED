@@ -124,6 +124,7 @@ class _App:
         self._autosell_roundups = _Var(roundups)
         self._autosell_sold = set(sold)
         self._autosell_queue = []
+        self._autosell_fails = {}
         self._trade_in_flight = in_flight
         self._track_rows = []
         self.logs = []
@@ -502,6 +503,33 @@ def test_an_already_sold_position_is_skipped_and_the_list_continues(tmp_path, mo
     assert "2026-08-06:GRNQ" in app._autosell_sold      # stays claimed
     assert any("nothing to sell" in m for m in app.logs)
     assert app.scheduled, "the queue was not resumed"
+
+
+def test_a_broker_that_can_never_log_in_is_not_retried_forever(tmp_path, monkeypatch):
+    """The loop behind "why does SoFi keep trying to log in".
+
+    Every hand-back re-queues the play; re-queuing drives another holdings
+    read; a holdings read IS a broker login. So a broker that cannot
+    authenticate at all — SoFi behind a Turnstile human check — turned an
+    unbounded retry into an unbounded login loop, once an hour plus once per
+    sweep click, for as long as the app stayed open.
+    """
+    app = _resolver(tmp_path, monkeypatch)
+    task = _task("CSAI")
+    key = "2026-08-06:CSAI"
+
+    for attempt in range(1, desktop_app.AUTOSELL_MAX_ATTEMPTS):
+        app._autosell_sold.add(key)
+        app._autosell_retry(task, "couldn't read SoFi")
+        assert key not in app._autosell_sold, f"attempt {attempt} should still retry"
+
+    # The last one stops: the play stays claimed, so nothing re-queues it and
+    # no further login is provoked.
+    app._autosell_sold.add(key)
+    app._autosell_retry(task, "couldn't read SoFi")
+    assert key in app._autosell_sold
+    assert any("giving up" in m for m in app.logs)
+    assert any("sell it by hand" in m.lower() for m in app.logs)
 
 
 def test_a_broker_that_could_not_be_read_is_retried_later(tmp_path, monkeypatch):
