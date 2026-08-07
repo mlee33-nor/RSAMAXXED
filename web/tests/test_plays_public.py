@@ -294,6 +294,28 @@ def test_the_settings_gear_offers_every_broker(board):
     assert board.count('data-broker=') == 10
 
 
+def test_a_broker_named_by_an_alert_can_be_told_apart_from_yours(board):
+    """The Sells and Tracking tabs list the brokers the ALERT named, with the
+    ALERTER's account counts. Unmarked, "Schwab x1" on an exit reads as "you
+    hold one Schwab account" — and the profit figures have always excluded it,
+    so the page was contradicting its own arithmetic."""
+    from app.playsfeed import broker_key
+
+    # The fixture's exit is at Robinhood, and it is tagged.
+    assert 'data-broker-tag="robinhood"' in board
+
+    # The tag has to be spelled exactly as broker_key spells it, or the browser
+    # looks the wrong name up in the account profile, finds nothing, and marks a
+    # broker you DO hold as unheld — the same bug pointing the other way.
+    tags = set(re.findall(r'data-broker-tag="([^"]*)"', board))
+    assert tags, "no broker on the page is tagged at all"
+    for name in ("Robinhood", "Wells Fargo", "Chase", "Public"):
+        assert broker_key(name) not in ("", None)
+    assert all(t == broker_key(t) for t in tags), (
+        f"tags that broker_key would spell differently: "
+        f"{[t for t in tags if t != broker_key(t)]}")
+
+
 def test_the_calendar_marks_the_days_a_window_shuts(board):
     """A deadline you can't see is a deadline you miss."""
     assert 'class="calgrid"' in board

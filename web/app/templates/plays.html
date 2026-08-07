@@ -580,7 +580,11 @@
                   {% if e.legs %}
                     <div class="legs">
                       {% for leg in e.legs %}
-                        <span class="leg">{{ leg.broker }}
+                        {# data-broker-tag mirrors playsfeed.broker_key. These
+                           counts are the ALERTER's, and without marking they
+                           read as the reader's own -- "Schwab x1" on an exit
+                           looks exactly like "you hold one Schwab account". #}
+                        <span class="leg" data-broker-tag="{{ leg.broker | lower | replace(' ', '') | replace('*', '') }}">{{ leg.broker }}
                           <b>×{% if leg.accounts_high > leg.accounts_low %}{{ leg.accounts_low }}–{{ leg.accounts_high }}{% else %}{{ leg.accounts_low }}{% endif %}</b>
                         </span>
                       {% endfor %}
@@ -636,7 +640,12 @@
                    figure on the Dashboard. #}
                 <td class="small{% if l.sold %} dim{% else %} faint{% endif %}"
                     title="{{ 'brokers named by the sell alert' if l.sold else 'no sell alert has closed this one yet' }}">
-                  {{ l.paid_in }}
+                  {%- if l.paying_brokers -%}
+                    {%- for b in l.paying_brokers -%}
+                      {%- if not loop.first %}, {% endif -%}
+                      <span data-broker-tag="{{ b | lower | replace(' ', '') | replace('*', '') }}">{{ b }}</span>
+                    {%- endfor -%}
+                  {%- else -%}{{ l.paid_in }}{%- endif -%}
                 </td>
                 <td class="mono dim">{{ l.booked_on or '—' }}</td>
                 <td class="mono">{% if l.per_account_profit %}{{ l.per_account_profit | money }}{% else %}—{% endif %}</td>
