@@ -81,6 +81,16 @@ AUTOSELL_MAX_PER_PULL = 4
 # being switched off.
 AUTOSELL_WAIT_TICKS = 120
 
+# How many times one play may be handed back before auto-sell stops trying.
+#
+# Every hand-back re-queues the play, and re-queuing it drives another holdings
+# read, and a holdings read is a broker LOGIN. A broker that cannot authenticate
+# at all — SoFi behind a Turnstile human check — therefore turns an unbounded
+# retry into an unbounded login loop against that broker. Three is enough to
+# ride out a dropped session and few enough that a real blocker escalates to a
+# human instead of hammering the door.
+AUTOSELL_MAX_ATTEMPTS = 3
+
 load_dotenv(ENV_FILE)
 
 
@@ -1179,6 +1189,10 @@ class App(ctk.CTk):
         self._autosell_sold: set = set(_as.get("sold") or [])
         self._autosell_queue: List[Any] = []
         self._autosell_waits: int = 0     # pump ticks spent behind a busy trade
+        # play key -> hand-backs so far. Not persisted: a restart is a fair
+        # reason to try a broker again, and it is the WITHIN-session loop that
+        # hammers a login.
+        self._autosell_fails: Dict[str, int] = {}
 
         self._configure_styles()
         self._build_shell()
@@ -8761,17 +8775,42 @@ class App(ctk.CTk):
         self.after(1000, self._autosell_pump)
 
     def _autosell_retry(self, task, why: str) -> None:
-        """Give a play back so a later pull can try it again.
+        """Give a play back so a later pull can try it again — up to a point.
 
         The claim in _autosell_pump is taken BEFORE the holdings read, because
         the alternative — claiming it after the order — risks selling twice.
         The cost of that choice is that anything which fails between the claim
         and the order would strand the play as "sold" forever, so every such
         path has to hand it back explicitly.
+
+        THE POINT, and it is why this counts: handing it back unconditionally
+        is a loop. A broker that cannot log in at all — SoFi sitting behind a
+        Turnstile human check is the live example — fails the holdings read
+        every single time, so the play is unclaimed, re-queued on the next pull,
+        and drives another login attempt. Forever, once an hour, plus once per
+        sweep click. "Why does SoFi keep trying to log in" is this function
+        with no ceiling on it.
+
+        After AUTOSELL_MAX_ATTEMPTS the play stays claimed and says so. It is
+        still on the Exits tab to sell by hand, which is the correct escalation
+        for something no amount of retrying will fix.
         """
-        self._autosell_sold.discard(self._autosell_key(task))
+        key = self._autosell_key(task)
+        n = self._autosell_fails.get(key, 0) + 1
+        self._autosell_fails[key] = n
+
+        if n >= AUTOSELL_MAX_ATTEMPTS:
+            self._log(f"Auto-sell: giving up on {task.symbol} after {n} attempts "
+                      f"({why}). Sell it by hand from the Exits tab — retrying "
+                      f"is only re-triggering the broker login.", "warn")
+            self._push_notification(
+                f"Auto-sell gave up on {task.symbol} — {why}", "warning")
+            return                              # stays claimed: stop the loop
+
+        self._autosell_sold.discard(key)
         self._save_autosell_state()
-        self._log(f"Auto-sell: {task.symbol} put back — {why}", "meta")
+        self._log(f"Auto-sell: {task.symbol} put back — {why} "
+                  f"(attempt {n} of {AUTOSELL_MAX_ATTEMPTS})", "meta")
 
     def _autosell_fire(self, resolved) -> None:
         """Place the resolved sell — the one step a human would have clicked."""
