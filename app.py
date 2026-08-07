@@ -8071,6 +8071,17 @@ class App(ctk.CTk):
                 font=(FONT_FAMILY, 9), anchor="w", bd=0, highlightthickness=0,
             ).pack(anchor="w")
 
+        # Catching up is a different job from keeping up: auto-sell fires on a
+        # transition, so a position that was ALREADY fractional when you armed
+        # it is never picked up. This is how the backlog gets cleared.
+        self._sweep_btn = tk.Button(
+            body, text="Sell all fractionals now", command=self._autosell_sweep,
+            bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_CARD,
+            activeforeground=TEXT_PRIMARY, font=(FONT_FAMILY, 9, "bold"),
+            relief="flat", bd=0, padx=14, pady=7, cursor="hand2",
+        )
+        self._sweep_btn.pack(anchor="w", pady=(10, 0))
+
         self._autosell_toggled(save=False)
 
     def _autosell_toggled(self, save: bool = True) -> None:
@@ -8558,6 +8569,63 @@ class App(ctk.CTk):
                   f"{', '.join(t.symbol for t in tasks)}"
                   + (" [DRY RUN]" if self._autosell_dry_run.get() else ""))
         self._autosell_pump()
+
+    def _autosell_sweep(self) -> None:
+        """Sell everything fractional you are holding RIGHT NOW.
+
+        Auto-sell above fires on a TRANSITION — a play the board just moved into
+        fractional. That is correct for keeping up, and useless for catching up:
+        `became_fractional` is false for a row that was already fractional when
+        you armed it, so the backlog you had on day one would sit there forever
+        while every new play sailed past it.
+
+        So this is the other half, and it is a button rather than automatic
+        because sweeping a backlog is a decision with a date on it — the
+        positions have been sitting a while and the reason may not be inertia.
+        Everything downstream is identical: the same queue, the same one-at-a-
+        time pump, the same sold-once record, the same dry-run switch.
+        """
+        if not self._track_rows:
+            self._push_notification("Pull the board first — nothing to sweep.", "warning")
+            return
+
+        tasks = [t for t in lifecycle.sell_worklist(self._track_rows)
+                 if t.brokers and t.is_fractional
+                 and self._autosell_key(t) not in self._autosell_sold]
+        if not tasks:
+            self._push_notification("No fractional positions to sell.", "info")
+            return
+
+        state, label, _ = _market_status()
+        if state != "open":
+            self._push_notification(
+                f"{label} — a market order now would pay the whole spread. "
+                f"{len(tasks)} play(s) ready when it opens.", "warning")
+            return
+
+        # Two clicks, and the second one knows the count. No modal: the button
+        # states what it is about to do and waits, which is the same protection
+        # with none of the dialog's ability to be dismissed by reflex.
+        if not getattr(self, "_sweep_armed", False):
+            self._sweep_armed = True
+            syms = ", ".join(t.symbol for t in tasks[:6])
+            more = f" +{len(tasks) - 6} more" if len(tasks) > 6 else ""
+            self._sweep_btn.configure(
+                text=f"Confirm: sell {len(tasks)} — {syms}{more}", bg=RED)
+            self.after(8000, self._autosell_sweep_disarm)
+            return
+
+        self._autosell_sweep_disarm()
+        self._autosell_queue.extend(tasks)
+        self._log(f"Sweep: queued {len(tasks)} fractional play(s) — "
+                  f"{', '.join(t.symbol for t in tasks)}"
+                  + (" [DRY RUN]" if self._autosell_dry_run.get() else ""))
+        self._autosell_pump()
+
+    def _autosell_sweep_disarm(self) -> None:
+        self._sweep_armed = False
+        if hasattr(self, "_sweep_btn"):
+            self._sweep_btn.configure(text="Sell all fractionals now", bg=BG_INPUT)
 
     def _autosell_pump(self) -> None:
         """Start the next play once the previous one has finished.
