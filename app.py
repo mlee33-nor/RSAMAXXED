@@ -8594,7 +8594,12 @@ class App(ctk.CTk):
         Everything downstream is identical: the same queue, the same one-at-a-
         time pump, the same sold-once record, the same dry-run switch.
         """
+        # Every refusal below says so ON THE BUTTON. A notification in the bell
+        # and a line in the Activity log are both on other screens, so a sweep
+        # that declined to run was indistinguishable from a sweep that did
+        # nothing — you press it twice and watch an unchanged page.
         if not self._track_rows:
+            self._sweep_say("Pull the board first")
             self._push_notification("Pull the board first — nothing to sweep.", "warning")
             return
 
@@ -8602,14 +8607,20 @@ class App(ctk.CTk):
                  if t.brokers and t.is_fractional
                  and self._autosell_key(t) not in self._autosell_sold]
         if not tasks:
+            self._sweep_say("Nothing fractional to sell")
             self._push_notification("No fractional positions to sell.", "info")
             return
 
         state, label, _ = _market_status()
         if state != "open":
+            self._sweep_say(f"{label} — not selling")
             self._push_notification(
                 f"{label} — a market order now would pay the whole spread. "
                 f"{len(tasks)} play(s) ready when it opens.", "warning")
+            return
+
+        if getattr(self, "_trade_in_flight", False):
+            self._sweep_say("A trade is already running")
             return
 
         # Two clicks, and the second one knows the count. No modal: the button
@@ -8621,20 +8632,58 @@ class App(ctk.CTk):
             more = f" +{len(tasks) - 6} more" if len(tasks) > 6 else ""
             self._sweep_btn.configure(
                 text=f"Confirm: sell {len(tasks)} — {syms}{more}", bg=RED)
-            self.after(8000, self._autosell_sweep_disarm)
+            # Long enough to actually read the tickers before deciding. At 8s
+            # this expired while you were still reading it, so the second click
+            # only re-armed and the button appeared to do nothing.
+            self.after(20000, self._autosell_sweep_disarm)
             return
 
-        self._autosell_sweep_disarm()
+        self._sweep_armed = False
         self._autosell_queue.extend(tasks)
         self._log(f"Sweep: queued {len(tasks)} fractional play(s) — "
                   f"{', '.join(t.symbol for t in tasks)}"
                   + (" [DRY RUN]" if self._autosell_dry_run.get() else ""))
+        # Reading holdings across three brokers takes tens of seconds and every
+        # word of progress goes to the Activity log on another page. Without
+        # this the button falls straight back to its resting label and the whole
+        # sweep looks like a click that did nothing.
+        self._sweep_progress()
         self._autosell_pump()
+
+    def _sweep_say(self, msg: str, hold_ms: int = 3000) -> None:
+        """Put a sentence on the button, then let it go back to normal."""
+        if not hasattr(self, "_sweep_btn"):
+            return
+        self._sweep_armed = False
+        self._sweep_btn.configure(text=msg, bg=BG_INPUT)
+        self.after(hold_ms, self._autosell_sweep_disarm)
+
+    def _sweep_progress(self) -> None:
+        """Follow the queue on the button until it drains."""
+        if not hasattr(self, "_sweep_btn"):
+            return
+        left = len(self._autosell_queue)
+        busy = getattr(self, "_trade_in_flight", False)
+        if not left and not busy:
+            self._sweep_btn.configure(text="Done — check Activity for the fills",
+                                      bg=BG_INPUT)
+            self.after(6000, self._autosell_sweep_disarm)
+            return
+        self._sweep_btn.configure(
+            text=(f"Working… {left} left" if left else "Working… placing the order"),
+            bg=BG_INPUT)
+        self.after(1500, self._sweep_progress)
 
     def _autosell_sweep_disarm(self) -> None:
         self._sweep_armed = False
-        if hasattr(self, "_sweep_btn"):
-            self._sweep_btn.configure(text="Sell all fractionals now", bg=BG_INPUT)
+        if not hasattr(self, "_sweep_btn"):
+            return
+        # The arm timer is still pending when a sweep actually starts, so
+        # without this it fires mid-run and wipes the progress label — putting
+        # "Sell all fractionals now" back on screen while orders are going out.
+        if self._autosell_queue or getattr(self, "_trade_in_flight", False):
+            return
+        self._sweep_btn.configure(text="Sell all fractionals now", bg=BG_INPUT)
 
     def _autosell_pump(self) -> None:
         """Start the next play once the previous one has finished.
