@@ -17,5 +17,10 @@ schwab-api>=0.3.0
 zendriver>=0.15.5
 curl-cffi>=0.5.0
 beautifulsoup4>=4.12.0
+# Not used directly by this app -- schwab-api imports it to drive its login.
+# Installing these does NOT install a browser: Schwab also needs
+# `py -3.13 -m playwright install firefox`, and firefox specifically, because
+# schwab_api.authentication raises ValueError on any other browserType.
+# Without it Schwab bootstrap dies on "Executable doesn't exist".
 playwright>=1.40.0
 playwright-stealth>=1.0.0

@@ -8364,7 +8364,7 @@ class App(ctk.CTk):
                 self._exits_list, "warning", "No board source available",
                 "The round-up board comes down with the play feed, which needs "
                 "the 'requests' package installed — run "
-                "pip install -r requirements.txt. Running the feed yourself? "
+                "py -3.13 -m pip install -r requirements.txt. Running the feed yourself? "
                 "Set DISCORD_LIFECYCLE_CHANNEL in .env instead.").pack(fill="x")
             return
         if self._track_error:
@@ -9243,7 +9243,7 @@ class App(ctk.CTk):
         if not self._track_available():
             self._push_notification(
                 "Can't read the round-up board — install the requirements "
-                "(pip install -r requirements.txt), or set "
+                "(py -3.13 -m pip install -r requirements.txt), or set "
                 "DISCORD_LIFECYCLE_CHANNEL to read it from Discord directly.",
                 "warning")
             return

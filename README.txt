@@ -272,16 +272,32 @@ CONTENTS
 
 ┌─ 10. SETUP ─────────────────────────────────────────────────────────────────
 │
-│  Requirements: Python 3.13 on Windows.
+│  Requirements: Windows, and Python 3.13 specifically — not 3.12, not
+│  3.14. Only 3.13 gets the dependencies below, and the other versions
+│  usually come first on PATH. Chase, SoFi, Wells Fargo and Fidelity
+│  drive a real browser, so you also need Chrome installed (Edge works
+│  as a fallback and already ships with Windows 11).
 │
 │     1.  Install dependencies:
-│            pip install -r requirements.txt
+│            py -3.13 -m pip install -r requirements.txt
 │
-│     2.  Launch the app:
+│         Use "py -3.13 -m pip", not a bare "pip". A bare pip installs
+│         into whichever Python is first on PATH, and the app then dies
+│         at "import customtkinter" with no window and no message.
+│
+│     2.  ONLY IF YOU USE SCHWAB, fetch the browser it logs in with:
+│            py -3.13 -m playwright install firefox
+│
+│         The pip step above installs the playwright library but not the
+│         browser binary it drives, and schwab-api supports firefox and
+│         nothing else. Skip this and Schwab bootstrap fails with
+│         "Executable doesn't exist" — every other broker is unaffected.
+│
+│     3.  Launch the app:
 │            RSAMAXXED.bat
 │         (or run app.py directly for the GUI, or runner.py for CLI)
 │
-│     3.  TURN ON THE PLAYS. Copy .env.example to .env and set the one
+│     4.  TURN ON THE PLAYS. Copy .env.example to .env and set the one
 │         line that makes alerts arrive:
 │
 │            RSAMAXXED_PLAYS_KEY=the password you were given
@@ -295,11 +311,11 @@ CONTENTS
 │         bottom-right never shows a feed arrival — a missing or wrong
 │         password is the usual cause, not a broken install.
 │
-│     4.  CONNECT YOUR BROKERS. Copy .env.example to .env and fill in
-│         only the brokers you use, or enter them in the Brokers tab and
-│         click Save. Then Bootstrap each one to start its session.
+│     5.  CONNECT YOUR BROKERS. In that same .env, fill in only the
+│         brokers you use, or enter them in the Brokers tab and click
+│         Save. Then Bootstrap each one to start its session.
 │
-│     5.  Open the Dashboard and hit Refresh All. Green status dots
+│     6.  Open the Dashboard and hit Refresh All. Green status dots
 │         mean a broker is linked and ready.
 │
 │  Credentials live in a local .env file and are used to log in to that

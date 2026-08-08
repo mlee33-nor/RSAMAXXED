@@ -137,7 +137,7 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
     try:
         import uvicorn
     except ImportError:
-        print("uvicorn not installed. Run: pip install uvicorn")
+        print("uvicorn not installed. Run: py -3.13 -m pip install uvicorn")
         sys.exit(1)
     print(f"Starting dashboard on http://127.0.0.1:{args.port}")
     uvicorn.run("dashboard:app", host="127.0.0.1", port=args.port, reload=False)
