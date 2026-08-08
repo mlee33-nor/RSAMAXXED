@@ -1525,6 +1525,7 @@ function initPlaysDash() {
       brokerFilter = brokerFilter === key ? '' : key;
       paint();
     });
+    renderBrokerDetail(s);
     heroSpark(heroSparkEl, s.months);
 
     animate = false;
@@ -1593,6 +1594,84 @@ function initPlaysDash() {
     paint();
     outcomeChart($('#chart-outcomes'));
   }));
+
+  /* The sells behind one bar.
+
+     "Where it paid" says how much each broker made you; nobody stops there.
+     This is the arithmetic underneath it — every play that sold at that
+     broker, what one account got, how many accounts you hold there, and the
+     product — and it foots to the bar exactly, because it is the same
+     multiplication drawn a second way rather than a second estimate. */
+  function renderBrokerDetail(s) {
+    const host = $('#broker-detail');
+    if (!host) return;
+    if (!brokerFilter) { host.hidden = true; host.innerHTML = ''; return; }
+
+    const name = names[brokerFilter] || brokerFilter;
+    const held = accounts[brokerFilter] || 0;
+    const mine = s.detail
+      .filter(d => d.held.includes(brokerFilter))
+      .map(d => ({ ...d, here: d.per * held }))
+      .sort((a, b) => b.here - a.here);
+
+    host.hidden = false;
+    host.innerHTML = '';
+
+    const head = document.createElement('div');
+    head.className = 'bd-h';
+    const b = document.createElement('b');
+    b.textContent = `${name} — ${mine.length} sell${mine.length === 1 ? '' : 's'}`;
+    const sub = document.createElement('span');
+    sub.className = 'muted';
+    sub.style.fontSize = '11.5px';
+    sub.textContent = held
+      ? `${held} account${held === 1 ? '' : 's'} here`
+      : 'you hold no accounts here';
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'clear';
+    clear.textContent = 'clear ✕';
+    clear.addEventListener('click', () => { brokerFilter = ''; paint(); });
+    head.append(b, sub, clear);
+    host.appendChild(head);
+
+    if (!mine.length) {
+      const note = document.createElement('p');
+      note.className = 'empty-note';
+      note.textContent = 'No sell alert in this period named this broker.';
+      host.appendChild(note);
+      return;
+    }
+
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    thead.innerHTML = '<tr><th>Sold</th><th>Ticker</th><th>Per account</th>' +
+                      '<th>Accounts</th><th>Paid you</th></tr>';
+    const tbody = document.createElement('tbody');
+    mine.forEach(d => {
+      const tr = document.createElement('tr');
+      [d.on, d.sym, money(d.per), String(held), money(d.here)].forEach((v, i) => {
+        const td = document.createElement('td');
+        td.textContent = v;
+        if (i !== 1) td.className = 'mono';
+        if (i === 4) td.classList.add('pos');
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    const tfoot = document.createElement('tfoot');
+    const ftr = document.createElement('tr');
+    const total = mine.reduce((a, d) => a + d.here, 0);
+    ['', 'Total', '', '', money(total)].forEach((v, i) => {
+      const td = document.createElement('td');
+      td.textContent = v;
+      if (i === 4) td.className = 'mono pos';
+      ftr.appendChild(td);
+    });
+    tfoot.appendChild(ftr);
+    table.append(thead, tbody, tfoot);
+    host.appendChild(table);
+  }
 
   /* One place that changes the period, so a chip and a chart click cannot
      drift into disagreeing about what is selected. */

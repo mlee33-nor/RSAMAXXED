@@ -81,7 +81,10 @@ def fetch(channel_id: str, token: str, after: Optional[str] = None,
     url = f"{API}/channels/{channel_id}/messages?limit={int(limit)}"
     if after:
         url += f"&after={after}"
+    return _get(url, token)
 
+
+def _get(url: str, token: str) -> tuple:
     req = urllib.request.Request(url, headers=_headers(token))
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
@@ -95,6 +98,46 @@ def fetch(channel_id: str, token: str, after: Optional[str] = None,
         }.get(e.code, _HTTP_ERRORS.get(e.code, f"HTTP error {e.code}"))
     except Exception as e:
         return [], str(e)[:80]
+
+
+def fetch_back(channel_id: str, token: str, want: int) -> tuple:
+    """The last `want` messages, paging past Discord's 100-per-request cap.
+
+    A single request tops out at 100, which is fine for "what landed today" and
+    useless for repairing history. When a parser bug is fixed — a sell total
+    written `**$159.84**` with no `+` dropped the whole exit, and it was the
+    largest of the three in its message — the correction only reaches messages
+    that get read again. Everything older stays wrong forever, and "forever"
+    started at 100 messages back.
+
+    Pages with `before`, newest first, and stops early when Discord returns a
+    short page (the start of the channel). Publishing is idempotent and keyed on
+    the message id, so re-reading costs nothing but time.
+    """
+    token = (token or "").strip()
+    channel_id = (channel_id or "").strip()
+    if not token or not channel_id:
+        return [], "Enter your Discord token and channel ID first."
+
+    out: list = []
+    before = None
+    while len(out) < want:
+        page = min(100, want - len(out))
+        url = f"{API}/channels/{channel_id}/messages?limit={page}"
+        if before:
+            url += f"&before={before}"
+        batch, err = _get(url, token)
+        if err:
+            # Keep what we already have: a rate limit half way through a deep
+            # read should publish 300 messages, not none.
+            return out, (err if not out else None)
+        if not batch:
+            break
+        out.extend(batch)
+        before = batch[-1].get("id")
+        if len(batch) < page:
+            break                       # reached the beginning of the channel
+    return out, None
 
 
 def resolve_channel(token: str, channel: str, server: str = "") -> tuple:

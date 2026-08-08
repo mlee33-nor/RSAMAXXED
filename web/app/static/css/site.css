@@ -1439,6 +1439,30 @@
   .since b{font-weight:640;white-space:nowrap}
   .since span{font-family:var(--mono);font-size:12px;color:var(--text-2);flex:1;min-width:80px}
 
+  /* A broker's own sells, opened by clicking its bar. */
+  .bdetail{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}
+  .bdetail .bd-h{
+    display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:8px;
+  }
+  .bdetail .bd-h b{font-size:13px}
+  .bdetail .bd-h .clear{
+    margin-left:auto;background:none;border:0;cursor:pointer;
+    color:var(--text-3);font-size:11.5px;padding:2px 6px;border-radius:6px;
+  }
+  .bdetail .bd-h .clear:hover{color:var(--text);background:rgba(255,255,255,.06)}
+  .bdetail table{width:100%;border-collapse:collapse}
+  .bdetail th{
+    text-align:left;font-size:9.5px;letter-spacing:.11em;text-transform:uppercase;
+    color:var(--text-3);font-weight:600;padding:0 8px 6px 0;
+  }
+  .bdetail td{
+    padding:5px 8px 5px 0;font-size:12px;border-top:1px solid var(--line);
+    white-space:nowrap;
+  }
+  .bdetail td.mono{font-family:var(--mono)}
+  .bdetail tfoot td{border-top:1px solid var(--line-2);font-weight:650}
+  .bdetail .empty-note{margin:6px 0 0}
+
   /* ---- the hero figure: exactly one per view */
   .hero-row{display:grid;grid-template-columns:minmax(240px,.9fr) 2.1fr;gap:12px;align-items:stretch}
   @media(max-width:900px){ .hero-row{grid-template-columns:1fr} }

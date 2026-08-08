@@ -9,6 +9,7 @@ customer would open the terminal to an empty Quick Picks list.
     python publish_feed.py                # pull both channels, publish
     python publish_feed.py --dry-run      # parse and report, publish nothing
     python publish_feed.py --limit 100    # look further back than the default 50
+    python publish_feed.py --limit 600    # repair history after a parser fix
 
 Environment (a .env beside this file is loaded automatically):
 
@@ -81,17 +82,20 @@ def _resolve(token: str, raw: str, server: str, label: str) -> tuple[str, str]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--limit", type=int, default=50,
-                    help="messages to read per channel (default 50, max 100)")
+                    help="messages to read per channel (default 50; over 100 pages back)")
     ap.add_argument("--dry-run", action="store_true",
                     help="parse and report, but publish nothing")
     args = ap.parse_args(argv)
 
+    # Above 100 we page instead of clamping. Discord rejects a single request
+    # over 100, but the whole point of a big --limit is repairing history: a
+    # parser fix only reaches messages that get read again, so a cap of 100 left
+    # everything older permanently wrong. See discord_feed.fetch_back.
+    if args.limit > 100:
+        print(f"reading back {args.limit} messages per channel (paged)")
     # Discord rejects a limit above 100 outright. Clamping (loudly) beats
     # handing back a 400 that reads like the channel is broken — and a run that
     # silently fetched nothing is exactly how a day's alerts go missing.
-    if args.limit > 100:
-        print(f"note: --limit {args.limit} exceeds Discord's cap; reading 100")
-        args.limit = 100
     args.limit = max(1, args.limit)
 
     token = _env("DISCORD_TOKEN")
@@ -117,14 +121,14 @@ def main(argv: list[str] | None = None) -> int:
     if sell_err:
         print(f"note: {sell_err} — exits will be skipped")
 
-    buy_msgs, err = discord_feed.fetch(buy_cid, token, limit=args.limit)
+    buy_msgs, err = discord_feed.fetch_back(buy_cid, token, args.limit)
     if err:
         print(f"BUY channel: {err}", file=sys.stderr)
         return 2
 
     sell_msgs: list = []
     if sell_cid:
-        sell_msgs, serr = discord_feed.fetch(sell_cid, token, limit=args.limit)
+        sell_msgs, serr = discord_feed.fetch_back(sell_cid, token, args.limit)
         if serr:
             # A readable BUY channel is worth publishing on its own; don't lose
             # today's plays because the sell channel was rate limited.
