@@ -1390,8 +1390,16 @@ function initPlaysDash() {
 
     heroCount(heroTotal, s.total, animate);
     if (heroSub) {
+      // Say the assumption out loud. This figure credits EVERY alert in EVERY
+      // account the sell named — it is a ceiling, and the gap between it and
+      // what anyone actually books is the alerts they missed and the accounts
+      // they did not buy in. Against real fills it runs about 3x, which is a
+      // fine thing for a board to claim and an indefensible thing for it to
+      // imply silently.
+      const total = Object.values(accounts).reduce((a, b) => a + b, 0);
       heroSub.textContent = s.plays
-        ? `across ${s.plays} plays with a confirmed sell, in the brokers each one actually sold at`
+        ? `if you had bought all ${s.plays} of these across your ${total} account` +
+          `${total === 1 ? '' : 's'}, in the brokers each one actually sold at`
         : 'no confirmed sell in this period landed in a broker you hold';
     }
     // Its own pass over the rows, scoped to the current month rather than to
