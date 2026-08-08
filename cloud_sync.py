@@ -65,6 +65,18 @@ class CloudError(RuntimeError):
     """Any failure that the GUI should surface to the user verbatim."""
 
 
+class CloudAuthError(CloudError):
+    """This machine has no valid board password.
+
+    Kept apart from a plain CloudError because the two need opposite advice. A
+    transport failure is transient and the honest thing to say is "we'll retry,
+    do nothing". This one never fixes itself: the feed will stay empty until
+    the user pastes their password into .env. Telling them to sit and wait —
+    which is what a shared error path did — leaves them staring at an empty
+    Watchlist forever, sure the app is broken.
+    """
+
+
 @dataclass
 class PendingPair:
     code: str
@@ -474,7 +486,7 @@ class CloudSync:
         except requests.RequestException as exc:
             raise CloudError(f"Can't reach RSAMAXXED Cloud: {exc}") from exc
         if r.status_code == 401:
-            raise CloudError(
+            raise CloudAuthError(
                 "The play feed needs the board password on this machine. Set "
                 f"{_PLAYS_KEY_ENV} in your .env (or link this device to your account)."
             )
