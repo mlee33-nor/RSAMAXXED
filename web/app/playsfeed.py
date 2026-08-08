@@ -565,46 +565,55 @@ class Board:
     # ---- what the dashboard computes from
     @property
     def payout_rows(self) -> list[dict]:
-        """Every play that paid something, as plain data for the browser.
+        """Every EXIT that paid something, as plain data for the browser.
+
+        One row per exit, not per play, and that distinction is the whole
+        accuracy of the month figures. The alerter sells a play in tranches:
+        GNPX went out across July and August at different brokers. Rolled into
+        one row per play, the union of all nine brokers was credited to whatever
+        month the LAST exit landed in — so August credited a 53-account reader
+        52 accounts for a tranche the alerter sold at 10.
+
+        A broker is still credited only ONCE per play, at the exit that first
+        named it. You own those accounts once and you sell them once; a second
+        tranche at the same broker is the alerter working through their own
+        accounts, not a second position of yours.
 
         The money is finished on the CLIENT, not here, and that is deliberate:
         the multiplier is the reader's own per-broker account counts, which live
-        in their browser and are never sent to us. The server ships what it
-        knows — when it paid, how much per account, and WHICH BROKERS it paid in
-        — and the page does the arithmetic against their numbers.
+        in their browser and are never sent to us.
         """
         rows = []
         for l in self.history:
-            per = l.per_account_profit
-            brokers = l.paying_brokers
-            # `per is None` — not `not per`. A play that broke even is 0.0,
-            # which is falsy, so it was silently dropped from the record along
-            # with any that sold BELOW what it cost. Both are real outcomes and
-            # a board that can only show winners is not a record of anything.
-            if per is None or not brokers:
-                continue
-            rows.append({
-                "sym": l.play.symbol,
-                # THE DAY IT SOLD. A profit chart answers "when did I make
-                # this", and the money arrives when the exit clears, not when
-                # the alert went out.
-                #
-                # This was the alert date until 2026-08-07, on the reasoning
-                # that you commit capital on the alert. True, and it is a
-                # different question from the one the chart asks — and it read
-                # badly: a reverse split resolves weeks after its alert, so
-                # March, April and May alerts that all sold in June piled into
-                # three tiny stacks months before any money existed, while June
-                # looked thin. `alerted` is kept for anything that wants the
-                # other basis.
-                "on": l.resolved_on or l.play.alert_date,
-                "alerted": l.play.alert_date or "",
-                "booked": l.resolved_on,
-                "per": round(per, 4),
-                "brokers": [broker_key(b) for b in brokers],
-                "status": l.status,
-                "sold": l.sold,
-            })
+            entry = l.play.entry_price
+            credited: set[str] = set()
+            for e in sorted(l.exits, key=lambda x: x.sell_date or ""):
+                fresh = []
+                for leg in e.legs:
+                    name = leg.get("broker")
+                    if name and broker_key(name) not in credited:
+                        credited.add(broker_key(name))
+                        fresh.append(name)
+                if not fresh:
+                    continue          # every broker here already paid this play
+
+                # What one account received, less what the alert said to pay.
+                if e.exit_price and entry is not None:
+                    per = e.exit_price - entry
+                elif l.per_account_profit is not None:
+                    per = l.per_account_profit      # no price on this exit
+                else:
+                    continue
+                rows.append({
+                    "sym": l.play.symbol,
+                    "on": e.sell_date or l.resolved_on,
+                    "alerted": l.play.alert_date or "",
+                    "booked": e.sell_date or l.resolved_on,
+                    "per": round(per, 4),
+                    "brokers": [broker_key(b) for b in fresh],
+                    "status": l.status,
+                    "sold": True,
+                })
         return sorted(rows, key=lambda r: r["on"])
 
     @property

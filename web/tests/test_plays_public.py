@@ -658,11 +658,13 @@ def test_exit_price_is_used_as_published_not_divided_again(anon):
     assert row["per"] == pytest.approx(9.0, abs=0.01)   # 10.00 - 1.00, not 0.0
 
 
-def test_a_play_that_sold_in_tranches_averages_them(anon):
-    """The alerter sells across brokers on different days — AIFA went out seven
-    times between $1.80 and $2.24. `paying_brokers` credits the reader at every
-    broker any exit named, so one per-account figure has to cover all of them:
-    the average each account actually got, weighted by accounts."""
+def test_each_tranche_is_priced_at_what_it_actually_sold_for(anon):
+    """The alerter sells a play across brokers on different days. Each of those
+    is its own realization: a different price, a different date, its own
+    brokers. Rolling them into one row per play forced a single blended price
+    and, worse, credited the union of every broker to whichever month the LAST
+    exit landed in — which is how August credited a 53-account reader 52
+    accounts for a GNPX tranche the alerter sold at 10."""
     anon.post("/api/v1/plays/ingest", headers=KEY, json={
         "buys": [{"source_id": "px:4", "symbol": "TRANCHE", "kind": "standard",
                   "alert_date": "2026-08-04", "ratio": "1:10", "ratio_n": 10,
@@ -671,16 +673,45 @@ def test_a_play_that_sold_in_tranches_averages_them(anon):
             {"source_id": "px:s4a", "symbol": "TRANCHE", "sell_date": "2026-08-06",
              "exit_price": 2.00, "proceeds_low": 18.0,
              "legs": [{"broker": "Public", "accounts_low": 9, "accounts_high": 9}]},
-            {"source_id": "px:s4b", "symbol": "TRANCHE", "sell_date": "2026-08-07",
+            {"source_id": "px:s4b", "symbol": "TRANCHE", "sell_date": "2026-09-07",
              "exit_price": 4.00, "proceeds_low": 4.0,
              "legs": [{"broker": "Chase", "accounts_low": 1, "accounts_high": 1}]},
         ],
     })
-    row = next(r for r in _board_of(anon).payout_rows if r["sym"] == "TRANCHE")
-    # (2.00*9 + 4.00*1) / 10 = 2.20 received, less 1.00 paid.
-    assert row["per"] == pytest.approx(1.20, abs=0.01)
-    # NOT the last exit alone, which would have said 4.00 - 1.00 = 3.00.
-    assert row["per"] != pytest.approx(3.00, abs=0.01)
+    rows = [r for r in _board_of(anon).payout_rows if r["sym"] == "TRANCHE"]
+    assert len(rows) == 2, "each exit is its own payout"
+    by_month = {r["on"][:7]: r for r in rows}
+
+    # August sold at Public only, at $2.00 against $1.00 paid.
+    assert by_month["2026-08"]["brokers"] == ["public"]
+    assert by_month["2026-08"]["per"] == pytest.approx(1.00, abs=0.01)
+
+    # September sold at Chase, at $4.00 — its own price, not a blend, and
+    # Public is NOT credited again here.
+    assert by_month["2026-09"]["brokers"] == ["chase"]
+    assert by_month["2026-09"]["per"] == pytest.approx(3.00, abs=0.01)
+
+
+def test_a_broker_is_credited_once_however_many_tranches(anon):
+    """You own those accounts once and you sell them once. A second tranche at
+    the same broker is the alerter working through their OWN accounts, not a
+    second position of yours."""
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={
+        "buys": [{"source_id": "px:6", "symbol": "SAMEBRK", "kind": "standard",
+                  "alert_date": "2026-08-04", "entry_price": 1.00,
+                  "ratio": "1:10", "ratio_n": 10, "last_buy_date": "2026-08-05"}],
+        "sells": [
+            {"source_id": "px:s6a", "symbol": "SAMEBRK", "sell_date": "2026-08-06",
+             "exit_price": 3.00, "proceeds_low": 15.0,
+             "legs": [{"broker": "Public", "accounts_low": 5, "accounts_high": 5}]},
+            {"source_id": "px:s6b", "symbol": "SAMEBRK", "sell_date": "2026-08-07",
+             "exit_price": 3.00, "proceeds_low": 15.0,
+             "legs": [{"broker": "Public", "accounts_low": 5, "accounts_high": 5}]},
+        ],
+    })
+    rows = [r for r in _board_of(anon).payout_rows if r["sym"] == "SAMEBRK"]
+    assert len(rows) == 1, "Public was credited twice for one position"
+    assert rows[0]["per"] * 5 == pytest.approx(10.0, abs=0.01)
 
 
 def test_a_play_that_broke_even_is_still_in_the_record(anon):
