@@ -1011,6 +1011,12 @@ def _local_picks() -> List[Dict[str, str]]:
     return []
 
 
+# Set when the feed refused us for want of a board password, cleared on any
+# successful read. Module-level because _cloud_picks() is a plain function that
+# the App instance calls, not a method.
+_PICKS_AUTH_ERROR: Optional[str] = None
+
+
 def _cloud_picks() -> Optional[List[Dict[str, str]]]:
     """Open plays from the cloud feed, or None if this copy couldn't read it.
 
@@ -1022,12 +1028,19 @@ def _cloud_picks() -> Optional[List[Dict[str, str]]]:
     have", [] is "the feed says nothing is open". Collapsing them would blank a
     customer's Quick Picks every time their wifi dropped.
     """
+    global _PICKS_AUTH_ERROR
     if not CLOUD_AVAILABLE:
         return None
     try:
         picks = cloud_sync.CloudSync().fetch_picks()
+    except cloud_sync.CloudAuthError as exc:
+        # Still None — the cache is right to survive this. But remember WHY, so
+        # the empty state can say "paste your password" instead of "sit tight".
+        _PICKS_AUTH_ERROR = str(exc)
+        return None
     except Exception:
         return None          # CloudError, or anything the transport threw
+    _PICKS_AUTH_ERROR = None
     return picks if isinstance(picks, list) else None
 
 
@@ -3154,7 +3167,18 @@ class App(ctk.CTk):
             # open today" is normal, "we can't reach the feed" is a problem.
             # There is deliberately nothing to sign up for here — the plays
             # arrive on their own.
-            if getattr(self, "_feed_fail_streak", 0) or self._feed_last_ok is None:
+            if _PICKS_AUTH_ERROR:
+                # The one empty state the user MUST act on. Waiting will not
+                # fix it, so this says the opposite of the message below.
+                self._empty_state(
+                    self._picks_grid, "warning", "Add your plays password",
+                    "This copy has no board password, so the feed won't send "
+                    "anything. Open the .env file next to the app and set "
+                    "RSAMAXXED_PLAYS_KEY to the password you were given — the "
+                    "same one that opens rsamaxxed.com/plays — then restart. "
+                    "Waiting will not fix this on its own.",
+                    bg=BG_CARD, pad=18).pack(fill="x")
+            elif getattr(self, "_feed_fail_streak", 0) or self._feed_last_ok is None:
                 self._empty_state(
                     self._picks_grid, "warning", "Waiting for the play feed",
                     "Couldn't reach the feed just now. It retries by itself "
@@ -9121,15 +9145,23 @@ class App(ctk.CTk):
         ok = False
         try:
             picks = _fetch_quick_picks()
-            ok = True
-            if picks:
-                self.after(0, lambda p=picks: self._render_quick_picks(p))
+            # NOT simply True. _cloud_picks() swallows a refusal and hands back
+            # the cache, so a copy with no board password took this path with
+            # picks=[] and no exception — and the screen then told the customer
+            # "nothing is live today, last checked 14:02", which is a confident
+            # lie. We were never allowed to look. Treat that as a failed pull so
+            # the empty state can ask for the password instead.
+            ok = _PICKS_AUTH_ERROR is None
+            # Render even when empty: that is exactly when the message matters,
+            # and _load_picks() already refuses to let an empty feed erase a
+            # populated cache, so this cannot blank anyone's plays.
+            self.after(0, lambda p=picks: self._render_quick_picks(p))
         except Exception:
             pass
 
         try:
             incoming = client.fetch_sells()
-            ok = True
+            ok = ok or _PICKS_AUTH_ERROR is None
         except Exception:
             incoming = None
         if incoming:
@@ -9151,8 +9183,19 @@ class App(ctk.CTk):
         if ok:
             self._feed_last_ok = datetime.now()
             self._feed_fail_streak = 0
+            self._notified_no_plays_key = False
             self._update_feed_status()
             return
+
+        # A missing password is not an outage and retrying cannot cure it. Say
+        # so once, from wherever the user happens to be standing — the empty
+        # state on the picks screen only helps if they are looking at it.
+        if _PICKS_AUTH_ERROR and not getattr(self, "_notified_no_plays_key", False):
+            self._notified_no_plays_key = True
+            self._push_notification(
+                "No plays password on this copy, so the feed is empty. Set "
+                "RSAMAXXED_PLAYS_KEY in .env to the password you were given, "
+                "then restart.", "warning")
 
         self._feed_fail_streak = getattr(self, "_feed_fail_streak", 0) + 1
         self._update_feed_status()
