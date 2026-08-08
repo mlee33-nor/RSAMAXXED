@@ -303,6 +303,47 @@ class PlayLife:
         drop out of the arithmetic rather than count as zero.
         """
         p = self.play
+
+        # 1. WHAT THE SELL ALERT ACTUALLY REPORTED.
+        #
+        # Preferred over everything below, because it is a published fact and
+        # the alternative is a model — and the model is wrong by a lot. It
+        # assumes a post-split share is worth `entry x ratio`, which is what
+        # would happen if the price held. On dying microcaps it does not:
+        #
+        #     FFAI  1-for-150  entry $0.1116  modelled $16.63  sold at $4.44
+        #     VIVK  1-for-20   entry $0.3020  modelled $ 5.74  sold at $1.43
+        #     HCWB  1-for-6    entry $1.1200  modelled $ 5.60  sold at $2.56
+        #
+        # Across the whole feed the model reported $3,558 where the published
+        # prices give $1,653 — the board was overstating by 2.2x. Not every
+        # play: SGLY modelled $3.42 and sold for $7.28. It is a model, so it is
+        # wrong in both directions; it is simply not evidence, and there is
+        # evidence sitting right next to it.
+        # `exit_price` IS what one account received — checked against every one
+        # of the 65 exits the feed carries, where proceeds / account-legs equals
+        # exit_price to the cent, without a single exception. So it is used as
+        # published: no dividing by the ratio, which would take a figure that
+        # already means "per account" and divide it a second time.
+        #
+        # Weighted across ALL of a play's exits, not just the last. The alerter
+        # sells in tranches — AIFA went out seven times between $1.80 and $2.24
+        # at different brokers on different days — and `paying_brokers` credits
+        # the reader at every broker any of those exits named. One `per` has to
+        # cover all of them, so it is the average each account actually got.
+        legs = [(e.exit_price, sum((l.get("accounts_low") or 0) for l in e.legs))
+                for e in self.exits if e.exit_price]
+        priced = [(px, n) for px, n in legs if n]
+        if priced and p.entry_price:
+            shares = sum(n for _px, n in priced)
+            received = sum(px * n for px, n in priced) / shares
+            return received - p.entry_price
+        # An exit with a price but no account counts still beats the model.
+        if legs and p.entry_price:
+            return (sum(px for px, _n in legs) / len(legs)) - p.entry_price
+
+        # 2. No published exit price. The model is all there is, and it is
+        # better than nothing for a play that has not sold yet.
         n = self.ratio_n
         if p.entry_price and n:
             return p.entry_price * (n - 1)
@@ -536,7 +577,11 @@ class Board:
         for l in self.history:
             per = l.per_account_profit
             brokers = l.paying_brokers
-            if not per or not brokers:
+            # `per is None` — not `not per`. A play that broke even is 0.0,
+            # which is falsy, so it was silently dropped from the record along
+            # with any that sold BELOW what it cost. Both are real outcomes and
+            # a board that can only show winners is not a record of anything.
+            if per is None or not brokers:
                 continue
             rows.append({
                 "sym": l.play.symbol,
