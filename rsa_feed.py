@@ -561,7 +561,14 @@ def parse_sell_message(msg: dict) -> tuple[list[SellAlert], list[RoundUp]]:
                     if sold:
                         px_i = lo_i / sold
                 sells.append(SellAlert(
-                    source_id=f"{mid}:{len(sells)}" if mid else f"{sym_i}:{day}",
+                    # Keyed on the SYMBOL, not the position. An index is
+                    # only stable while the parser splits a message the
+                    # same way it did last time, and it does not: fixing
+                    # the shared-total bug moved WXM from :0 to :1 and
+                    # gave :0 to CETX, so a republish would have inserted
+                    # a second WXM and still refused CETX. A message
+                    # reports a given ticker once; that is the identity.
+                    source_id=f"{mid}:{sym_i}" if mid else f"{sym_i}:{day}",
                     symbol=sym_i, exit_price=px_i,
                     proceeds_low=round(lo_i, 2) if lo_i is not None else None,
                     proceeds_high=round(hi_i, 2) if hi_i is not None else None,
