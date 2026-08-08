@@ -406,6 +406,36 @@
             <button type="button" class="chip sm on" data-basis="sold">Booked when sold</button>
             <button type="button" class="chip sm" data-basis="bought">Credited to buy month</button>
           </div>
+          {# The alerts' OWN figures, so the chart above can be checked against
+             the channel it came from. Every other number here is scaled to the
+             reader's account counts — which is the point, and which means a
+             reader who remembers "June was about $1,400" and sees $2,079 has
+             no way to tell a bigger profile from a broken sum. #}
+          <details class="tableview published">
+            <summary>What the alerts themselves reported</summary>
+            <table class="htable">
+              <thead><tr><th>Month</th><th>Exits</th><th>Accounts</th>
+                         <th>Proceeds</th><th>Cost</th><th>Net</th></tr></thead>
+              <tbody>
+                {% for m in board.published_rows %}
+                  <tr><td class="mono">{{ m.key }}</td>
+                      <td class="mono">{{ m.exits }}</td>
+                      <td class="mono">{{ m.accounts }}</td>
+                      <td class="mono">{{ m.gross | money }}</td>
+                      <td class="mono dim">{{ m.cost | money }}</td>
+                      <td class="mono pos">{{ m.net | money }}</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            <p class="muted" style="font-size:11.5px;margin:10px 0 0">
+              The alerter's own arithmetic, across the accounts THEY named — the
+              same for every reader, and what the sell channel adds up to. The
+              chart above is this scaled to <b>your</b> account counts, so it is
+              larger when you hold more accounts than they used and smaller when
+              you hold fewer.
+            </p>
+          </details>
+
           <figure class="chart" id="chart-monthly"
                   aria-label="Theoretical profit booked per month, with the running total"></figure>
           <details class="tableview">
