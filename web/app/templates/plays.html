@@ -220,10 +220,9 @@
         <span class="flabel">Period</span>
         <div class="chips" role="group" aria-label="Period">
           <button type="button" class="chip on" data-month="">All time</button>
-          {# Sold-date periods. Named for their basis, because they select on
-             the day money CAME BACK while the month chips beside them select
-             on the day it went out — two different questions, and a chip that
-             hid which one it answered would be worse than not having it. #}
+          {# Everything here selects on the day it SOLD, month chips included,
+             so a chip and a bar can never disagree about which month a play
+             belongs to. These two are the same basis at day resolution. #}
           <button type="button" class="chip" data-month="sold:today">Sold today</button>
           <button type="button" class="chip" data-month="sold:7d">Sold this week</button>
           {% for m in totals.months %}
@@ -383,18 +382,17 @@
         <div class="card chart-card">
           <div class="card-h">
             <h3 id="profit-chart-title">Profit by month</h3>
-            {# "the month alerted" is not decoration: a play alerted in July and
-               sold in August books to JULY, and This Month inherits that rule.
-               Dropping the basis from this line while adding a tile that
-               depends on it would have been a quiet way to mislead. #}
-            <span class="muted" style="font-size:12px" id="profit-chart-basis">bars, the month alerted · line, the running total</span>
+            {# "the month it sold" is not decoration: a play alerted in March
+               and sold in June books to JUNE, and This Month inherits that
+               rule. Dropping the basis from this line while adding tiles that
+               depend on it would be a quiet way to mislead. #}
+            <span class="muted" style="font-size:12px" id="profit-chart-basis">bars, the month it sold · line, the running total</span>
           </div>
           {# Day and month are the SAME series at two resolutions — same rows,
              same bucketing rule, same running total — so switching cannot
              change the answer, only how finely it is cut. Daily matters
-             because a reverse-split window is days long: "what did the plays
-             I could have bought on Tuesday end up worth" is a question the
-             month view cannot answer. #}
+             because the exits cluster: "what did Thursday's sells actually
+             pay" is a question the month view cannot answer. #}
           <div class="chips grain" role="group" aria-label="Chart resolution">
             <button type="button" class="chip sm on" data-grain="month">By month</button>
             <button type="button" class="chip sm" data-grain="day">By day</button>

@@ -479,9 +479,23 @@ def parse_sell_message(msg: dict) -> tuple[list[SellAlert], list[RoundUp]]:
     notes: list[str] = []
     in_total = False
 
+    # Blocks waiting for a total. Usually one — but a message can list several
+    # tickers and publish ONE combined figure at the end, and attributing all of
+    # it to whichever block happened to be last is both wrong for that ticker
+    # and silently drops every other one. See the split below.
+    pending: list = []
+
+    def park() -> None:
+        """Finish the block being read, if it has anything in it."""
+        nonlocal symbol, price, legs
+        if symbol:
+            pending.append((symbol, price, legs))
+        symbol, price, legs = "", None, []
+
     def flush() -> None:
         nonlocal symbol, price, legs
         symbol, price, legs = "", None, []
+        pending.clear()
 
     for raw in _strip_noise(msg.get("content") or "").splitlines():
         line = raw.strip()
@@ -496,7 +510,7 @@ def parse_sell_message(msg: dict) -> tuple[list[SellAlert], list[RoundUp]]:
         head = _SELL_HEAD.match(line)
         if head:
             in_total = False
-            flush()
+            park()
             # group(2) is None for a bare ticker; the price is derived from
             # the message's own total when it closes the block.
             symbol = head.group(1).upper()
@@ -514,23 +528,45 @@ def parse_sell_message(msg: dict) -> tuple[list[SellAlert], list[RoundUp]]:
 
         total = _SELL_TOTAL.match(line)
         if total:
-            if in_total or not symbol:
+            park()
+            if in_total or not pending:
+                flush()
                 continue         # the message-level 'Total:' sum — not an exit
             lo, hi = _money_range(total.group("amt"))
-            # No price on the ticker line, but the message published a total and
-            # named the accounts -- so the price per account is arithmetic, not a
-            # guess, and it is the figure the whole profit model rests on.
-            px = price
-            if px is None:
-                sold = sum(l.accounts_low for l in legs)
-                if sold and lo:
-                    px = lo / sold
-            sells.append(SellAlert(
-                source_id=f"{mid}:{len(sells)}" if mid else f"{symbol}:{day}",
-                symbol=symbol, exit_price=px,
-                proceeds_low=lo, proceeds_high=hi if hi is not None else lo,
-                legs=tuple(legs), posted_at=posted, sell_date=day,
-            ))
+
+            # Split the figure across every block it closes, in proportion to
+            # what each was worth: price x accounts. On 2026-06-16 one message
+            # listed CETX $3.84 across 14 accounts and WXM $4.24 across 3, then
+            # published +$66.48 — which is exactly 53.76 + 12.72. All of it went
+            # to WXM and CETX produced no exit at all.
+            weights = []
+            for _sym, px, lg in pending:
+                n = sum(l.accounts_low for l in lg)
+                weights.append((px or 0) * n)
+            span = sum(weights)
+            if span <= 0:                      # nothing to weigh by: split evenly
+                weights = [1.0] * len(pending)
+                span = float(len(pending))
+
+            for (sym_i, px_i, lg_i), w in zip(pending, weights):
+                share = w / span
+                lo_i = lo * share if lo is not None else None
+                hi_i = (hi if hi is not None else lo) 
+                hi_i = hi_i * share if hi_i is not None else lo_i
+                # No price on the ticker line, but the message published a total
+                # and named the accounts, so the price per account is arithmetic
+                # rather than a guess.
+                if px_i is None and lo_i:
+                    sold = sum(l.accounts_low for l in lg_i)
+                    if sold:
+                        px_i = lo_i / sold
+                sells.append(SellAlert(
+                    source_id=f"{mid}:{len(sells)}" if mid else f"{sym_i}:{day}",
+                    symbol=sym_i, exit_price=px_i,
+                    proceeds_low=round(lo_i, 2) if lo_i is not None else None,
+                    proceeds_high=round(hi_i, 2) if hi_i is not None else None,
+                    legs=tuple(lg_i), posted_at=posted, sell_date=day,
+                ))
             flush()
             continue
 

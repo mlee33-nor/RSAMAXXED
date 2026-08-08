@@ -585,13 +585,20 @@ class Board:
                 continue
             rows.append({
                 "sym": l.play.symbol,
-                # The ALERT month, not the month the split resolved. The page
-                # asks "if I had bought everything, what did each month make",
-                # and you buy on the alert — so the payout belongs to the month
-                # you would have put the money in. Booking it to the resolution
-                # date instead drains a month of its own plays and piles them
-                # into the next one, which is what made June read as empty.
-                "on": l.play.alert_date or l.resolved_on,
+                # THE DAY IT SOLD. A profit chart answers "when did I make
+                # this", and the money arrives when the exit clears, not when
+                # the alert went out.
+                #
+                # This was the alert date until 2026-08-07, on the reasoning
+                # that you commit capital on the alert. True, and it is a
+                # different question from the one the chart asks — and it read
+                # badly: a reverse split resolves weeks after its alert, so
+                # March, April and May alerts that all sold in June piled into
+                # three tiny stacks months before any money existed, while June
+                # looked thin. `alerted` is kept for anything that wants the
+                # other basis.
+                "on": l.resolved_on or l.play.alert_date,
+                "alerted": l.play.alert_date or "",
                 "booked": l.resolved_on,
                 "per": round(per, 4),
                 "brokers": [broker_key(b) for b in brokers],
