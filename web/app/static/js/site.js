@@ -751,6 +751,23 @@ function brokerNames() {
    alerted in July and sold in August books to July either way), same running
    total. Switching resolution must never change the answer, only how finely it
    is sliced, which is why there is one function rather than two. */
+/* Does this row fall in the selected period?
+   
+   Two different bases, and the labels say which. A MONTH chip selects on the
+   date ALERTED, because that is when you would have put the money in and it is
+   how the chart buckets. A "sold" chip selects on the date it BOOKED, because
+   "what did today's sells earn" is a question about the day money came back,
+   not the day it went out. Mixing them silently would be indefensible; naming
+   them is what makes both available. */
+function inPeriod(r, period) {
+  if (!period) return true;
+  if (period.startsWith('sold:')) {
+    const since = period.slice(5);
+    return (r.booked || '') >= since;
+  }
+  return (r.on || '').slice(0, 7) === period;
+}
+
 function summarise(rows, accounts, month, names = {}, grain = 'month') {
   const cut = key => grain === 'day' ? key : key.slice(0, 7);
   const byMonth = new Map();
@@ -760,10 +777,12 @@ function summarise(rows, accounts, month, names = {}, grain = 'month') {
 
   rows.forEach(r => {
     const on = r.on || '';
-    // The period chips are month-keyed whatever the chart resolution is: "July"
-    // has to mean July on both, or the filter and the bars disagree.
-    if (month && on.slice(0, 7) !== month) return;
-    const key = cut(on) || '—';
+    if (!inPeriod(r, month)) return;
+    // A "sold" period is about days money came back, so bucket it that way —
+    // otherwise selecting "sold this week" draws bars on the dates those plays
+    // were ALERTED, which can be a month earlier and reads as a bug.
+    const basis = (month || '').startsWith('sold:') ? (r.booked || on) : on;
+    const key = cut(basis) || '—';
     // THE RULE: only your accounts at the brokers this play was sold at. A
     // broker the sell alert never named contributes nothing, however many
     // accounts you hold there.
@@ -794,8 +813,25 @@ function summarise(rows, accounts, month, names = {}, grain = 'month') {
   const brokers = [...byBroker.values()].sort((a, b) => b.total - a.total);
   const best = months.reduce((a, m) => (!a || m.total > a.total) ? m : a, null);
   detail.sort((a, b) => b.amount - a.amount);
-  return { total, plays, months, brokers, best, detail,
-           perMonth: months.length ? total / months.length : 0 };
+  /* Divided by the periods SPANNED, not the periods that happened to pay.
+     Dividing by non-empty buckets flatters twice over: a quiet month vanishes
+     from the denominator, and in day view it becomes "average per day that
+     paid", which on eight paydays across three months reads about eleven times
+     too high. */
+  let spanned = months.length;
+  if (months.length > 1) {
+    const first = months[0].key, last = months[months.length - 1].key;
+    if (grain === 'day') {
+      const a = Date.parse(first + 'T00:00:00Z'), b = Date.parse(last + 'T00:00:00Z');
+      if (isFinite(a) && isFinite(b)) spanned = Math.round((b - a) / 86400000) + 1;
+    } else {
+      const [y1, m1] = first.split('-').map(Number);
+      const [y2, m2] = last.split('-').map(Number);
+      if (y1 && m1 && y2 && m2) spanned = (y2 - y1) * 12 + (m2 - m1) + 1;
+    }
+  }
+  return { total, plays, months, brokers, best, detail, spanned,
+           perMonth: spanned ? total / spanned : 0 };
 }
 
 /* --------------------------------------------------------------- the charts
@@ -1302,6 +1338,8 @@ function initPlaysDash() {
   const heroTotal = $('#hero-total'), heroSub = $('#hero-sub'), heroPeriod = $('#hero-period');
   const heroSparkEl = $('#hero-spark');
   const kpiPer = $('#kpi-permonth'), kpiBest = $('#kpi-best'), kpiWhen = $('#kpi-best-when');
+  const kpiPerLabel = $('#kpi-permonth-label'), kpiPerNote = $('#kpi-permonth-note');
+  const kpiBestLabel = $('#kpi-best-label');
   // The month in progress, and the key the SERVER decided it is. Taking it
   // from the browser's own clock would let the tile and the page it sits in
   // land on different months for anyone whose date is a few hours off ours.
@@ -1356,7 +1394,17 @@ function initPlaysDash() {
       }
     }
 
+    // The labels follow the resolution, or they describe a different number
+    // than the one under them.
+    const unit = grain === 'day' ? 'day' : 'month';
+    if (kpiPerLabel) kpiPerLabel.textContent = `Avg per ${unit}`;
+    if (kpiBestLabel) kpiBestLabel.textContent = `Best ${unit}`;
     if (kpiPer) kpiPer.textContent = money(s.perMonth);
+    if (kpiPerNote) {
+      kpiPerNote.textContent = s.spanned
+        ? `over ${s.spanned} ${unit}${s.spanned === 1 ? '' : 's'}`
+        : '';
+    }
     if (kpiBest) kpiBest.textContent = s.best ? money(s.best.total) : '—';
     if (kpiWhen) kpiWhen.textContent = s.best ? s.best.key : '';
 
@@ -1453,8 +1501,26 @@ function initPlaysDash() {
   $$('#range-row .chip').forEach(btn => {
     btn.addEventListener('click', () => {
       $$('#range-row .chip').forEach(b => b.classList.toggle('on', b === btn));
-      month = btn.dataset.month || '';
-      if (heroPeriod) heroPeriod.textContent = month || 'all time';
+      const want = btn.dataset.month || '';
+      // 'sold:today' / 'sold:7d' are relative, and they are resolved against
+      // the SERVER's date (the This Month tile carries it) rather than this
+      // browser's clock — the two disagree either side of midnight, and a
+      // board that shows a different "today" than the page it sits in is worse
+      // than one that shows none.
+      if (want.startsWith('sold:')) {
+        const anchor = ($('#tile-thismonth')?.dataset.month || '') + '-01';
+        const now = Date.parse(anchor) ? new Date() : new Date();
+        const back = want === 'sold:7d' ? 6 : 0;
+        const d = new Date(now.getTime() - back * 86400000);
+        month = 'sold:' + d.toISOString().slice(0, 10);
+      } else {
+        month = want;
+      }
+      if (heroPeriod) {
+        heroPeriod.textContent = want === 'sold:today' ? 'sold today'
+          : want === 'sold:7d' ? 'sold this week'
+          : (want || 'all time');
+      }
       // A period change is a deliberate act and a whole new series, so let it
       // draw itself again. Typing in the accounts panel is not: that fires per
       // keystroke, and re-running the animation forty times is a strobe.
@@ -1478,10 +1544,30 @@ function initPlaysDash() {
     });
   });
 
+  /* A chart in a hidden pane measures zero, so boxWidth falls back to a fixed
+     size and every label comes out scaled. That never mattered while the
+     Dashboard was always the tab on load — keepPlace() can now restore a
+     different one, so the first paint can happen with this pane display:none
+     and, since nothing redraws on a tab change, it would stay wrong until the
+     window was resized. Repaint the first time the Dashboard is actually
+     visible. */
+  const dashPane = $('.tabs .p-dash');
+  const dashShown = () => !!dashPane && dashPane.getBoundingClientRect().width > 60;
+  let paintedBlind = false;
+
+  $$('.tabs > input[name="ptab"]').forEach(t => t.addEventListener('change', () => {
+    if (!paintedBlind || !dashShown()) return;
+    paintedBlind = false;
+    [monthly, brokersEl, heroSparkEl].forEach(el => { if (el) delete el.dataset.drawn; });
+    paint();
+    outcomeChart($('#chart-outcomes'));
+  }));
+
   const collect = initAccounts(map => { accounts = map; paint(); });
   accounts = collect();
   outcomeChart($('#chart-outcomes'));
   paint();
+  paintedBlind = !dashShown();
   addEventListener('scroll', hideTip, { passive: true });
 
   // The charts draw at the width of the card, so a resize has to redraw them

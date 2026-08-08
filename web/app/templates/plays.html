@@ -220,6 +220,12 @@
         <span class="flabel">Period</span>
         <div class="chips" role="group" aria-label="Period">
           <button type="button" class="chip on" data-month="">All time</button>
+          {# Sold-date periods. Named for their basis, because they select on
+             the day money CAME BACK while the month chips beside them select
+             on the day it went out — two different questions, and a chip that
+             hid which one it answered would be worse than not having it. #}
+          <button type="button" class="chip" data-month="sold:today">Sold today</button>
+          <button type="button" class="chip" data-month="sold:7d">Sold this week</button>
           {% for m in totals.months %}
             <button type="button" class="chip" data-month="{{ m.key }}">{{ m.key }}</button>
           {% endfor %}
@@ -256,12 +262,18 @@
               {% endif %}
             </div>
           </div>
+          {# These two follow the chart's resolution, and their LABELS have to
+             follow with them. Left saying "month" in day view they reported an
+             average per day and the best single day under a monthly heading,
+             which is not a rounding difference — it is a different number
+             entirely, roughly thirty times out. #}
           <div class="tile">
-            <div class="k">Avg per month</div>
+            <div class="k" id="kpi-permonth-label">Avg per month</div>
             <div class="v num" id="kpi-permonth">{{ totals.per_month | money }}</div>
+            <div class="k2" id="kpi-permonth-note"></div>
           </div>
           <div class="tile">
-            <div class="k">Best month</div>
+            <div class="k" id="kpi-best-label">Best month</div>
             <div class="v num" id="kpi-best">{% if totals.best %}{{ totals.best.total | money }}{% else %}—{% endif %}</div>
             <div class="k2" id="kpi-best-when">{% if totals.best %}{{ totals.best.key }}{% endif %}</div>
           </div>
@@ -631,6 +643,19 @@
             <span class="sb sb-{{ status }}"><b>{{ n }}</b> {{ label }}</span>
           {% endfor %}
         </div>
+        {# "Unconfirmed" reads like something went wrong, and nothing did. The
+           round-up board the alerter publishes only goes back so far, so an
+           older alert has no outcome to report — it is a gap in what was
+           published, not a play stuck in limbo, and saying so is cheaper than
+           letting every reader wonder. #}
+        {% if board.unconfirmed_count %}
+          <p class="muted" style="font-size:12px;margin:10px 0 0">
+            <b>{{ board.unconfirmed_count }} unconfirmed</b> — the round-up board only
+            goes back to {{ board.tracked_from or 'recently' }}, so alerts older than that
+            have no outcome published. They are not still pending; nobody ever
+            said what happened to them.
+          </p>
+        {% endif %}
       {% endif %}
 
       <div class="htable-wrap">
