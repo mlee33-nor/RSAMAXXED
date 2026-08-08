@@ -277,6 +277,25 @@
             <div class="v num">{{ board.awaiting_sale | length }}</div>
             <div class="k2">resolved, awaiting an exit</div>
           </div>
+          {# The denominator. A profit figure with no capital behind it can
+             only flatter, and two thirds of resolved alerts pay this reader
+             nothing — so what buying the whole feed would have COST belongs
+             next to what it made, not on another tab. #}
+          <div class="tile">
+            <div class="k">Capital deployed</div>
+            <div class="v num" id="kpi-deployed">—</div>
+            <div class="k2" id="kpi-deployed-note">to buy every alert</div>
+          </div>
+          <div class="tile">
+            <div class="k">Return on it</div>
+            <div class="v num" id="kpi-roc">—</div>
+            <div class="k2" id="kpi-roc-note">profit ÷ deployed</div>
+          </div>
+          <div class="tile">
+            <div class="k">Paid you</div>
+            <div class="v num" id="kpi-hit">—</div>
+            <div class="k2" id="kpi-hit-note">of the alerts you'd have bought</div>
+          </div>
           <div class="tile{% if board.urgent %} hot{% endif %}">
             <div class="k">Closing ≤ 2 days</div>
             <div class="v num">{{ board.urgent | length }}</div>
@@ -706,6 +725,9 @@
     brokers it paid in.
   #}
   <script type="application/json" id="payouts">{{ board.payout_json | safe }}</script>
+  {# The cost side. Every alert anyone would actually have bought, with what a
+     share cost — so the page can put a denominator under the profit. #}
+  <script type="application/json" id="capital">{{ board.capital_json | safe }}</script>
   {% endif %}
 
   {# No automation pitch here. This board is the plays; the terminal is separate

@@ -560,6 +560,47 @@ class Board:
         return json.dumps(self.payout_rows, separators=(",", ":"))
 
     @property
+    def capital_rows(self) -> list[dict]:
+        """Every alert worth money to BUY, whether or not it ever paid.
+
+        `payout_rows` is the winners. On its own it can only flatter: the board
+        reports what the plays that paid were worth and never what buying the
+        whole feed cost, so a headline figure has no denominator. Two thirds of
+        resolved alerts come back fractional and pay this reader nothing.
+
+        A fractional outcome is NOT a total loss — cash in lieu returns roughly
+        the market value of the fraction, and an unsold fraction is still worth
+        about what was paid for it. So this ships the COST, and lets the page
+        say "deployed X to make Y across N plays" rather than inventing a loss
+        figure nobody actually took. Understating profit would be as misleading
+        as overstating it.
+
+        Watch-only alerts are excluded: the split is not declared, so nobody
+        would have bought them, and counting their cost would invent capital
+        that was never committed.
+        """
+        rows = []
+        for l in self.history:
+            p = l.play
+            if not p.entry_price or not p.is_actionable:
+                continue
+            rows.append({
+                "sym": p.symbol,
+                "on": p.alert_date or "",
+                "entry": round(p.entry_price, 4),
+                "status": l.status,
+                # Whether it paid is the browser's question, not ours — it
+                # depends on the reader's brokers — but "did a sell alert ever
+                # name anywhere" is ours.
+                "sold": l.sold,
+            })
+        return sorted(rows, key=lambda r: r["on"])
+
+    @property
+    def capital_json(self) -> str:
+        return json.dumps(self.capital_rows, separators=(",", ":"))
+
+    @property
     def broker_slots(self) -> list[tuple[str, str, bool]]:
         """(display name, key, holds fractions) for the settings panel."""
         return [(b, broker_key(b), b in FRACTIONAL_BROKERS) for b in SUPPORTED_BROKERS]
