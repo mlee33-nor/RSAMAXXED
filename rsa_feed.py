@@ -330,6 +330,41 @@ def _pick_field(fields: dict[str, str], *needles: str) -> str:
     return ""
 
 
+# Labels the plain-text form uses, in the order they appear. Matched loosely
+# because the emoji version writes "🎟️ Ticker" and the typed one just "Ticker".
+_TEXT_LABELS = ("alert date", "ticker", "ratio", "current share price",
+                "potential profit", "last day to buy", "strategy",
+                "round up history", "roundup history")
+
+
+def _embed_from_text(content: str) -> dict | None:
+    """An embed-shaped dict from an alert someone typed out by hand.
+
+    Returns None unless the message actually looks like one, so ordinary chat
+    in the buy channel cannot be mistaken for an alert.
+    """
+    lines = [l.strip() for l in (content or "").splitlines()]
+    lines = [l for l in lines if l]
+    if not lines or "rsa alert" not in lines[0].lower():
+        return None
+
+    fields = []
+    i = 1
+    while i < len(lines):
+        label = lines[i].lower().strip("*_` ")
+        if any(label.startswith(n) for n in _TEXT_LABELS) and i + 1 < len(lines):
+            fields.append({"name": lines[i], "value": lines[i + 1]})
+            i += 2
+            continue
+        i += 1
+    if not fields:
+        return None
+    # The line under the title is the type (STANDARD / OTC / CONDITIONAL), the
+    # same thing the embed carries in its description.
+    desc = lines[1] if len(lines) > 1 else ""
+    return {"title": lines[0], "description": desc, "fields": fields}
+
+
 def parse_buy_message(msg: dict) -> list[BuyAlert]:
     """Every RSA Alert embed in one BUY-channel message.
 
@@ -341,7 +376,22 @@ def parse_buy_message(msg: dict) -> list[BuyAlert]:
     default_date = _msg_date(msg)
     out: list[BuyAlert] = []
 
-    for i, embed in enumerate(msg.get("embeds") or []):
+    embeds = list(msg.get("embeds") or [])
+    if not embeds:
+        # The SAME alert, typed rather than sent by the bot: no embed at all,
+        # the field names and values simply alternating down the message.
+        #
+        #     🔔 RSA Alert / STANDARD / Alert Date / 5/29/26 / Ticker / SBFM ...
+        #
+        # It parsed to nothing, so SBFM had no entry price, so its June exits
+        # could not be priced and dropped out of the record entirely. Rebuilt
+        # into the shape the embed path already knows how to read, so there is
+        # one extraction rather than two that drift.
+        faux = _embed_from_text(msg.get("content") or "")
+        if faux:
+            embeds = [faux]
+
+    for i, embed in enumerate(embeds):
         title = embed.get("title") or ""
         desc = embed.get("description") or ""
         fields = _field_map(embed)

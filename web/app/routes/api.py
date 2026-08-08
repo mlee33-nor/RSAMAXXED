@@ -441,7 +441,8 @@ def ingest_plays(body: FeedIn, db: Session = Depends(get_db)) -> dict[str, Any]:
     # `notes` counts CORRECTIONS to exits that already existed — see below. It
     # is reported separately from `sells` because nothing was published; a
     # caption this parser previously got wrong was repaired.
-    counts = {"buys": 0, "sells": 0, "roundups": 0, "lifecycle": 0, "notes": 0}
+    counts = {"buys": 0, "sells": 0, "roundups": 0, "lifecycle": 0,
+              "notes": 0, "migrated": 0}
 
     def _fresh(model, ids: list[str]) -> set[str]:
         if not ids:
@@ -520,6 +521,40 @@ def ingest_plays(body: FeedIn, db: Session = Depends(get_db)) -> dict[str, Any]:
             if row is not None and (s.note or "")[:2000] != (row.note or ""):
                 row.note = (s.note or "")[:2000]
                 counts["notes"] = counts.get("notes", 0) + 1
+
+    # One-time migration of the positional ids to symbol-keyed ones.
+    #
+    # A row stored as "<mid>:0" is from the parser that could not split a
+    # message sharing one total between two tickers, so its money is a KNOWN
+    # artifact -- WXM was stored at $66.48, which is its own $12.72 plus all of
+    # CETX's $53.76. Re-keying it and taking the corrected figures is not
+    # rewriting history; it is finishing a parse that was wrong.
+    #
+    # Deliberately one-way and one-time: it fires only when the stored id is
+    # positional AND the incoming one is symbol-keyed for the same message and
+    # ticker. Once migrated the row is symbol-keyed, so it can never be
+    # rewritten again, and the immutability of every other exit is untouched.
+    if body.sells:
+        legacy = {}
+        for row in db.scalars(select(PlayExit)):
+            head, sep, tail = (row.source_id or "").partition(":")
+            if sep and head.isdigit() and tail.isdigit():
+                legacy[(head, row.symbol)] = row
+        for s in body.sells:
+            head, sep, tail = (s.source_id or "").partition(":")
+            if not (sep and head.isdigit()) or tail.isdigit():
+                continue                     # not a symbol-keyed replacement
+            row = legacy.get((head, s.symbol))
+            if row is None:
+                continue
+            row.source_id = s.source_id
+            row.exit_price = s.exit_price
+            row.proceeds_low = s.proceeds_low
+            row.proceeds_high = s.proceeds_high
+            row.legs_json = json.dumps([l.model_dump() for l in s.legs])
+            reported.discard((head, s.symbol))
+            seen.add(s.source_id)
+            counts["migrated"] = counts.get("migrated", 0) + 1
 
     for s in body.sells:
         msg = _msg_of(s.source_id)

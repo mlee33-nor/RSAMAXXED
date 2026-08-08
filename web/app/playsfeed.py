@@ -612,6 +612,44 @@ class Board:
         return json.dumps(self.payout_rows, separators=(",", ":"))
 
     @property
+    def published_rows(self) -> list[dict]:
+        """What the ALERTS themselves reported, month by month.
+
+        Every other figure on this board is scaled to the reader's own account
+        counts, which is the point — and it means nothing on the page can be
+        checked against the channel it came from. A reader who remembers "June
+        was about $1,400" and sees $2,079 has no way to tell a bigger account
+        profile from a broken sum.
+
+        So this is the alerter's own arithmetic, untouched: the proceeds they
+        published, less what those shares cost at the alert price, across the
+        accounts THEY named. It reconciles to the sell channel by construction
+        and is the same for every reader.
+        """
+        by_month: dict[str, dict] = {}
+        for l in self.history:
+            entry = l.play.entry_price
+            for e in l.exits:
+                if not e.sell_date or e.proceeds_low is None:
+                    continue
+                legs = sum((leg.get("accounts_low") or 0) for leg in e.legs)
+                key = e.sell_date[:7]
+                b = by_month.setdefault(
+                    key, {"key": key, "gross": 0.0, "cost": 0.0, "exits": 0,
+                          "accounts": 0})
+                b["gross"] += e.proceeds_low
+                b["cost"] += (entry or 0) * legs
+                b["accounts"] += legs
+                b["exits"] += 1
+        for b in by_month.values():
+            b["net"] = b["gross"] - b["cost"]
+        return [by_month[k] for k in sorted(by_month)]
+
+    @property
+    def published_json(self) -> str:
+        return json.dumps(self.published_rows, separators=(",", ":"))
+
+    @property
     def capital_rows(self) -> list[dict]:
         """Every alert worth money to BUY, whether or not it ever paid.
 
