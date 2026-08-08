@@ -752,13 +752,10 @@ function brokerNames() {
    total. Switching resolution must never change the answer, only how finely it
    is sliced, which is why there is one function rather than two. */
 /* Does this row fall in the selected period?
-   
-   Two different bases, and the labels say which. A MONTH chip selects on the
-   date ALERTED, because that is when you would have put the money in and it is
-   how the chart buckets. A "sold" chip selects on the date it BOOKED, because
-   "what did today's sells earn" is a question about the day money came back,
-   not the day it went out. Mixing them silently would be indefensible; naming
-   them is what makes both available. */
+
+   Everything selects on the date it SOLD, which is also how the chart buckets,
+   so a chip and a bar can never disagree about which month a play belongs to.
+   The "sold today / this week" chips are the same basis at day resolution. */
 function inPeriod(r, period) {
   if (!period) return true;
   if (period.startsWith('sold:')) {
@@ -1384,8 +1381,8 @@ function initPlaysDash() {
     if (grainTitle) grainTitle.textContent = `Profit by ${grain}`;
     if (grainBasis) {
       grainBasis.textContent = grain === 'day'
-        ? 'bars, the day alerted · line, the running total'
-        : 'bars, the month alerted · line, the running total';
+        ? 'bars, the day it sold · line, the running total'
+        : 'bars, the month it sold · line, the running total';
     }
 
     heroCount(heroTotal, s.total, animate);
