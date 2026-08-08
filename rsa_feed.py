@@ -398,12 +398,23 @@ def _buys_from_text(text: str, mid: str, day: str, posted: str) -> list[BuyAlert
 
 # 'EDBL $3.59' — the line that opens an exit block. The price is required:
 # without it the line is prose, not an exit.
-_SELL_HEAD = re.compile(rf"^\s*({_TICKER})\s*[@:]?\s*\$?\s*(\d+(?:\.\d+)?)\s*$")
+# The line that opens an exit. THE PRICE IS OPTIONAL: the channel writes both
+# "BYAH $3.22" and a bare "XXII", and requiring a price meant the bare form
+# never set a symbol -- so the total two lines later was discarded as a
+# message-level sum and the whole exit vanished. Seven June messages went
+# that way, worth $441, which is most of the gap between the board and what
+# the channel recorded for the month.
+_SELL_HEAD = re.compile(rf"^\s*({_TICKER})\s*[@:]?\s*\$?\s*(\d+(?:\.\d+)?)?\s*$")
 
 # '- Robinhood x3' / '- Robinhood: x3' / '- Public x9-21' / '- wells  x10'
+# A broker the exit cleared at. THE COUNT IS OPTIONAL TOO -- "- chase" with no
+# "x6" is how the shorter messages are written. The count is the ALERTER's
+# anyway and the board ignores it (the multiplier is the reader's own
+# accounts), so a leg without one still names the broker, which is the part
+# that matters. Recorded as 0 rather than invented as 1: unknown is not one.
 _SELL_LEG = re.compile(
     r"^\s*[-•*]\s*(?P<broker>[A-Za-z][A-Za-z0-9 .*&\-]*?)\s*:?\s*"
-    r"[x×]\s*(?P<low>\d+)(?:\s*-\s*(?P<high>\d+))?\s*$",
+    r"(?:[x×]\s*(?P<low>\d+)(?:\s*-\s*(?P<high>\d+))?)?\s*$",
     re.I,
 )
 
@@ -486,14 +497,17 @@ def parse_sell_message(msg: dict) -> tuple[list[SellAlert], list[RoundUp]]:
         if head:
             in_total = False
             flush()
-            symbol, price = head.group(1).upper(), float(head.group(2))
+            # group(2) is None for a bare ticker; the price is derived from
+            # the message's own total when it closes the block.
+            symbol = head.group(1).upper()
+            price = float(head.group(2)) if head.group(2) else None
             continue
 
         leg = _SELL_LEG.match(line)
         if leg and symbol:
             broker = normalize_broker(leg.group("broker"))
             if broker:
-                low = int(leg.group("low"))
+                low = int(leg.group("low") or 0)
                 high = int(leg.group("high") or low)
                 legs.append(SellLeg(broker, low, max(low, high)))
             continue
@@ -503,9 +517,17 @@ def parse_sell_message(msg: dict) -> tuple[list[SellAlert], list[RoundUp]]:
             if in_total or not symbol:
                 continue         # the message-level 'Total:' sum — not an exit
             lo, hi = _money_range(total.group("amt"))
+            # No price on the ticker line, but the message published a total and
+            # named the accounts -- so the price per account is arithmetic, not a
+            # guess, and it is the figure the whole profit model rests on.
+            px = price
+            if px is None:
+                sold = sum(l.accounts_low for l in legs)
+                if sold and lo:
+                    px = lo / sold
             sells.append(SellAlert(
                 source_id=f"{mid}:{len(sells)}" if mid else f"{symbol}:{day}",
-                symbol=symbol, exit_price=price,
+                symbol=symbol, exit_price=px,
                 proceeds_low=lo, proceeds_high=hi if hi is not None else lo,
                 legs=tuple(legs), posted_at=posted, sell_date=day,
             ))
