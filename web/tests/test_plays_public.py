@@ -146,7 +146,9 @@ def test_changing_the_password_forgets_every_browser(anon, monkeypatch):
     monkeypatch.setattr(config, "PLAYS_PASSWORD", "a-brand-new-password")
     stale = TestClient(app, cookies={"rsamaxxed_plays": cookie})
     assert 'name="password"' in stale.get("/plays").text
-    assert stale.get("/api/v1/public/plays").status_code == 401
+    # The JSON feed is open by design and is not what the password protects —
+    # see the feed-is-open tests below. Only the browser board is revoked.
+    assert stale.get("/api/v1/public/plays").status_code == 200
 
 
 def test_the_calculator_remembers_the_account_count():
@@ -402,15 +404,15 @@ def test_an_open_tab_learns_about_new_alerts_without_being_reloaded():
     assert "setInterval(poll" in js
 
 
-def test_the_poll_reads_the_feed_off_the_same_cookie_the_board_uses(anon):
-    """No key in the JavaScript: the page is already through the gate, and the
-    feed door accepts that. A password pasted into a static asset would be
-    published to everyone who can read the asset — which is everyone."""
+def test_the_poll_reads_the_feed_without_a_key_in_the_javascript(anon):
+    """No key in the JavaScript — and none needed. The feed is open, so the
+    page has nothing to leak. A password pasted into a static asset would be
+    published to everyone who can read the asset, which is everyone."""
     _unlock(anon)
     assert anon.get("/api/v1/public/plays").status_code == 200
 
     stranger = TestClient(app)
-    assert stranger.get("/api/v1/public/plays").status_code == 401
+    assert stranger.get("/api/v1/public/plays").status_code == 200
 
     with TestClient(app) as c:
         js = c.get("/static/js/site.js").text
@@ -877,29 +879,36 @@ def test_a_tracked_split_with_no_matching_alert_is_still_listed(anon):
 
 
 # ------------------------------------------------- the account-free JSON door
-# The feed is a paid tier. An HTML page behind a password whose JSON twin is
-# wide open would be a gate with a hole cut in the wall beside it.
+# The feed is FREE and these three routes are deliberately open. A downloaded
+# terminal must fill itself with nothing pasted in, so anything that puts a
+# door in front of them is a regression, not a hardening. These tests exist to
+# make re-gating them a decision someone takes on purpose.
 
 FEED_ROUTES = ("/api/v1/public/plays", "/api/v1/public/plays/picks",
                "/api/v1/public/plays/lifecycle")
 
 
 @pytest.mark.parametrize("path", FEED_ROUTES)
-def test_the_feed_api_is_not_readable_without_the_password(path, anon):
-    assert anon.get(path).status_code == 401
+def test_the_feed_api_is_readable_by_anyone(path, anon):
+    """A fresh clone with no .env, no key and no account: it just works."""
+    assert anon.get(path).status_code == 200
 
 
 @pytest.mark.parametrize("path", FEED_ROUTES)
-def test_the_password_reads_the_feed_with_no_account(path, anon):
-    """What a subscriber's terminal does: no signup, no pairing, just the key."""
+def test_a_key_is_accepted_but_never_required(path, anon):
+    """Installs that still carry RSAMAXXED_PLAYS_KEY from the paid era must not
+    break — the header is simply ignored now."""
     r = anon.get(path, headers={"X-Plays-Key": PASSWORD})
     assert r.status_code == 200, r.text
 
 
 @pytest.mark.parametrize("path", FEED_ROUTES)
-def test_an_unset_password_locks_the_feed_rather_than_opening_it(path, anon, monkeypatch):
+def test_an_unset_board_password_does_not_take_the_feed_down(path, anon, monkeypatch):
+    """PLAYS_PASSWORD gates the browser board only. Leaving it unset must not
+    starve every terminal in the field — that coupling is what made a
+    misconfigured deploy look like a dead product."""
     monkeypatch.setattr(config, "PLAYS_PASSWORD", "")
-    assert anon.get(path, headers={"X-Plays-Key": "anything"}).status_code == 503
+    assert anon.get(path).status_code == 200
 
 
 def test_a_browser_that_typed_the_password_can_read_the_json(anon):

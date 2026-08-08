@@ -427,6 +427,32 @@ class CloudSync:
             return env
         return str(_read_state().get("plays_key") or "").strip()
 
+    def check_plays_key(self, key: str) -> bool:
+        """Is this password one the feed accepts? Saves nothing either way.
+
+        Takes the key as an argument rather than reading the stored one on
+        purpose: the setup prompt must be able to test what the user just typed
+        WITHOUT writing it first. Storing then rolling back would leave a bad
+        key on disk if the check died mid-flight, and that is the one state
+        that looks identical to a working install from the outside.
+        """
+        cleaned = (key or "").strip()
+        if not cleaned:
+            return False
+        try:
+            r = requests.get(
+                self._url("/public/plays/picks"),
+                headers={"X-Plays-Key": cleaned},
+                timeout=_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            raise CloudError(f"Can't reach RSAMAXXED Cloud: {exc}") from exc
+        if r.status_code == 401:
+            return False
+        if r.status_code >= 400:
+            raise CloudError(f"RSAMAXXED Cloud returned {r.status_code}")
+        return True
+
     def set_plays_key(self, key: str) -> None:
         """Remember the board password on this machine."""
         state = _read_state()

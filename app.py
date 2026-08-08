@@ -1224,6 +1224,11 @@ class App(ctk.CTk):
         self.after(700, self._startup_refresh)
         # TRACK board: runs on its own hourly timer, not the Discord toggle.
         self.after(2500, self._track_loop)
+        # No plays-password prompt on startup: the hosted feed is open, so a
+        # fresh install has nothing to enter and asking would invent friction
+        # that the product does not have. _prompt_plays_key stays reachable
+        # from the picks screen for anyone pointed at a self-hosted deployment
+        # that gates its own feed.
 
     # ---- Worker -> UI handoff ----------------------------------------------
 
@@ -3169,15 +3174,20 @@ class App(ctk.CTk):
             # arrive on their own.
             if _PICKS_AUTH_ERROR:
                 # The one empty state the user MUST act on. Waiting will not
-                # fix it, so this says the opposite of the message below.
-                self._empty_state(
+                # fix it, so this says the opposite of the message below — and
+                # carries the button that fixes it, rather than describing a
+                # file they would have to go and find.
+                box = self._empty_state(
                     self._picks_grid, "warning", "Add your plays password",
-                    "This copy has no board password, so the feed won't send "
-                    "anything. Open the .env file next to the app and set "
-                    "RSAMAXXED_PLAYS_KEY to the password you were given — the "
-                    "same one that opens rsamaxxed.com/plays — then restart. "
-                    "Waiting will not fix this on its own.",
-                    bg=BG_CARD, pad=18).pack(fill="x")
+                    "This copy has no plays password yet, so the feed won't "
+                    "send anything. Paste the one you were given — the same "
+                    "one that opens rsamaxxed.com/plays. Waiting will not fix "
+                    "this on its own.",
+                    bg=BG_CARD, pad=18)
+                PillButton(box, text="Enter password",
+                           command=self._prompt_plays_key,
+                           width=150, height=32).pack(pady=(0, 18))
+                box.pack(fill="x")
             elif getattr(self, "_feed_fail_streak", 0) or self._feed_last_ok is None:
                 self._empty_state(
                     self._picks_grid, "warning", "Waiting for the play feed",
@@ -3923,6 +3933,133 @@ class App(ctk.CTk):
         btn_frame = tk.Frame(dlg, bg=BG_CARD)
         btn_frame.pack(fill="x", padx=20, pady=(12, 8))
         PillButton(btn_frame, text="Save", command=save, width=90, height=30).pack(side="right")
+
+    def _needs_plays_key(self) -> bool:
+        """True when this copy can't read the feed and could be told how to.
+
+        A paired device authenticates with its token and needs no password, so
+        asking would be noise.
+        """
+        if not CLOUD_AVAILABLE:
+            return False
+        try:
+            client = cloud_sync.CloudSync()
+            return not client.device_token and not client.plays_key
+        except Exception:
+            return False
+
+    def _maybe_prompt_plays_key(self) -> None:
+        """Ask for the password on first launch, once.
+
+        The whole subscription is one string, and until this existed the only
+        way to enter it was to find .env in a file manager and edit it — which
+        is why a new customer's Watchlist sat empty and looked broken. Asked
+        once: a customer who dismisses it gets the picks-screen button instead
+        of a dialog every hour.
+        """
+        if getattr(self, "_asked_plays_key", False) or not self._needs_plays_key():
+            return
+        self._asked_plays_key = True
+        self._prompt_plays_key(first_run=True)
+
+    def _prompt_plays_key(self, first_run: bool = False) -> None:
+        """Modal: paste the plays password, verify it, save it, load the feed.
+
+        Verified before it is saved, because a wrong password fails exactly
+        like no password — an empty screen — and a customer who believes they
+        have already entered it has no way left to tell the difference.
+        """
+        dlg = tk.Toplevel(self)
+        dlg.title("Connect your plays feed")
+        dlg.configure(bg=BG_CARD)
+        dlg.geometry("460x290")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text=icon("starfill"), bg=BG_CARD, fg=ACCENT,
+                 font=(ICON_FONT, 22)).pack(pady=(20, 6))
+        tk.Label(dlg,
+                 text="Welcome to RSAMAXXED" if first_run else "Connect your plays feed",
+                 bg=BG_CARD, fg=TEXT_PRIMARY,
+                 font=(FONT_FAMILY, 13, "bold")).pack()
+        tk.Label(dlg,
+                 text="Paste your plays password to start receiving alerts.\n"
+                      "It's the same one that opens rsamaxxed.com/plays.",
+                 bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9),
+                 justify="center").pack(pady=(4, 12))
+
+        entry = tk.Entry(dlg, bg=BG_INPUT, fg=TEXT_PRIMARY, show="•",
+                         insertbackground=TEXT_PRIMARY, font=(FONT_FAMILY, 11),
+                         relief="flat", bd=0, highlightthickness=1,
+                         highlightbackground=BORDER, highlightcolor=ACCENT,
+                         justify="center")
+        entry.pack(fill="x", padx=40, ipady=6)
+        entry.focus_set()
+
+        status = tk.Label(dlg, text="", bg=BG_CARD, fg=TEXT_MUTED,
+                          font=(FONT_FAMILY, 9), wraplength=380, justify="center")
+        status.pack(pady=(8, 0))
+
+        btns = tk.Frame(dlg, bg=BG_CARD)
+        btns.pack(fill="x", padx=40, pady=(14, 8))
+
+        def _finish(key: str) -> None:
+            cloud_sync.CloudSync().set_plays_key(key)
+            global _PICKS_AUTH_ERROR
+            _PICKS_AUTH_ERROR = None
+            self._notified_no_plays_key = False
+            dlg.destroy()
+            self._push_notification("Plays feed connected — loading alerts.", "success")
+            self._log("Feed: plays password accepted")
+            self._run_in_thread(self._feed_pull_worker)
+
+        def _verdict(good: bool, err: str, key: str) -> None:
+            if good:
+                _finish(key)
+                return
+            connect.configure(state="normal")
+            connect.configure_text("Connect")
+            status.configure(
+                text=err or "That password was refused. Check it opens "
+                            "rsamaxxed.com/plays in a browser — same spelling.",
+                fg=RED)
+
+        def _check() -> None:
+            key = entry.get().strip()
+            if not key:
+                status.configure(text="Paste the password first.", fg=TEXT_MUTED)
+                return
+            connect.configure(state="disabled")
+            connect.configure_text("Checking…")
+            status.configure(text="Checking with the server…", fg=TEXT_MUTED)
+
+            def work() -> None:
+                try:
+                    good, err = cloud_sync.CloudSync().check_plays_key(key), ""
+                except Exception as exc:                       # noqa: BLE001
+                    good, err = False, str(exc)
+                self.after(0, lambda: _verdict(good, err, key))
+
+            self._run_in_thread(work)
+
+        def _later() -> None:
+            dlg.destroy()
+            if first_run:
+                self._push_notification(
+                    "No plays password yet — the Quick Picks tab has a button "
+                    "to add it whenever you're ready.", "info")
+
+        connect = PillButton(btns, text="Connect", command=_check, width=120, height=32)
+        connect.pack(side="right")
+        PillButton(btns, text="I'll do it later", command=_later, width=120,
+                   height=32, bg_color=BG_INPUT, fg_color=TEXT_SECONDARY).pack(side="left")
+
+        tk.Label(dlg, text="No account or sign-up needed.", bg=BG_CARD,
+                 fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).pack(pady=(0, 10))
+
+        entry.bind("<Return>", lambda _e: _check())
+        dlg.bind("<Escape>", lambda _e: _later())
 
     def _update_custom_totals(self) -> None:
         """Custom accounts are a separate manual tracker (shown in their own

@@ -297,23 +297,19 @@ CONTENTS
 │            RSAMAXXED.bat
 │         (or run app.py directly for the GUI, or runner.py for CLI)
 │
-│     4.  TURN ON THE PLAYS. Copy .env.example to .env and set the one
-│         line that makes alerts arrive:
+│     4.  THE PLAYS ARE ALREADY ON. There is nothing to turn on and
+│         nothing to enter — no account, no sign-up, no password, no
+│         key, no Discord. The terminal downloads the buy alerts, the
+│         exits and the round-up (fractional) board on launch, then
+│         refreshes every hour while it is open.
 │
-│            RSAMAXXED_PLAYS_KEY=the password you were given
+│         If the Watchlist is empty it means no plays are open right
+│         now, which is normal — new alerts land on their own. The
+│         status bar bottom-right shows when the feed last arrived.
 │
-│         No account, no sign-up, no pairing code, no Discord. The
-│         terminal downloads the buy alerts, the exits and the round-up
-│         (fractional) board on launch, then refreshes every hour while
-│         it is open.
-│
-│         Without that line the Watchlist stays empty and the status bar
-│         bottom-right never shows a feed arrival — a missing or wrong
-│         password is the usual cause, not a broken install.
-│
-│     5.  CONNECT YOUR BROKERS. In that same .env, fill in only the
-│         brokers you use, or enter them in the Brokers tab and click
-│         Save. Then Bootstrap each one to start its session.
+│     5.  CONNECT YOUR BROKERS. Copy .env.example to .env and fill in
+│         only the brokers you use, or enter them in the Brokers tab and
+│         click Save. Then Bootstrap each one to start its session.
 │
 │     6.  Open the Dashboard and hit Refresh All. Green status dots
 │         mean a broker is linked and ready.
