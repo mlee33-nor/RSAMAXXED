@@ -440,6 +440,37 @@ def test_the_checkbox_is_hidden_until_the_script_that_makes_it_work_has_run():
     assert "classList.add('js')" in js
 
 
+def test_one_message_cannot_report_the_same_ticker_twice(anon):
+    """source_id is positional — "<message id>:0", ":1" — so it is only stable
+    while the parser splits a message the same way it did last time. It does
+    not: 2026-06-16 listed CETX and WXM under one total, the old parser saw one
+    exit (WXM at :0) and the fixed one sees two (CETX at :0, WXM at :1). On the
+    next scheduled run :0 would be skipped as present and :1 inserted, giving
+    that message two WXM exits.
+    """
+    # How the old parser saw it: everything on WXM, at index 0.
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={"sells": [
+        {"source_id": "1516382616675155978:0", "symbol": "WXM", "sell_date": "2099-01-02",
+         "exit_price": 4.24, "proceeds_low": 66.48,
+         "legs": [{"broker": "Robinhood", "accounts_low": 3, "accounts_high": 3}]}]})
+
+    # How the fixed parser sees it: CETX takes index 0, WXM moves to 1.
+    again = anon.post("/api/v1/plays/ingest", headers=KEY, json={"sells": [
+        {"source_id": "1516382616675155978:CETX", "symbol": "CETX", "sell_date": "2099-01-02",
+         "exit_price": 3.84, "proceeds_low": 53.76,
+         "legs": [{"broker": "Fidelity", "accounts_low": 10, "accounts_high": 10}]},
+        {"source_id": "1516382616675155978:WXM", "symbol": "WXM", "sell_date": "2099-01-02",
+         "exit_price": 4.24, "proceeds_low": 12.72,
+         "legs": [{"broker": "Robinhood", "accounts_low": 3, "accounts_high": 3}]}]})
+    assert again.status_code == 200
+
+    exits = [e for e in _board_of(anon).exits if (e.source_id or "").startswith("1516382616675155978:")]
+    wxm = [e for e in exits if e.symbol == "WXM"]
+    assert len(wxm) == 1, f"that message reported WXM {len(wxm)} times"
+    # CETX was genuinely absent before, so it is allowed in.
+    assert any(e.symbol == "CETX" for e in exits)
+
+
 def test_a_parser_bug_in_a_note_can_be_corrected(anon):
     """An exit's note is the ONE field ingest may rewrite.
 

@@ -463,6 +463,40 @@ def ingest_plays(body: FeedIn, db: Session = Depends(get_db)) -> dict[str, Any]:
         counts["buys"] += 1
 
     seen = _fresh(PlayExit, [s.source_id for s in body.sells])
+
+    # AND skip anything this MESSAGE already reported for that SYMBOL, whatever
+    # index it arrived under.
+    #
+    # source_id is positional — "<message id>:0", ":1" — so it is only stable
+    # while the parser splits a message the same way it did last time. It does
+    # not: 2026-06-16 listed CETX and WXM under one total, the old parser saw
+    # one exit (WXM at :0) and the fixed one sees two (CETX at :0, WXM at :1).
+    # On the next scheduled run :0 would be skipped as already-present and :1
+    # inserted, giving that message two WXM exits and double-counting it.
+    #
+    # A message can only report a given ticker's exit once, so that pair is the
+    # real identity. Same reasoning as the (symbol, date) guard in
+    # import_picks_file, and the same failure it exists to prevent.
+    def _msg_of(source_id: str) -> str:
+        """The Discord message an exit came from, or "" if the id does not name
+        one. A leading run of digits is a snowflake; anything else did not come
+        from the sell parser and must not be lumped in with its neighbours by a
+        prefix that happens to match. The tail is deliberately unconstrained —
+        it has been an index and is now the symbol, and this guard is what makes
+        moving between the two safe."""
+        head, sep, _tail = (source_id or "").partition(":")
+        return head if sep and head.isdigit() else ""
+
+    msg_ids = {m for m in (_msg_of(x.source_id) for x in body.sells) if m}
+    reported: set[tuple[str, str]] = set()
+    if msg_ids:
+        for sid, sym in db.execute(
+            select(PlayExit.source_id, PlayExit.symbol)
+        ).all():
+            head = _msg_of(sid or "")
+            if head and head in msg_ids:
+                reported.add((head, sym))
+
     # An exit's NOTE is the one field that may be corrected in place.
     #
     # Everything else about an exit is a fact the alerter published — a price, a
@@ -488,9 +522,13 @@ def ingest_plays(body: FeedIn, db: Session = Depends(get_db)) -> dict[str, Any]:
                 counts["notes"] = counts.get("notes", 0) + 1
 
     for s in body.sells:
-        if s.source_id in seen:
+        msg = _msg_of(s.source_id)
+        pair = (msg, s.symbol)
+        if s.source_id in seen or (msg and pair in reported):
             continue
         seen.add(s.source_id)
+        if msg:
+            reported.add(pair)
         db.add(PlayExit(
             source_id=s.source_id, symbol=s.symbol, exit_price=s.exit_price,
             proceeds_low=s.proceeds_low, proceeds_high=s.proceeds_high,
