@@ -578,6 +578,45 @@ def test_the_tracker_still_reports_what_it_knows(payouts):
     assert "rounded_up" in statuses and "fractional" in statuses
 
 
+def test_the_board_ships_what_buying_everything_would_have_cost(payouts):
+    """payout_rows is the winners. On its own it can only flatter — two thirds
+    of resolved alerts come back fractional and pay this reader nothing — so a
+    profit figure with no capital behind it has no denominator."""
+    _rows, board = payouts
+    cap = {r["sym"]: r for r in board.capital_rows}
+
+    # All three cost money to buy, whatever they later did.
+    for sym in ("ONLYCHASE", "WHOLE", "FRAC"):
+        assert sym in cap, f"{sym} cost money and is missing from the cost side"
+        assert cap[sym]["entry"] == 1.0
+
+    # And only ONLYCHASE ever paid, which is the whole point of having both.
+    paid = {r["sym"] for r in board.payout_rows}
+    assert "ONLYCHASE" in paid
+    assert {"WHOLE", "FRAC"} & paid == set()
+
+
+def test_an_alert_nobody_could_have_bought_costs_nothing(anon):
+    """A watch-only alert has no declared split, so nobody buys it. Counting
+    its cost would invent capital that was never committed — which would
+    understate the return exactly as badly as ignoring cost overstates it."""
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={
+        "buys": [
+            {"source_id": "cap:watch", "symbol": "WATCHME", "kind": "conditional",
+             "alert_date": "2026-08-04", "entry_price": 2.0},
+            {"source_id": "cap:noprice", "symbol": "NOPRICE", "kind": "standard",
+             "alert_date": "2026-08-04", "last_buy_date": "2099-01-01"},
+            {"source_id": "cap:real", "symbol": "REALBUY", "kind": "standard",
+             "alert_date": "2026-08-04", "entry_price": 0.5,
+             "last_buy_date": "2099-01-01"},
+        ],
+    })
+    cap = {r["sym"] for r in _board_of(anon).capital_rows}
+    assert "REALBUY" in cap
+    assert "WATCHME" not in cap, "a watch-only alert was counted as capital"
+    assert "NOPRICE" not in cap, "an alert with no price cannot be costed"
+
+
 def test_the_totals_engine_multiplies_broker_by_broker(payouts):
     """Checked against the rule written out longhand, over several profiles —
     including lopsided ones, where a flat account count would diverge most."""

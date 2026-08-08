@@ -1292,6 +1292,13 @@ function initPlaysDash() {
   let rows = [];
   try { rows = JSON.parse(data.textContent || '[]'); } catch (e) { rows = []; }
 
+  /* The cost side. `rows` above is only the plays that PAID, which on its own
+     can only flatter — two thirds of resolved alerts come back fractional and
+     pay this reader nothing. These are the alerts anyone would actually have
+     bought, so the profit gets a denominator. */
+  let costRows = [];
+  try { costRows = JSON.parse($('#capital')?.textContent || '[]'); } catch (e) { costRows = []; }
+
   const heroTotal = $('#hero-total'), heroSub = $('#hero-sub'), heroPeriod = $('#hero-period');
   const heroSparkEl = $('#hero-spark');
   const kpiPer = $('#kpi-permonth'), kpiBest = $('#kpi-best'), kpiWhen = $('#kpi-best-when');
@@ -1375,6 +1382,43 @@ function initPlaysDash() {
           `<td class="mono pos">${money(d.amount)}</td>`;
         auditBody.appendChild(tr);
       });
+    }
+
+    /* Deployed, and what came back.
+
+       You buy one share in EVERY account you hold — that is the strategy — so
+       the cost of an alert is its entry price times your total accounts,
+       wherever they are. Deliberately not "your accounts at the brokers it
+       later paid at": you cannot know that when you buy, and pricing the cost
+       with hindsight is how a strategy looks better on paper than it was.
+
+       No loss figure is invented. A fractional outcome returns roughly what
+       was paid for it (cash in lieu, or a fraction still worth about its
+       cost); the real cost of a miss is capital tied up for nothing, which is
+       exactly what "return on it" measures. */
+    const totalAccounts = Object.values(accounts).reduce((a, b) => a + b, 0);
+    const scoped = month ? costRows.filter(r => (r.on || '').slice(0, 7) === month) : costRows;
+    const deployed = scoped.reduce((a, r) => a + r.entry * totalAccounts, 0);
+    const kDep = $('#kpi-deployed'), kDepN = $('#kpi-deployed-note');
+    const kRoc = $('#kpi-roc'), kRocN = $('#kpi-roc-note');
+    const kHit = $('#kpi-hit'), kHitN = $('#kpi-hit-note');
+    if (kDep) kDep.textContent = deployed ? money(deployed) : '—';
+    if (kDepN) {
+      kDepN.textContent = scoped.length
+        ? `${scoped.length} alert${scoped.length === 1 ? '' : 's'} × ${totalAccounts} account${totalAccounts === 1 ? '' : 's'}`
+        : 'to buy every alert';
+    }
+    if (kRoc) {
+      kRoc.textContent = deployed > 0 ? (s.total / deployed * 100).toFixed(1) + '%' : '—';
+    }
+    if (kRocN) kRocN.textContent = deployed > 0 ? `on ${money(deployed)} put in` : 'profit ÷ deployed';
+    if (kHit) {
+      kHit.textContent = scoped.length ? `${s.plays} / ${scoped.length}` : '—';
+    }
+    if (kHitN) {
+      kHitN.textContent = scoped.length
+        ? `${Math.round(s.plays / scoped.length * 100)}% of the alerts you'd have bought`
+        : "of the alerts you'd have bought";
     }
 
     if (paidN) paidN.textContent = s.plays;
@@ -1737,6 +1781,79 @@ function keepPlace() {
   setInterval(remember, 5000);
 }
 
+/* ============================================================================
+   WHAT CHANGED SINCE YOU WERE LAST HERE
+   ----------------------------------------------------------------------------
+   The chime covers a tab left open. This covers the other way people use the
+   board — closing it and coming back tomorrow — where the page looks identical
+   whether three alerts landed overnight or none did, and the only way to know
+   is to remember yesterday's list.
+
+   Diffed on IDS, not on a timestamp: an alert published yesterday and ingested
+   today would slip through a date comparison, and the whole point is that
+   nothing published while you were away goes unmentioned. Stored per browser
+   like everything else here.
+   ========================================================================= */
+
+const SEEN_STORE = 'rsamaxxed.seen.v1';
+
+function initSinceLast() {
+  const plays = $$('#open-plays .ownbox').map(b => b.dataset.play).filter(Boolean);
+  const exits = $$('.prow.exit[data-sym]')
+    .map(li => `${li.dataset.sold || ''}:${li.dataset.sym || ''}`);
+  if (!plays.length && !exits.length) return;
+
+  let seen = null;
+  try { seen = JSON.parse(localStorage.getItem(SEEN_STORE) || 'null'); } catch (e) { /* fine */ }
+
+  const remember = () => {
+    try {
+      localStorage.setItem(SEEN_STORE, JSON.stringify({ plays, exits }));
+    } catch (e) { /* fine */ }
+  };
+
+  // First ever visit: nothing to compare against, and announcing the entire
+  // board as "new" would teach you to ignore this line on day two.
+  if (!seen || !Array.isArray(seen.plays)) { remember(); return; }
+
+  const oldPlays = new Set(seen.plays), oldExits = new Set(seen.exits || []);
+  const newPlays = plays.filter(k => !oldPlays.has(k));
+  const newExits = exits.filter(k => !oldExits.has(k));
+  remember();
+  if (!newPlays.length && !newExits.length) return;
+
+  const host = $('.page-h');
+  if (!host) return;
+  const bar = document.createElement('div');
+  bar.className = 'since';
+
+  const say = [];
+  if (newPlays.length) {
+    say.push(`${newPlays.length} new alert${newPlays.length === 1 ? '' : 's'}`);
+  }
+  if (newExits.length) {
+    say.push(`${newExits.length} new exit${newExits.length === 1 ? '' : 's'}`);
+  }
+
+  const lead = document.createElement('b');
+  lead.textContent = `Since you were last here: ${say.join(', ')}`;
+  const syms = document.createElement('span');
+  const names = newPlays.map(k => k.split(':')[1])
+    .concat(newExits.map(k => k.split(':')[1]))
+    .filter(Boolean);
+  syms.textContent = names.slice(0, 8).join(', ') + (names.length > 8 ? '…' : '');
+
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'tclose';
+  close.setAttribute('aria-label', 'Dismiss');
+  close.textContent = '✕';
+  close.addEventListener('click', () => bar.remove());
+
+  bar.append(lead, syms, close);
+  host.after(bar);
+}
+
 function initPlayAlerts() {
   const btn = $('#sound-toggle');
   if (!btn) return;                          // not the plays board
@@ -1960,6 +2077,7 @@ function boot() {
   initPager();
   initBought();
   initPlayAlerts();
+  initSinceLast();
 }
 
 if (document.readyState === 'loading') addEventListener('DOMContentLoaded', boot);
