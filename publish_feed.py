@@ -33,7 +33,9 @@ publish failed. Non-zero is what a scheduler should alert on.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -77,6 +79,56 @@ def _resolve(token: str, raw: str, server: str, label: str) -> tuple[str, str]:
     if guild:
         print(f"{label}: #{raw} -> {cid} (in {guild})")
     return cid, ""
+
+
+# A line carrying a money figure, which is what a sell total looks like.
+_HAS_MONEY = re.compile(r"\$\s*[\d,]+")
+
+
+def _flat(text: str) -> str:
+    """One line, so a preview cannot break the log it is printed into."""
+    return " | ".join(l.strip() for l in (text or "").splitlines() if l.strip())
+
+
+def _warn_unparsed(sell_msgs: list, buy_msgs: list) -> None:
+    """Say out loud when a message with money in it produced nothing.
+
+    Every format this parser handles was added AFTER it had silently dropped
+    something: a total written without a "+", a bare ticker with no price, a
+    broker with no account count, two tickers sharing one total, an alert typed
+    out instead of sent as an embed. Each one cost real money off the board, and
+    each stayed invisible until somebody happened to compare a month against
+    Discord by hand.
+
+    The formats will drift again. This cannot parse the next one, but it can
+    refuse to be quiet about it — which turns "June looks low" into a line in
+    the publisher's own output on the first run that sees it.
+    """
+    missed = []
+    for m in sell_msgs:
+        got, _ = rsa_feed.parse_sell_message(m)
+        if got:
+            continue
+        content = m.get("content") or ""
+        if _HAS_MONEY.search(content):
+            missed.append(("SELL", (m.get("timestamp") or "")[:10],
+                           _flat(content)[:88]))
+    for m in buy_msgs:
+        if rsa_feed.parse_buy_message(m):
+            continue
+        blob = (m.get("content") or "") + json.dumps(m.get("embeds") or [])
+        if "RSA Alert" in blob:
+            missed.append(("BUY", (m.get("timestamp") or "")[:10],
+                           _flat(m.get("content") or "")[:88]))
+
+    if not missed:
+        return
+    print(f"WARNING: {len(missed)} message(s) look like alerts but parsed to "
+          f"nothing — money may be missing from the board:")
+    for kind, when, preview in missed[:10]:
+        print(f"   {kind:4} {when}  {preview}")
+    if len(missed) > 10:
+        print(f"   ...and {len(missed) - 10} more")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -158,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"read {len(buy_msgs)} buy / {len(sell_msgs)} sell message(s) -> "
           f"{len(batch.buys)} plays, {len(batch.sells)} exits, "
           f"{len(batch.roundups)} round-ups, {len(lifecycle)} board rows")
+
+    _warn_unparsed(sell_msgs, buy_msgs)
 
     if not (batch or lifecycle):
         print("nothing to publish")
