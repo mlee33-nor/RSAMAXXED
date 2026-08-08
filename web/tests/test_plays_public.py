@@ -682,6 +682,59 @@ def test_the_model_still_covers_a_play_with_no_published_price(anon):
     assert life.per_account_profit == pytest.approx(4.0)     # 1.00 * (5 - 1)
 
 
+def test_the_board_adds_up_to_what_the_sell_channel_published(anon):
+    """The reconciliation, and the one that matters most.
+
+    A reader holding exactly the alerter's account counts must end up with
+    exactly the alerter's net: gross proceeds, less what those shares cost.
+    Against the live feed this comes to $1,808.83 published versus $1,807.19
+    computed — 0.09% apart, with 20 of 22 plays matching to the cent.
+    """
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={
+        "buys": [{"source_id": "rec:1", "symbol": "RECON", "kind": "standard",
+                  "alert_date": "2026-08-04", "ratio": "1:20", "ratio_n": 20,
+                  "entry_price": 0.50, "last_buy_date": "2026-08-05"}],
+        "sells": [{"source_id": "rec:s1", "symbol": "RECON",
+                   "sell_date": "2026-08-06", "exit_price": 5.00,
+                   # 5.00 x 12 accounts, exactly as the channel publishes it
+                   "proceeds_low": 60.0,
+                   "legs": [{"broker": "Public", "accounts_low": 9, "accounts_high": 9},
+                            {"broker": "Chase", "accounts_low": 3, "accounts_high": 3}]}],
+    })
+    row = next(r for r in _board_of(anon).payout_rows if r["sym"] == "RECON")
+
+    published_gross, legs = 60.0, 12
+    cost = 0.50 * legs
+    # Scoped to this play: board.totals() sums every symbol the shared test
+    # database has accumulated, which would drown the thing being checked.
+    assert row["per"] * legs == pytest.approx(
+        published_gross - cost, abs=0.01), "the board does not reconcile to the channel"
+    assert row["per"] == pytest.approx(4.50, abs=0.01)
+
+
+def test_tranches_credit_your_accounts_once_not_once_each(anon):
+    """The alerter sells the same broker across several days — AIFA went out
+    seven times. You own those accounts once, so you sell them once. Crediting
+    per tranche would pay you seven times for one set of accounts."""
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={
+        "buys": [{"source_id": "rec:2", "symbol": "TRANCH2", "kind": "standard",
+                  "alert_date": "2026-08-04", "ratio": "1:10", "ratio_n": 10,
+                  "entry_price": 1.00, "last_buy_date": "2026-08-05"}],
+        "sells": [
+            {"source_id": "rec:s2a", "symbol": "TRANCH2", "sell_date": "2026-08-06",
+             "exit_price": 3.00, "proceeds_low": 15.0,
+             "legs": [{"broker": "Public", "accounts_low": 5, "accounts_high": 5}]},
+            {"source_id": "rec:s2b", "symbol": "TRANCH2", "sell_date": "2026-08-07",
+             "exit_price": 3.00, "proceeds_low": 15.0,
+             "legs": [{"broker": "Public", "accounts_low": 5, "accounts_high": 5}]},
+        ],
+    })
+    # Five Public accounts sold at $3.00 having cost $1.00: $10.00, not $20.00.
+    row = next(r for r in _board_of(anon).payout_rows if r["sym"] == "TRANCH2")
+    assert row["brokers"] == ["public"], "one broker, however many tranches"
+    assert row["per"] * 5 == pytest.approx(10.0, abs=0.01)
+
+
 def test_the_board_ships_what_buying_everything_would_have_cost(payouts):
     """payout_rows is the winners. On its own it can only flatter — two thirds
     of resolved alerts come back fractional and pay this reader nothing — so a
