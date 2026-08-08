@@ -1560,11 +1560,16 @@ function initPlaysDash() {
       // board that shows a different "today" than the page it sits in is worse
       // than one that shows none.
       if (want.startsWith('sold:')) {
-        const anchor = ($('#tile-thismonth')?.dataset.month || '') + '-01';
-        const now = Date.parse(anchor) ? new Date() : new Date();
-        const back = want === 'sold:7d' ? 6 : 0;
-        const d = new Date(now.getTime() - back * 86400000);
-        month = 'sold:' + d.toISOString().slice(0, 10);
+        // The LOCAL calendar date, assembled by hand.
+        //
+        // toISOString() converts to UTC, so for anyone west of Greenwich after
+        // early evening it returns TOMORROW — and "sold today" then asked for
+        // exits on or after a date that has not happened, which is why it came
+        // back empty. A sell_date is a plain calendar day with no timezone in
+        // it, so it has to be compared against a plain calendar day.
+        const d = new Date(Date.now() - (want === 'sold:7d' ? 6 : 0) * 86400000);
+        const pad = n => String(n).padStart(2, '0');
+        month = `sold:${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
       } else {
         month = want;
       }
