@@ -670,7 +670,10 @@
           <tbody>
             {% for l in board.history %}
               {% set p = l.play %}
-              <tr>
+              {# data-status lets the outcome bar act as a filter for this
+                 table: clicking "Came back fractional" is the fastest way to
+                 ask which forty they were. #}
+              <tr data-status="{{ l.status }}">
                 <td class="mono dim">{{ p.alert_date or '—' }}</td>
                 <td>
                   <b>{{ p.symbol }}</b>

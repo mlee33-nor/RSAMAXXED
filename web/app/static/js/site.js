@@ -765,6 +765,8 @@ function inPeriod(r, period) {
     const since = period.slice(5);
     return (r.booked || '') >= since;
   }
+  // 'day:YYYY-MM-DD' — what a click on a single bar in day view selects.
+  if (period.startsWith('day:')) return (r.on || '') === period.slice(4);
   return (r.on || '').slice(0, 7) === period;
 }
 
@@ -947,7 +949,7 @@ function emptyChart(host, msg) {
    Both scales are anchored at zero across the same plot height, so the three
    gridlines are true for the left axis and the right one at once — the reason
    a dual axis is honest here and usually isn't. */
-function profitChart(host, months) {
+function profitChart(host, months, onPick) {
   if (!host) return;
   if (!months.length) return emptyChart(host, 'Nothing paid out in this period.');
 
@@ -1076,6 +1078,10 @@ function profitChart(host, months) {
       live.classList.remove('on');
       hideTip();
     });
+    if (onPick) {
+      hit.classList.add('pick');
+      hit.addEventListener('click', () => onPick(m.key));
+    }
     s.appendChild(hit);
   });
 
@@ -1097,7 +1103,7 @@ function profitChart(host, months) {
    A broker you hold accounts at that no sell alert ever named is absent rather
    than drawn at zero: it earned nothing because nothing sold there, and a row
    of zeroes reads as a failure instead of a non-event. */
-function brokerChart(host, brokers) {
+function brokerChart(host, brokers, onPick) {
   if (!host) return;
   if (!brokers.length) {
     return emptyChart(host, 'No sell alert in this period named a broker you hold.');
@@ -1148,6 +1154,10 @@ function brokerChart(host, brokers) {
         `<b>${money(b.total)}</b><i>${b.plays} play${b.plays === 1 ? '' : 's'} sold here</i>`);
     });
     hit.addEventListener('pointerleave', () => { bar.classList.remove('hot'); hideTip(); });
+    if (onPick) {
+      hit.classList.add('pick');
+      hit.addEventListener('click', () => onPick(b.key));
+    }
     s.appendChild(hit);
   });
 
@@ -1235,7 +1245,7 @@ const OUTCOME_FILL = {
 };
 const outcomeFill = s => OUTCOME_FILL[s] || 'var(--c-null)';
 
-function outcomeChart(host) {
+function outcomeChart(host, onPick) {
   if (!host) return;
   const src = $$('.statbar .sb');
   if (!src.length) return emptyChart(host, 'No outcomes recorded yet.');
@@ -1291,6 +1301,10 @@ function outcomeChart(host) {
         `${r.label}<b>${r.n} of ${all}</b><i>${((r.n / all) * 100).toFixed(1)}% of every alert</i>`);
     });
     hit.addEventListener('pointerleave', () => { seg.classList.remove('hot'); hideTip(); });
+    if (onPick) {
+      hit.classList.add('pick');
+      hit.addEventListener('click', () => onPick(r.status, r.label));
+    }
     s.appendChild(hit);
 
     x += w;
@@ -1359,6 +1373,7 @@ function initPlaysDash() {
   const names = brokerNames();
   let month = '';                      // '' = all time
   let grain = 'month';                 // 'month' | 'day' — chart resolution
+  let brokerFilter = '';               // set by clicking a bar in "Where it paid"
   let accounts = {};
   let animate = true;
 
@@ -1420,7 +1435,15 @@ function initPlaysDash() {
 
     if (auditBody) {
       auditBody.innerHTML = '';
-      s.detail.forEach(d => {
+      const shown = brokerFilter
+        ? s.detail.filter(d => d.held.includes(brokerFilter)) : s.detail;
+      const fnote = $('#audit-filter');
+      if (fnote) {
+        fnote.textContent = brokerFilter
+          ? `showing only plays that paid at ${names[brokerFilter] || brokerFilter} — click the bar again for all`
+          : '';
+      }
+      shown.forEach(d => {
         const tr = document.createElement('tr');
         tr.innerHTML =
           `<td class="mono dim">${d.on}</td><td><b>${d.sym}</b></td>` +
@@ -1491,8 +1514,17 @@ function initPlaysDash() {
       el.classList.toggle('unheld', !(accounts[el.dataset.brokerTag] > 0));
     });
 
-    profitChart(monthly, s.months);
-    brokerChart(brokersEl, s.brokers);
+    /* Charts as navigation, not decoration. Each click asks the page the
+       obvious follow-up question the picture just raised: which plays made
+       that month, which plays paid at that broker, which forty came back
+       fractional. */
+    profitChart(monthly, s.months, key => {
+      setPeriod(grain === 'day' ? 'day:' + key : key, key);
+    });
+    brokerChart(brokersEl, s.brokers, key => {
+      brokerFilter = brokerFilter === key ? '' : key;
+      paint();
+    });
     heroSpark(heroSparkEl, s.months);
 
     animate = false;
@@ -1500,7 +1532,6 @@ function initPlaysDash() {
 
   $$('#range-row .chip').forEach(btn => {
     btn.addEventListener('click', () => {
-      $$('#range-row .chip').forEach(b => b.classList.toggle('on', b === btn));
       const want = btn.dataset.month || '';
       // 'sold:today' / 'sold:7d' are relative, and they are resolved against
       // the SERVER's date (the This Month tile carries it) rather than this
@@ -1516,14 +1547,14 @@ function initPlaysDash() {
       } else {
         month = want;
       }
-      if (heroPeriod) {
-        heroPeriod.textContent = want === 'sold:today' ? 'sold today'
-          : want === 'sold:7d' ? 'sold this week'
-          : (want || 'all time');
-      }
+      const label = want === 'sold:today' ? 'sold today'
+        : want === 'sold:7d' ? 'sold this week'
+        : (want || 'all time');
       // A period change is a deliberate act and a whole new series, so let it
       // draw itself again. Typing in the accounts panel is not: that fires per
       // keystroke, and re-running the animation forty times is a strobe.
+      $$('#range-row .chip').forEach(b => b.classList.toggle('on', b === btn));
+      if (heroPeriod) heroPeriod.textContent = label;
       [monthly, brokersEl, heroSparkEl].forEach(el => { if (el) delete el.dataset.drawn; });
       animate = true;
       paint();
@@ -1563,9 +1594,40 @@ function initPlaysDash() {
     outcomeChart($('#chart-outcomes'));
   }));
 
+  /* One place that changes the period, so a chip and a chart click cannot
+     drift into disagreeing about what is selected. */
+  function setPeriod(value, label) {
+    month = value;
+    $$('#range-row .chip').forEach(b => b.classList.toggle('on', (b.dataset.month || '') === value));
+    if (heroPeriod) heroPeriod.textContent = label || value || 'all time';
+    [monthly, brokersEl, heroSparkEl].forEach(el => { if (el) delete el.dataset.drawn; });
+    animate = true;
+    paint();
+  }
+
+  /* Clicking an outcome opens the Tracking tab filtered to it. "40 came back
+     fractional" is a number anyone would want to click, and until now there
+     was nothing behind it. */
+  outcomeChart($('#chart-outcomes'), (status, label) => {
+    const tab = $('#tab-track');
+    if (tab) tab.checked = true;
+    const rows = $$('.p-track .htable tbody tr[data-status]');
+    const on = rows.filter(r => r.dataset.status === status);
+    rows.forEach(r => { r.hidden = r.dataset.status !== status; });
+    const note = $('#track-filter');
+    if (note) {
+      note.textContent = `showing ${on.length} ${label} — click to clear`;
+      note.hidden = false;
+      note.onclick = () => {
+        rows.forEach(r => { r.hidden = false; });
+        note.hidden = true;
+      };
+    }
+    $('.p-track')?.scrollIntoView({ block: 'start', behavior: REDUCED ? 'auto' : 'smooth' });
+  });
+
   const collect = initAccounts(map => { accounts = map; paint(); });
   accounts = collect();
-  outcomeChart($('#chart-outcomes'));
   paint();
   paintedBlind = !dashShown();
   addEventListener('scroll', hideTip, { passive: true });

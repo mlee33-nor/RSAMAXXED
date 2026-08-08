@@ -578,6 +578,110 @@ def test_the_tracker_still_reports_what_it_knows(payouts):
     assert "rounded_up" in statuses and "fractional" in statuses
 
 
+def test_a_published_exit_price_beats_the_model(anon):
+    """per_account_profit used entry x (ratio - 1) — a model assuming the
+    post-split share is worth entry x ratio. On dying microcaps it is not:
+    FFAI modelled $16.63 and sold at $4.44. Across the feed the model said
+    $3,558 where the published prices say $1,653.
+
+    The sell alert reports what it actually went for. Prefer the fact.
+    """
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={
+        "buys": [{"source_id": "px:1", "symbol": "MODELLED", "kind": "standard",
+                  "alert_date": "2026-08-04", "ratio": "1:150", "ratio_n": 150,
+                  "entry_price": 0.10, "last_buy_date": "2026-08-05"}],
+        "sells": [{"source_id": "px:s1", "symbol": "MODELLED",
+                   "sell_date": "2026-08-06", "exit_price": 4.00,
+                   "proceeds_low": 4.0,
+                   "legs": [{"broker": "Chase", "accounts_low": 1,
+                             "accounts_high": 1}]}],
+        "lifecycle": [{"source_id": "2026-08-04:MODELLED", "symbol": "MODELLED",
+                       "alert_date": "2026-08-04", "status": "rounded_up",
+                       "kind": "standard"}],
+    })
+    row = next(r for r in _board_of(anon).payout_rows if r["sym"] == "MODELLED")
+    # The model would have said 0.10 * 149 = $14.90.
+    assert row["per"] == pytest.approx(3.90, abs=0.01), "the model won over the fact"
+
+
+def test_exit_price_is_used_as_published_not_divided_again(anon):
+    """`exit_price` already MEANS what one account received — checked against
+    all 65 exits the feed carries, where proceeds / account-legs equals
+    exit_price to the cent with no exception. An earlier version divided it by
+    the split ratio for fractional plays, which would take a per-account figure
+    and divide it a second time."""
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={
+        "buys": [{"source_id": "px:2", "symbol": "ASPUB", "kind": "standard",
+                  "alert_date": "2026-08-04", "ratio": "1:10", "ratio_n": 10,
+                  "entry_price": 1.00, "last_buy_date": "2026-08-05"}],
+        "sells": [{"source_id": "px:s2", "symbol": "ASPUB",
+                   "sell_date": "2026-08-06", "exit_price": 10.00,
+                   "proceeds_low": 10.0,
+                   "legs": [{"broker": "Public", "accounts_low": 1,
+                             "accounts_high": 1}]}],
+        "lifecycle": [{"source_id": "2026-08-04:ASPUB", "symbol": "ASPUB",
+                       "alert_date": "2026-08-04", "status": "fractional",
+                       "kind": "standard"}],
+    })
+    row = next(r for r in _board_of(anon).payout_rows if r["sym"] == "ASPUB")
+    assert row["per"] == pytest.approx(9.0, abs=0.01)   # 10.00 - 1.00, not 0.0
+
+
+def test_a_play_that_sold_in_tranches_averages_them(anon):
+    """The alerter sells across brokers on different days — AIFA went out seven
+    times between $1.80 and $2.24. `paying_brokers` credits the reader at every
+    broker any exit named, so one per-account figure has to cover all of them:
+    the average each account actually got, weighted by accounts."""
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={
+        "buys": [{"source_id": "px:4", "symbol": "TRANCHE", "kind": "standard",
+                  "alert_date": "2026-08-04", "ratio": "1:10", "ratio_n": 10,
+                  "entry_price": 1.00, "last_buy_date": "2026-08-05"}],
+        "sells": [
+            {"source_id": "px:s4a", "symbol": "TRANCHE", "sell_date": "2026-08-06",
+             "exit_price": 2.00, "proceeds_low": 18.0,
+             "legs": [{"broker": "Public", "accounts_low": 9, "accounts_high": 9}]},
+            {"source_id": "px:s4b", "symbol": "TRANCHE", "sell_date": "2026-08-07",
+             "exit_price": 4.00, "proceeds_low": 4.0,
+             "legs": [{"broker": "Chase", "accounts_low": 1, "accounts_high": 1}]},
+        ],
+    })
+    row = next(r for r in _board_of(anon).payout_rows if r["sym"] == "TRANCHE")
+    # (2.00*9 + 4.00*1) / 10 = 2.20 received, less 1.00 paid.
+    assert row["per"] == pytest.approx(1.20, abs=0.01)
+    # NOT the last exit alone, which would have said 4.00 - 1.00 = 3.00.
+    assert row["per"] != pytest.approx(3.00, abs=0.01)
+
+
+def test_a_play_that_broke_even_is_still_in_the_record(anon):
+    """0.0 is falsy, so `if not per` dropped break-even plays and anything that
+    sold BELOW cost. A board that can only show winners is not a record."""
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={
+        "buys": [{"source_id": "px:5", "symbol": "FLATPX", "kind": "standard",
+                  "alert_date": "2026-08-04", "entry_price": 2.00,
+                  "ratio": "1:5", "ratio_n": 5, "last_buy_date": "2026-08-05"}],
+        "sells": [{"source_id": "px:s5", "symbol": "FLATPX",
+                   "sell_date": "2026-08-06", "exit_price": 2.00,
+                   "proceeds_low": 2.0,
+                   "legs": [{"broker": "Chase", "accounts_low": 1,
+                             "accounts_high": 1}]}],
+    })
+    row = next((r for r in _board_of(anon).payout_rows if r["sym"] == "FLATPX"), None)
+    assert row is not None, "a break-even play vanished from the record"
+    assert row["per"] == pytest.approx(0.0, abs=0.01)
+
+
+def test_the_model_still_covers_a_play_with_no_published_price(anon):
+    """It is wrong often, but for a play nobody has priced it is all there is —
+    and a play dropped for want of a number is worse than an estimated one."""
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={
+        "buys": [{"source_id": "px:3", "symbol": "NOEXITPX", "kind": "standard",
+                  "alert_date": "2026-08-04", "ratio": "1:5", "ratio_n": 5,
+                  "entry_price": 1.00, "last_buy_date": "2099-01-01"}],
+    })
+    life = next(l for l in _board_of(anon).history if l.play.symbol == "NOEXITPX")
+    assert life.per_account_profit == pytest.approx(4.0)     # 1.00 * (5 - 1)
+
+
 def test_the_board_ships_what_buying_everything_would_have_cost(payouts):
     """payout_rows is the winners. On its own it can only flatter — two thirds
     of resolved alerts come back fractional and pay this reader nothing — so a
