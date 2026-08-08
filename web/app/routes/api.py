@@ -765,15 +765,27 @@ def require_plays_key(
         raise HTTPException(status_code=401, detail="the play feed needs the board password")
 
 
-@router.get("/public/plays", dependencies=[Depends(require_plays_key)])
+# --- The three routes a downloaded terminal reads -------------------------
+#
+# Deliberately OPEN: no password, no key, no account. The product is free, and
+# the point is that someone can clone the repo, run the app and have the plays
+# arrive with nothing to paste. Gating these is what made a new install show an
+# empty Watchlist and look broken.
+#
+# `require_plays_key` below is kept, unused, so re-gating is a one-line change
+# if that decision is ever revisited. It is NOT applied here — do not read its
+# presence as protection.
+
+
+@router.get("/public/plays")
 def read_plays_public(db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Buys, closed plays, exits and round-ups. Board password required."""
+    """Buys, closed plays, exits and round-ups. Open to any caller."""
     return playsfeed.feed_json(playsfeed.load_board(db))
 
 
-@router.get("/public/plays/picks", dependencies=[Depends(require_plays_key)])
+@router.get("/public/plays/picks")
 def read_picks_public(db: Session = Depends(get_db)) -> list[dict[str, str]]:
-    """Open plays in the shape picks.json holds. Board password required."""
+    """Open plays in the shape picks.json holds. Open to any caller."""
     notes = {"standard": "Reg Alert", "otc": "OTC", "conditional": "conditional"}
     board = playsfeed.load_board(db)
     return [
@@ -784,9 +796,9 @@ def read_picks_public(db: Session = Depends(get_db)) -> list[dict[str, str]]:
     ]
 
 
-@router.get("/public/plays/lifecycle", dependencies=[Depends(require_plays_key)])
+@router.get("/public/plays/lifecycle")
 def read_lifecycle_public(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    """The TRACK board — what each split actually did. Board password required.
+    """The TRACK board — what each split actually did. Open to any caller.
 
     Served on this door for the same reason as the rest: without it a terminal
     that was never paired shows an empty Exits page, and 'which of my positions
