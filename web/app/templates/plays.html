@@ -236,6 +236,9 @@
       <div class="hero-row">
         <div class="card hero-card">
           <div class="k">Theoretical profit · <span id="hero-period">all time</span></div>
+          {# "Theoretical" is doing a lot of work in that heading, so the
+             sub-line under the figure spells out what it assumes rather than
+             leaving a reader to infer it from one adjective. #}
           <div class="hero-fig pos" id="hero-total">{{ totals.total | money }}</div>
           <div class="hero-sub muted" id="hero-sub">
             across {{ totals.plays }} plays with a confirmed sell, in the
