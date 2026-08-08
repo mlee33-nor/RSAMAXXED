@@ -1427,6 +1427,7 @@
      header, so the header stays a title and a caption. */
   .chips.grain{margin:-6px 0 12px;padding:0 2px}
   .chips.grain .chip.sm{padding:4px 11px;font-size:11.5px}
+  .chips.grain .chipgap{width:14px;flex:none}
 
   /* "Since you were last here". A line, not a card: it is news about the
      board rather than part of it, and it is gone the moment it is read. */
