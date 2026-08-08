@@ -706,6 +706,24 @@ class Board:
         return out
 
     @property
+    def unconfirmed_count(self) -> int:
+        """Alerts with no outcome published at all.
+
+        Not a limbo state and not a bug: the alerter's round-up board only
+        reaches back so far, so anything older simply never had its outcome
+        posted. Counted separately so the page can say that rather than leave
+        "Unconfirmed" looking like a failure.
+        """
+        return sum(1 for l in self.history if l.status == "unknown")
+
+    @property
+    def tracked_from(self) -> str:
+        """The earliest alert the round-up board still covers."""
+        dates = [l.life.alert_date for l in self.history
+                 if l.life is not None and l.life.alert_date]
+        return min(dates) if dates else ""
+
+    @property
     def history_by_status(self) -> list[tuple[str, str, int]]:
         """(status, human label, count), in the order a split actually happens.
 
