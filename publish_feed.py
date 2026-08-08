@@ -107,12 +107,48 @@ def _warn_unparsed(sell_msgs: list, buy_msgs: list) -> None:
     missed = []
     for m in sell_msgs:
         got, _ = rsa_feed.parse_sell_message(m)
-        if got:
-            continue
         content = m.get("content") or ""
-        if _HAS_MONEY.search(content):
-            missed.append(("SELL", (m.get("timestamp") or "")[:10],
-                           _flat(content)[:88]))
+
+        if not got:
+            if _HAS_MONEY.search(content):
+                missed.append(("SELL", (m.get("timestamp") or "")[:10],
+                               _flat(content)[:88]))
+            continue
+
+        # It parsed. That is not the same as parsing CORRECTLY, and the two
+        # ways it can be wrong both cost money without producing an empty
+        # result, so neither is caught by the check above.
+
+        # 1. The arithmetic inside one exit. Every exit the channel has ever
+        #    published has proceeds equal to exit_price x accounts, to the cent.
+        #    When it does not, the figure belongs to something else — WXM was
+        #    stored at $66.48 against 3 accounts at $4.24, because it had been
+        #    handed CETX's share of a shared total as well.
+        for e in got:
+            legs = sum(l.accounts_low for l in e.legs)
+            if not (legs and e.exit_price and e.proceeds_low):
+                continue
+            # Compared PER ACCOUNT, not on the total. The channel writes the
+            # price rounded to the cent, so across 21 accounts an honest figure
+            # is already 6c off the product — EDBL published $40.80 against
+            # $1.94 x 21 = $40.74 and is perfectly correct. A cent per account
+            # is the rounding; anything past it is a different number.
+            if abs(e.proceeds_low / legs - e.exit_price) > 0.01:
+                missed.append(("SUM", (m.get("timestamp") or "")[:10],
+                               f"{e.symbol} ${e.proceeds_low:.2f} / {legs} accounts "
+                               f"= ${e.proceeds_low / legs:.2f}, but the price "
+                               f"published was ${e.exit_price:.2f}"))
+
+        # 2. A ticker the message names that no exit came back for. The shared
+        #    total dropped CETX entirely while WXM parsed fine, so the message
+        #    looked handled and half of it was gone.
+        named = {h.group(1).upper() for line in content.splitlines()
+                 if (h := rsa_feed._SELL_HEAD.match(line.strip()))}
+        parsed = {e.symbol.upper() for e in got}
+        for lost in sorted(named - parsed):
+            missed.append(("DROP", (m.get("timestamp") or "")[:10],
+                           f"{lost} is named but produced no exit — "
+                           f"{_flat(content)[:50]}"))
     for m in buy_msgs:
         if rsa_feed.parse_buy_message(m):
             continue
@@ -123,8 +159,9 @@ def _warn_unparsed(sell_msgs: list, buy_msgs: list) -> None:
 
     if not missed:
         return
-    print(f"WARNING: {len(missed)} message(s) look like alerts but parsed to "
-          f"nothing — money may be missing from the board:")
+    print(f"WARNING: {len(missed)} problem(s) found — money may be wrong on "
+          f"the board. SELL/BUY = parsed to nothing, SUM = the arithmetic "
+          f"inside an exit disagrees, DROP = a named ticker produced no exit:")
     for kind, when, preview in missed[:10]:
         print(f"   {kind:4} {when}  {preview}")
     if len(missed) > 10:
