@@ -756,18 +756,30 @@ function brokerNames() {
    Everything selects on the date it SOLD, which is also how the chart buckets,
    so a chip and a bar can never disagree about which month a play belongs to.
    The "sold today / this week" chips are the same basis at day resolution. */
-function inPeriod(r, period) {
-  if (!period) return true;
-  if (period.startsWith('sold:')) {
-    const since = period.slice(5);
-    return (r.booked || '') >= since;
-  }
-  // 'day:YYYY-MM-DD' — what a click on a single bar in day view selects.
-  if (period.startsWith('day:')) return (r.on || '') === period.slice(4);
-  return (r.on || '').slice(0, 7) === period;
+/* Which date a payout belongs to.
+
+   'sold'   the day the exit cleared. Realized: money that arrived in August is
+            August's.
+   'bought' the day it was alerted, so the profit is credited to the capital
+            that bought it. GNPX was alerted in July and sold in August; this
+            basis puts it in July.
+
+   Neither is more correct — they answer different questions — so the page
+   picks rather than asserting one is the only reading. */
+function dateOf(r, basis) {
+  return (basis === 'bought' ? (r.alerted || r.on) : r.on) || '';
 }
 
-function summarise(rows, accounts, month, names = {}, grain = 'month') {
+function inPeriod(r, period, basis) {
+  if (!period) return true;
+  // A "sold ..." chip always means the day money came back, whatever the chart
+  // is credited to — that is the whole point of the chip.
+  if (period.startsWith('sold:')) return (r.booked || '') >= period.slice(5);
+  if (period.startsWith('day:')) return dateOf(r, basis) === period.slice(4);
+  return dateOf(r, basis).slice(0, 7) === period;
+}
+
+function summarise(rows, accounts, month, names = {}, grain = 'month', basis = 'sold') {
   const cut = key => grain === 'day' ? key : key.slice(0, 7);
   const byMonth = new Map();
   const byBroker = new Map();
@@ -775,13 +787,13 @@ function summarise(rows, accounts, month, names = {}, grain = 'month') {
   let total = 0, plays = 0;
 
   rows.forEach(r => {
-    const on = r.on || '';
-    if (!inPeriod(r, month)) return;
-    // A "sold" period is about days money came back, so bucket it that way —
-    // otherwise selecting "sold this week" draws bars on the dates those plays
-    // were ALERTED, which can be a month earlier and reads as a bug.
-    const basis = (month || '').startsWith('sold:') ? (r.booked || on) : on;
-    const key = cut(basis) || '—';
+    if (!inPeriod(r, month, basis)) return;
+    // A "sold ..." period buckets by the day money came back whatever the
+    // basis, or selecting "sold this week" would draw bars on dates a month
+    // earlier and read as a bug.
+    const when = (month || '').startsWith('sold:')
+      ? (r.booked || r.on || '') : dateOf(r, basis);
+    const key = cut(when) || '—';
     // THE RULE: only your accounts at the brokers this play was sold at. A
     // broker the sell alert never named contributes nothing, however many
     // accounts you hold there.
@@ -1370,6 +1382,7 @@ function initPlaysDash() {
   const names = brokerNames();
   let month = '';                      // '' = all time
   let grain = 'month';                 // 'month' | 'day' — chart resolution
+  let basis = 'sold';                  // 'sold' | 'bought' — which month it counts in
   let brokerFilter = '';               // set by clicking a bar in "Where it paid"
   let accounts = {};
   let animate = true;
@@ -1377,12 +1390,12 @@ function initPlaysDash() {
   const grainTitle = $('#profit-chart-title'), grainBasis = $('#profit-chart-basis');
 
   const paint = () => {
-    const s = summarise(rows, accounts, month, names, grain);
+    const s = summarise(rows, accounts, month, names, grain, basis);
     if (grainTitle) grainTitle.textContent = `Profit by ${grain}`;
     if (grainBasis) {
-      grainBasis.textContent = grain === 'day'
-        ? 'bars, the day it sold · line, the running total'
-        : 'bars, the month it sold · line, the running total';
+      const what = basis === 'bought' ? 'it was bought' : 'it sold';
+      grainBasis.textContent =
+        `bars, the ${grain} ${what} · line, the running total`;
     }
 
     heroCount(heroTotal, s.total, animate);
@@ -1405,7 +1418,7 @@ function initPlaysDash() {
     if (kpiThis && thisKey) {
       // Explicitly month-grained: this tile answers "what has THIS MONTH
       // made", and that question does not change when the chart is cut daily.
-      const tm = summarise(rows, accounts, thisKey, names, 'month');
+      const tm = summarise(rows, accounts, thisKey, names, 'month', basis);
       kpiThis.textContent = money(tm.total);
       if (kpiThisNote) {
         kpiThisNote.textContent = tm.plays
@@ -1473,7 +1486,9 @@ function initPlaysDash() {
        cost); the real cost of a miss is capital tied up for nothing, which is
        exactly what "return on it" measures. */
     const totalAccounts = Object.values(accounts).reduce((a, b) => a + b, 0);
-    const scoped = month ? costRows.filter(r => (r.on || '').slice(0, 7) === month) : costRows;
+    const scoped = month && !month.startsWith('sold:')
+      ? costRows.filter(r => (r.on || '').slice(0, 7) === month.slice(0, 7))
+      : costRows;
     const deployed = scoped.reduce((a, r) => a + r.entry * totalAccounts, 0);
     const kDep = $('#kpi-deployed'), kDepN = $('#kpi-deployed-note');
     const kRoc = $('#kpi-roc'), kRocN = $('#kpi-roc-note');
@@ -1567,10 +1582,24 @@ function initPlaysDash() {
     });
   });
 
-  $$('.chips.grain .chip').forEach(btn => {
+  $$('.chips.grain .chip[data-basis]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (btn.dataset.basis === basis) return;
+      $$('.chips.grain .chip[data-basis]')
+        .forEach(b => b.classList.toggle('on', b === btn));
+      basis = btn.dataset.basis;
+      // A different basis moves every bar, so let the chart draw itself again.
+      [monthly, brokersEl, heroSparkEl].forEach(el => { if (el) delete el.dataset.drawn; });
+      animate = true;
+      paint();
+    });
+  });
+
+  $$('.chips.grain .chip[data-grain]').forEach(btn => {
     btn.addEventListener('click', () => {
       if (btn.dataset.grain === grain) return;
-      $$('.chips.grain .chip').forEach(b => b.classList.toggle('on', b === btn));
+      $$('.chips.grain .chip[data-grain]')
+        .forEach(b => b.classList.toggle('on', b === btn));
       grain = btn.dataset.grain;
       // A new resolution is a new series, so let it draw itself in — the same
       // reason a period change does, and the same reason a keystroke in the

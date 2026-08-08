@@ -396,6 +396,15 @@
           <div class="chips grain" role="group" aria-label="Chart resolution">
             <button type="button" class="chip sm on" data-grain="month">By month</button>
             <button type="button" class="chip sm" data-grain="day">By day</button>
+            {# Two honest answers to "which month did this belong to", and they
+               genuinely differ: GNPX was alerted in July and sold in August.
+               SOLD is realized — money that arrived in August is August's.
+               BOUGHT is the cohort — what the capital committed in July went on
+               to earn. Neither is more correct, so this picks rather than
+               pretending one of them is the only reading. #}
+            <span class="chipgap"></span>
+            <button type="button" class="chip sm on" data-basis="sold">Booked when sold</button>
+            <button type="button" class="chip sm" data-basis="bought">Credited to buy month</button>
           </div>
           <figure class="chart" id="chart-monthly"
                   aria-label="Theoretical profit booked per month, with the running total"></figure>
