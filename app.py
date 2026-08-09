@@ -10,6 +10,7 @@ EXE packaging:
 from __future__ import annotations
 
 import builtins
+import hashlib
 import importlib
 import json
 import os
@@ -731,6 +732,37 @@ def _save_done_picks(keys: set) -> None:
     try:
         PICKS_DONE_FILE.write_text(
             json.dumps(sorted([list(k) for k in keys]), indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+COVERAGE_READ_FILE = ROOT_DIR / "coverage_read.json"
+
+
+def _coverage_fingerprint(rows: List[tuple]) -> str:
+    """Identity of a set of coverage warnings — their text, not their presence.
+
+    Keyed on the wording because the wording carries the numbers: a new symbol,
+    a changed dollar amount, or one more unpriced buy all produce a different
+    fingerprint. That is the point of dismissing by content rather than by a
+    plain hidden/shown flag.
+    """
+    joined = "\n".join(text for _colour, text in rows)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def _load_coverage_read() -> str:
+    try:
+        data = json.loads(COVERAGE_READ_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return str(data.get("fingerprint", "")) if isinstance(data, dict) else ""
+
+
+def _save_coverage_read(fingerprint: str) -> None:
+    try:
+        COVERAGE_READ_FILE.write_text(
+            json.dumps({"fingerprint": fingerprint}, indent=2), encoding="utf-8")
     except OSError:
         pass
 
@@ -5274,8 +5306,13 @@ class App(ctk.CTk):
                                       border_color=YELLOW, radius=RAD_MD)
         cov_body = tk.Frame(self._cov_card.inner, bg=BG_CARD)
         cov_body.pack(fill="x", padx=SP_XL, pady=SP_MD)
-        tk.Label(cov_body, text=f"{icon('warning')}  WHAT THIS FIGURE LEAVES OUT",
-                 bg=BG_CARD, fg=YELLOW, font=(ICON_FONT, 10, "bold")).pack(anchor="w")
+        cov_head = tk.Frame(cov_body, bg=BG_CARD)
+        cov_head.pack(fill="x")
+        tk.Label(cov_head, text=f"{icon('warning')}  WHAT THIS FIGURE LEAVES OUT",
+                 bg=BG_CARD, fg=YELLOW, font=(ICON_FONT, 10, "bold")).pack(side="left")
+        PillButton(cov_head, text="Mark as read", bg_color=BG_CARD_ALT,
+                   hover_color=ACCENT, command=self._mark_coverage_read,
+                   width=110, height=26, font_size=9).pack(side="right")
         self._cov_lines = tk.Frame(cov_body, bg=BG_CARD)
         self._cov_lines.pack(fill="x", pady=(8, 0))
 
@@ -6761,6 +6798,16 @@ class App(ctk.CTk):
             self._cov_card.pack_forget()
             return
 
+        # Dismissal is remembered against the WORDING of these warnings, not as
+        # a plain "hidden" flag. Hiding it forever would be the one failure this
+        # card exists to prevent: a total that overstates itself with nothing on
+        # screen admitting it. Sell a new symbol with no recorded buy and the
+        # fingerprint changes, so the card comes back unread.
+        self._cov_fingerprint = _coverage_fingerprint(rows)
+        if self._cov_fingerprint == _load_coverage_read():
+            self._cov_card.pack_forget()
+            return
+
         for colour, text in rows:
             tk.Label(self._cov_lines, text="•  " + text, bg=BG_CARD, fg=colour,
                      font=(FONT_FAMILY, 9), justify="left", anchor="w",
@@ -6773,6 +6820,16 @@ class App(ctk.CTk):
             self._cov_card.pack(fill="x", pady=(0, 14), before=self._cov_before)
         else:
             self._cov_card.pack(fill="x", pady=(0, 14))
+
+    def _mark_coverage_read(self) -> None:
+        """Acknowledge the coverage warnings currently on screen."""
+        fingerprint = getattr(self, "_cov_fingerprint", "")
+        if not fingerprint:
+            return
+        _save_coverage_read(fingerprint)
+        self._cov_card.pack_forget()
+        self._show_toast("Marked as read — it returns if these figures change.",
+                         "info")
 
     # ---- Simulator --------------------------------------------------------
 
