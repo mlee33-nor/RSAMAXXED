@@ -21,7 +21,7 @@ import tkinter as tk
 import winsound
 from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox
 from typing import Any, Dict, List, Optional, Tuple
 
 import urllib.request
@@ -1399,6 +1399,76 @@ class App(ctk.CTk):
 
     # ---- GUI input hook (replaces terminal input() for 2FA/OTP) -----------
 
+    def _ask_inline(self, title: str, prompt: str, *,
+                    show: Optional[str] = None) -> Optional[str]:
+        """Modal text prompt drawn INSIDE the main window.
+
+        A tk popup is a separate OS window. Maximised, full-screen, or on a
+        second monitor it can open behind the terminal or off to one side, and
+        an unseen 2FA prompt is a login that dies on a code that expired while
+        it sat there. This one is placed over the app itself, so it is on
+        whichever screen the user is already looking at.
+
+        Blocks on `wait_variable` — the same nested event loop `simpledialog`
+        runs — so callers keep the ask-and-wait shape they already had.
+        """
+        result: List[Optional[str]] = [None]
+        done = tk.BooleanVar(self, value=False)
+
+        overlay = tk.Frame(self, bg=BG_PRIMARY)
+        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        overlay.lift()
+
+        card = RoundedFrame(overlay, bg_color=BG_CARD, border_color=ACCENT,
+                            radius=RAD_MD)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        body = tk.Frame(card.inner, bg=BG_CARD)
+        body.pack(padx=SP_2XL, pady=SP_2XL)
+
+        tk.Label(body, text=title, bg=BG_CARD, fg=TEXT_PRIMARY,
+                 font=(FONT_FAMILY, FS_H2, "bold")).pack(anchor="w")
+        tk.Label(body, text=prompt, bg=BG_CARD, fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 10), justify="left",
+                 wraplength=460).pack(anchor="w", pady=(6, SP_LG))
+
+        entry = ttk.Entry(body, width=32, font=(FONT_MONO, 13), justify="center",
+                          **({"show": show} if show else {}))
+        entry.pack(fill="x")
+
+        def submit(_evt=None) -> None:
+            result[0] = entry.get().strip()
+            done.set(True)
+
+        def cancel(_evt=None) -> None:
+            result[0] = None
+            done.set(True)
+
+        btns = tk.Frame(body, bg=BG_CARD)
+        btns.pack(fill="x", pady=(SP_LG, 0))
+        PillButton(btns, text="Submit", bg_color=ACCENT, command=submit,
+                   width=120, height=32).pack(side="right")
+        PillButton(btns, text="Cancel", bg_color=BG_CARD_ALT, hover_color=RED,
+                   command=cancel, width=100, height=32).pack(side="right",
+                                                              padx=(0, SP_SM))
+
+        entry.bind("<Return>", submit)
+        entry.bind("<Escape>", cancel)
+        overlay.bind("<Escape>", cancel)
+
+        # focus after the widget is mapped, or the caret lands nowhere
+        self.after(50, entry.focus_set)
+        try:
+            overlay.grab_set()
+        except tk.TclError:
+            pass
+        self.wait_variable(done)
+        try:
+            overlay.grab_release()
+        except tk.TclError:
+            pass
+        overlay.destroy()
+        return result[0]
+
     def _install_input_hook(self) -> None:
         """Monkey-patch builtins.input so broker 2FA prompts show a GUI dialog."""
         original_input = builtins.input
@@ -1419,11 +1489,7 @@ class App(ctk.CTk):
                     color=YELLOW,
                 )
                 app._log(f"ALERT: {prompt.strip()}")
-                answer = simpledialog.askstring(
-                    "Broker Input Required",
-                    prompt.strip(),
-                    parent=app,
-                )
+                answer = app._ask_inline("Broker Input Required", prompt.strip())
                 result[0] = answer if answer is not None else ""
                 app._hide_notification()
                 event.set()
@@ -7685,10 +7751,10 @@ class App(ctk.CTk):
             self._discord_locked = True
             self._apply_discord_lock()
             return
-        code = simpledialog.askstring(
+        code = self._ask_inline(
             "Unlock Feed Settings",
             "Enter the access code to edit the Discord feed settings:",
-            show="*", parent=self)
+            show="*")
         if code is None:
             return
         if code != DISCORD_CONFIG_UNLOCK:
