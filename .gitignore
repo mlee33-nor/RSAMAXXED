@@ -28,6 +28,8 @@ web/.env
 picks_done.json
 sells.json
 lifecycle_state.json
+# Which coverage warning the user has ticked off, by content fingerprint.
+coverage_read.json
 
 # Reference copies of other people's decompiled binaries. Kept locally for
 # study; committing them to a PUBLIC repo would republish someone else's
