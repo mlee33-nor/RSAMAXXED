@@ -7,7 +7,15 @@ tzdata>=2023.3
 robin-stocks>=3.0.0
 bbae-invest-api>=0.1.5
 dspac-invest-api>=0.1.4
-fennel-invest-api>=1.0.0
+# <2 is required, not cosmetic. 2.0 is a breaking rewrite: it dropped the email
+# + OTP login this app uses (`Fennel(filename=, path=)` and `.login()` are gone)
+# for a constructor that takes a Fennel-issued PAT, and renamed the rest
+# (get_account_ids -> get_account_info, get_stock_holdings ->
+# get_portfolio_positions). On 2.x every Fennel call dies at construction with
+# "Fennel.__init__() got an unexpected keyword argument 'filename'", surfacing
+# in the UI as "Auth failed". The old passwordless endpoint is still live, so
+# 1.2.0 keeps working; moving to 2.x is a rewrite of fennel.py, not a bump.
+fennel-invest-api>=1.2.0,<2
 schwab-api>=0.3.0
 # >=0.15.5 is required, not cosmetic. Chrome 150 dropped the `sameParty` cookie
 # field; older zendriver's Cookie.from_json does json["sameParty"] and raises
