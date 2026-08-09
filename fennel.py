@@ -265,6 +265,21 @@ class FennelBroker:
                             raise
 
                 acct_pairs = self._get_accounts(client)
+                if not acct_pairs:
+                    # The login is good; there is just nothing behind it. Fennel
+                    # marks a shut account CLOSED and the client keeps only the
+                    # APPROVED ones, so this comes back as an empty list rather
+                    # than an error. Reported as a failure because a broker with
+                    # no tradeable account cannot do anything we would ask of
+                    # it, and "Authenticated. Accounts: 0" reads like success.
+                    any_fail = True
+                    accounts_out.append(AccountOutput(
+                        account_id=label, ok=False,
+                        message="Signed in, but Fennel reports no open accounts on "
+                                "this login — every one of them is CLOSED, so there "
+                                "is nothing to trade."))
+                    continue
+
                 self._sessions.append(_LoginSession(label=label, email=email, client=client, accounts=acct_pairs, pkl_name=pkl))
 
                 any_ok = True
@@ -520,10 +535,34 @@ def _ensure_session_like_legacy() -> Tuple[Optional[FennelBroker], str]:
     return None, msg
 
 
-def bootstrap() -> None:
+def bootstrap(*args, **kwargs) -> BrokerOutput:
+    """Authenticate and report, in the shape every other broker module uses.
+
+    This used to return None and raise on failure, and it was the only broker
+    that did. Both callers -- app.py's _bootstrap_worker and runner.py's
+    cmd_bootstrap -- do `output = mod.bootstrap()` and then read output.state,
+    so a SUCCESSFUL Fennel bootstrap died on
+
+        AttributeError: 'NoneType' object has no attribute 'state'
+
+    The failure path looked fine only by accident: raising skipped the attribute
+    access altogether. Nothing surfaced until Fennel could actually log in again.
+    """
     b, msg = _ensure_session_like_legacy()
     if b is None:
-        raise RuntimeError(msg)
+        return BrokerOutput(
+            broker=BROKER, state="failed",
+            accounts=[AccountOutput(account_id="fennel", ok=False, message=msg)],
+            message=msg)
+
+    accounts = [
+        AccountOutput(account_id=f"{sess.label} · {name}", ok=True, message="ready")
+        for sess in b._sessions
+        for name, _acct_id in sess.accounts
+    ]
+    return BrokerOutput(
+        broker=BROKER, state="success", accounts=accounts,
+        message=f"Authenticated ({len(accounts)} accounts)")
 
 
 def get_holdings() -> BrokerOutput:
