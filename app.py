@@ -609,7 +609,15 @@ class StatusDot(tk.Canvas):
 # pre-configured so a downloaded copy just works; the lock keeps a stray
 # edit from breaking it. It is a fumble-guard, not a secret — the values it
 # protects sit in .env in plain text next to this file.
-DISCORD_CONFIG_UNLOCK = "REDACTED-ROTATED-CREDENTIAL"
+#
+# Because it is NOT a secret, the default below must never be a real
+# credential. This file is committed to a public repository, so anything
+# literal here is published to everyone who clones it. A broker password was
+# once used as this code; that published the password. Override the value with
+# RSAMAXXED_CONFIG_UNLOCK in .env if you want a different one — and pick a
+# string you do not use to log in anywhere.
+DISCORD_CONFIG_UNLOCK = os.environ.get(
+    "RSAMAXXED_CONFIG_UNLOCK", "").strip() or "unlock-feed-settings"
 
 SELLS_FILE = ROOT_DIR / "sells.json"
 
