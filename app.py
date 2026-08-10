@@ -375,6 +375,16 @@ def _market_status() -> tuple:
 MIRROR_CHECK_TIMES_ET: List[Tuple[int, int]] = [(9, 45), (12, 30), (15, 30)]
 MIRROR_HEARTBEAT_MS = 300_000  # 5 min wall-clock re-check — NOT a feed poll
 
+# Pick notes mirror will act on. Everything else (conditional, OTC) is a
+# deliberate pass — see _mirror_skip_reason.
+MIRROR_NOTES = ("reg alert", "alert", "early access")
+
+# Brokers whose execute_trade() accepts only_accounts=[...] and will trade just
+# those. Anything not listed here re-runs its whole account list, so the
+# "retry the accounts that failed" action deliberately won't offer it — a retry
+# that quietly re-buys the accounts that already filled is worse than no retry.
+RETRYABLE_ACCOUNT_BROKERS = ("wellsfargo", "fidelity")
+
 
 def _mirror_due_slot(now: datetime) -> Optional[str]:
     """Key of the most recent scheduled check `now` has reached, or None when
@@ -950,6 +960,38 @@ def _pick_coverage(picks: List[Dict[str, str]]) -> Dict[tuple, int]:
     return cov
 
 
+def _pick_broker_map(picks: List[Dict[str, str]]) -> Dict[tuple, set]:
+    """(SYMBOL, pick_date) -> the brokers holding a confirmed buy for it.
+
+    Same rule as _pick_coverage (a buy counts from the alert date on), but keyed
+    by broker rather than counted, because "has THIS broker already bought it"
+    and "has anyone bought it" are different questions. Mirror needs the first:
+    a name bought by hand at Chase says nothing about whether Public holds it.
+    """
+    out: Dict[tuple, set] = {}
+    try:
+        all_trades = trade_journal.get_trades()
+    except Exception:
+        return out
+    buys: Dict[str, List[tuple]] = {}
+    for t in all_trades:
+        if t.get("side") != "buy":
+            continue
+        sym = str(t.get("symbol") or "").upper()
+        if not sym:
+            continue
+        buys.setdefault(sym, []).append(
+            (str(t.get("timestamp") or "")[:10], str(t.get("broker") or "")))
+    for pick in picks:
+        sym = str(pick.get("symbol") or "").upper()
+        pick_date = str(pick.get("date") or "")
+        if not sym or not pick_date:
+            continue
+        out[(sym, pick_date)] = {b for (d, b) in buys.get(sym, [])
+                                 if b and d and d >= pick_date}
+    return out
+
+
 def _touched_pick_keys(picks: List[Dict[str, str]]) -> set:
     """Picks with at least one confirmed buy — i.e. real open positions.
 
@@ -1023,6 +1065,22 @@ def _prune_stale_picks(picks: List[Dict[str, str]],
         else:
             kept.append(p)
     return kept, removed
+
+
+def _pick_is_fresh(pick: Dict[str, str],
+                   max_age_days: int = PICK_MAX_AGE_DAYS) -> bool:
+    """True while a pick is still inside its buying window.
+
+    Undated picks count as fresh, matching _prune_stale_picks — we can't age
+    out what we can't date, and dropping them silently would be worse than
+    considering them.
+    """
+    from datetime import date as _date
+    try:
+        pd = datetime.strptime(str(pick.get("date")), "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return True
+    return (_date.today() - pd).days <= max_age_days
 
 
 def _merge_picks(*lists: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -1468,6 +1526,161 @@ class App(ctk.CTk):
             pass
         overlay.destroy()
         return result[0]
+
+    # ---- Full-window alert for "go do something on your phone" -------------
+
+    def _show_action_alert(self, title: str, body: str, *,
+                           detail: str = "", icon_name: str = "warning",
+                           color: str = YELLOW) -> None:
+        """Full-window alert for a step only the user can complete elsewhere.
+
+        Unlike `_ask_inline` there is nothing to type. A device approval is
+        already sitting on the user's phone and the login is blocked until they
+        tap it, so this takes no input, never grabs the keyboard, and stays up
+        until the caller takes it down. It cannot be missed: it covers the whole
+        window, raises the app, and beeps.
+
+        Thread-safe — bootstrap runs on a worker thread.
+        """
+        def _show() -> None:
+            existing = getattr(self, "_action_alert", None)
+            if existing is not None and existing["frame"].winfo_exists():
+                # Already showing: refresh the words rather than stacking a
+                # second scrim on top of the first.
+                existing["title"].configure(text=title)
+                existing["body"].configure(text=body)
+                existing["detail"].configure(text=detail)
+                return
+
+            overlay = tk.Frame(self, bg=BG_PRIMARY)
+            overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+            overlay.lift()
+
+            card = RoundedFrame(overlay, bg_color=BG_CARD, border_color=color,
+                                radius=RAD_LG)
+            card.place(relx=0.5, rely=0.5, anchor="center")
+            inner = tk.Frame(card.inner, bg=BG_CARD)
+            inner.pack(padx=SP_3XL, pady=SP_3XL)
+
+            tk.Label(inner, text=icon(icon_name), bg=BG_CARD, fg=color,
+                     font=(ICON_FONT, 40)).pack(anchor="center")
+            lbl_title = tk.Label(inner, text=title, bg=BG_CARD, fg=TEXT_PRIMARY,
+                                 font=(FONT_FAMILY, FS_H1, "bold"),
+                                 wraplength=520, justify="center")
+            lbl_title.pack(anchor="center", pady=(SP_LG, SP_SM))
+            lbl_body = tk.Label(inner, text=body, bg=BG_CARD, fg=TEXT_SECONDARY,
+                                font=(FONT_FAMILY, 11), wraplength=520,
+                                justify="center")
+            lbl_body.pack(anchor="center")
+            lbl_detail = tk.Label(inner, text=detail, bg=BG_CARD, fg=TEXT_MUTED,
+                                  font=(FONT_FAMILY, 10), wraplength=520,
+                                  justify="center")
+            lbl_detail.pack(anchor="center", pady=(SP_LG, 0))
+
+            waiting = tk.Label(inner, text="● waiting for approval", bg=BG_CARD,
+                               fg=color, font=(FONT_MONO, 11))
+            waiting.pack(anchor="center", pady=(SP_XL, 0))
+
+            state = {"frame": overlay, "title": lbl_title, "body": lbl_body,
+                     "detail": lbl_detail, "pulse": None, "on": True}
+
+            def pulse() -> None:
+                if not waiting.winfo_exists():
+                    return
+                state["on"] = not state["on"]
+                waiting.configure(fg=color if state["on"] else TEXT_MUTED)
+                state["pulse"] = self.after(650, pulse)
+
+            pulse()
+
+            # Dismissing hides the alert only. The login is still waiting on the
+            # phone — saying otherwise would be a lie, and cancelling it here
+            # would strand robin_stocks in its no-timeout poll.
+            PillButton(inner, text="Hide this", bg_color=BG_CARD_ALT,
+                       command=self._hide_action_alert,
+                       width=140, height=34).pack(anchor="center", pady=(SP_XL, 0))
+
+            self._action_alert = state
+
+            try:
+                self.deiconify()
+                self.lift()
+                self.attributes("-topmost", True)
+                self.after(800, lambda: self.attributes("-topmost", False))
+            except Exception:
+                pass
+            try:
+                self.bell()
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+
+        self.after(0, _show)
+
+    def _hide_action_alert(self) -> None:
+        def _hide() -> None:
+            state = getattr(self, "_action_alert", None)
+            self._action_alert = None
+            if state is None:
+                return
+            if state.get("pulse") is not None:
+                try:
+                    self.after_cancel(state["pulse"])
+                except Exception:
+                    pass
+            try:
+                if state["frame"].winfo_exists():
+                    state["frame"].destroy()
+            except Exception:
+                pass
+
+        self.after(0, _hide)
+
+    def _arm_device_approval_alert(self, mod) -> Any:
+        """Put a broker's device-approval push on screen while it blocks.
+
+        Robinhood is the one that needs this: its re-login sends a push and then
+        polls with no timeout, so a notification nobody sees is a bootstrap that
+        hangs until the app is killed. Any broker module exposing
+        `set_device_approval_hook` gets the same treatment; the rest are
+        untouched. Returns the setter so the caller can unregister.
+        """
+        setter = getattr(mod, "set_device_approval_hook", None)
+        if not callable(setter):
+            return None
+        broker_name = str(getattr(mod, "BROKER", "Broker")).capitalize()
+
+        def _on_push(message: str) -> None:
+            # Called from the login thread, mid-print. Everything here has to be
+            # scheduled onto the UI loop.
+            self.after(0, lambda: self._log(f"ALERT: {broker_name} — {message}"))
+            self._show_action_alert(
+                "Approve the login on your phone",
+                message,
+                detail=(
+                    "Approve within about a minute — the login shares one "
+                    "120-second budget between waiting for you and confirming "
+                    "afterwards. Don't start another bootstrap while this is up: "
+                    "repeated attempts trip Robinhood's rate limit, which then "
+                    "fails with a misleading \"check credentials\" error."
+                ),
+                icon_name="lock",
+            )
+
+        try:
+            setter(_on_push)
+        except Exception:
+            return None
+        return setter
+
+    def _disarm_device_approval_alert(self, setter) -> None:
+        """Unregister the hook and take the alert down, however login ended."""
+        if callable(setter):
+            try:
+                setter(None)
+            except Exception:
+                pass
+        self._hide_action_alert()
 
     def _install_input_hook(self) -> None:
         """Monkey-patch builtins.input so broker 2FA prompts show a GUI dialog."""
@@ -3268,6 +3481,8 @@ class App(ctk.CTk):
             for w in grid.winfo_children():
                 w.destroy()
         self._quick_picks = picks
+        if picks:
+            self._repair_mirror_executed()
         # Watchlist + ticker tape track the RSA picks we buy.
         self._sync_watchlist_from_picks()
         self._render_pipeline()
@@ -4914,7 +5129,8 @@ class App(ctk.CTk):
         return self._fetch_market_price(symbol)
 
     def _trade_worker(self, broker: str, side: str, symbol: str, qty: str,
-                      dry_run: bool, batch: Optional[dict] = None) -> None:
+                      dry_run: bool, batch: Optional[dict] = None,
+                      only_accounts: Optional[List[str]] = None) -> None:
         slot = _browser_slot(broker)  # per-broker Chrome lock (None = API broker)
         held_slot: Optional[threading.Lock] = None
         # Per-broker outcome reported back to the batch tracker (defaults to a
@@ -4986,9 +5202,22 @@ class App(ctk.CTk):
                 pre_trade_price = self._fetch_quote_price(broker, symbol, "buy")
 
             try:
-                output: BrokerOutput = mod.execute_trade(
-                    side=side, qty=qty, symbol=symbol, dry_run=dry_run,
-                )
+                kw = {"side": side, "qty": qty, "symbol": symbol, "dry_run": dry_run}
+                if only_accounts:
+                    # Not every broker module can narrow to a subset of its
+                    # accounts. Ask, and if the module doesn't take the kwarg,
+                    # say so instead of quietly re-buying the whole broker.
+                    try:
+                        output: BrokerOutput = mod.execute_trade(
+                            **kw, only_accounts=list(only_accounts))
+                    except TypeError as te:
+                        if "only_accounts" not in str(te):
+                            raise
+                        raise RuntimeError(
+                            f"{broker} cannot trade specific accounts — "
+                            f"retry it from the Trade Desk instead") from None
+                else:
+                    output = mod.execute_trade(**kw)
             finally:
                 done.set()
                 ticker.join(timeout=2)
@@ -5196,7 +5425,7 @@ class App(ctk.CTk):
         self._render_done_receipt(
             kind=kind, verb=verb, shares=shares_str, symbol=symbol,
             total_ok=total_ok, total_fail=total_fail, ok_brokers=ok_brokers,
-            results=results, dry=dry, elapsed=elapsed)
+            results=results, dry=dry, elapsed=elapsed, batch=batch)
 
         # --- Concise, styled feed summary (no ASCII bars) ---
         if kind == "ok":
@@ -6965,6 +7194,52 @@ class App(ctk.CTk):
         return {"enabled": False, "brokers": [], "executed": [],
                 "last_slot": "", "failed": []}
 
+    def _repair_mirror_executed(self) -> None:
+        """One-shot: drop 'executed' entries that were never actually executed.
+
+        Every earlier enable stamped the whole feed as executed, so saved state
+        can hold fresh picks that were never bought and can never be bought —
+        the switch that was supposed to buy them is what buried them. Release a
+        key only when all three are true, which pins it to that bug and nothing
+        else:
+
+          * mirror never opened a run for it (mirror_runs.json) — so this is not
+            a run that died mid-fan-out after real orders went out,
+          * it is not in `failed` — those filled nowhere and are deliberately
+            never retried,
+          * the journal shows no buy and the pick is still fresh.
+
+        Runs once, the first time the pick feed lands.
+        """
+        if getattr(self, "_mirror_repaired", True):
+            return
+        self._mirror_repaired = True
+        if not getattr(self, "_mirror_executed", None):
+            return
+        try:
+            picks = list(self._quick_picks or [])
+            bought = self._mirror_bought_keys(picks)
+            attempted = {(str(r.get("symbol") or "").upper(),
+                          str(r.get("pick_date") or ""))
+                         for r in mirror_journal.runs()}
+            fresh_unbought = {
+                self._mirror_key(p) for p in picks
+                if str(p.get("note", "")).lower() in MIRROR_NOTES
+                and _pick_is_fresh(p)
+                and self._mirror_journal_key(p) not in bought
+                and self._mirror_journal_key(p) not in attempted}
+        except Exception:
+            return
+        stale = {k for k in self._mirror_executed
+                 if k in fresh_unbought and k not in self._mirror_failed}
+        if not stale:
+            return
+        self._mirror_executed -= stale
+        self._save_mirror_state()
+        syms = ", ".join(sorted(k[1] for k in stale))
+        self._log(f"Mirror: released {len(stale)} pick(s) marked executed but "
+                  f"never bought — {syms}")
+
     def _save_mirror_state(self) -> None:
         """Persist mirror trading state to disk."""
         import json
@@ -7021,6 +7296,9 @@ class App(ctk.CTk):
         self._mirror_failed: set = set(
             tuple(x) if isinstance(x, list) else x
             for x in saved.get("failed", []))
+        # Repaired once the picks actually land — see _render_quick_picks. The
+        # feed is still empty at build time.
+        self._mirror_repaired = False
 
         # Status indicator
         self._mirror_status_frame = tk.Frame(mirror_header, bg=BG_CARD)
@@ -7355,23 +7633,39 @@ class App(ctk.CTk):
             return
 
         brokers_str = ", ".join(sorted(self._mirror_selected_brokers))
+        pending = self._mirror_pending_picks()
+        if pending:
+            names = ", ".join(f"{p.get('symbol', '?')} ({p.get('date', '')})"
+                              for p in pending[:6])
+            if len(pending) > 6:
+                names += f", +{len(pending) - 6} more"
+            pending_txt = (f"{len(pending)} pick(s) have no buy on record yet and "
+                           f"will be bought at the next check:\n\n  {names}\n\n")
+        else:
+            pending_txt = "Nothing is waiting to be bought right now.\n\n"
+
         confirm = messagebox.askyesno(
             "Enable Mirror Trading",
             f"Are you sure you want to enable Mirror Trading?\n\n"
             f"This will automatically BUY 1 share of any new Reg Alert pick "
             f"on the following brokers:\n\n"
             f"  {brokers_str}\n\n"
-            f"Only new picks added AFTER this moment will be executed.\n"
+            f"{pending_txt}"
             f"You can disable it at any time.",
             parent=self)
         if not confirm:
             return
 
-        # Snapshot current picks so we don't execute existing ones
+        # Suppress every Reg Alert pick that is NOT pending — already bought,
+        # already mirrored, or past its round-up window. What survives is work
+        # still owed, and enabling mirror must not bury it.
+        pending_keys = {self._mirror_key(p) for p in pending}
         for pick in self._quick_picks:
-            note = pick.get("note", "").lower()
-            if note in ("reg alert", "alert", "early access"):
-                self._mirror_executed.add(self._mirror_key(pick))
+            if str(pick.get("note", "")).lower() not in MIRROR_NOTES:
+                continue
+            key = self._mirror_key(pick)
+            if key not in pending_keys:
+                self._mirror_executed.add(key)
 
         self._mirror_enabled.set(True)
         self._mirror_status_dot.itemconfig("all", fill=GREEN, outline=GREEN)
@@ -7380,6 +7674,10 @@ class App(ctk.CTk):
         self._mirror_log_msg(f"Mirror trading ENABLED on: {brokers_str}")
         self._mirror_log_msg(
             f"Checking for new Reg Alert picks at {_mirror_schedule_label()} on market days")
+        if pending:
+            self._mirror_log_msg(
+                f"{len(pending)} unbought pick(s) queued: "
+                + ", ".join(str(p.get("symbol", "?")) for p in pending))
         self._save_mirror_state()
 
         # Start the schedule heartbeat
@@ -7453,6 +7751,65 @@ class App(ctk.CTk):
             f"Mirror: {symbol} filled on no broker — needs manual action", "error")
         self._render_mirror_failed()
 
+    def _mirror_pending_picks(self) -> List[Dict[str, str]]:
+        """Reg Alert picks mirror still owes: fresh, and with no buy on record.
+
+        Enabling mirror used to stamp *every* pick in the feed as executed, on
+        the theory that anything already listed had been dealt with. It hadn't —
+        a pick imported this morning and not yet bought is precisely the pick
+        mirror is being turned on for, and it went into the executed set unbought
+        and was never looked at again. Whether the journal shows a buy is the
+        real test; whether the pick predates the switch is not.
+
+        Picks past PICK_MAX_AGE_DAYS stay suppressed regardless: their round-up
+        window has closed, and flipping the switch must never open a month of
+        old positions at once.
+        """
+        bought = self._mirror_bought_keys(self._quick_picks)
+        pending: List[Dict[str, str]] = []
+        for pick in self._quick_picks:
+            if str(pick.get("note", "")).lower() not in MIRROR_NOTES:
+                continue
+            if self._mirror_key(pick) in self._mirror_executed:
+                continue
+            if self._mirror_journal_key(pick) in bought:
+                continue
+            if not _pick_is_fresh(pick):
+                continue
+            pending.append(pick)
+        return pending
+
+    def _mirror_bought_keys(self, picks: List[Dict[str, str]]) -> set:
+        """Journal keys mirror has nothing left to do on.
+
+        This is the guard that stops the executed set pretending to be a record
+        of what we own: a pick bought from the Trade Desk is bought, and mirror
+        must not buy it again just because it never placed that order itself.
+
+        Scoped to the brokers mirror actually trades, and only when EVERY one of
+        them already holds the pick. Testing "anyone bought it" instead would
+        silence exactly the case mirror exists for — a name bought by hand at
+        Chase and Wells Fargo, with Public and Robinhood still owed.
+        """
+        try:
+            selected = set(self._mirror_selected_brokers)
+            holders = _pick_broker_map(picks)
+            done = _load_done_picks()
+        except Exception:
+            return set()
+        if not selected:
+            return set(done)
+        return {k for k, brokers in holders.items()
+                if selected <= brokers} | set(done)
+
+    @staticmethod
+    def _mirror_journal_key(pick: Dict[str, str]) -> tuple:
+        """(SYMBOL, date) — the journal/coverage key order, which is the REVERSE
+        of _mirror_key's (date, SYMBOL). Two orders in play, so never pass one
+        where the other is expected."""
+        return (str(pick.get("symbol", "")).strip().upper(),
+                str(pick.get("date", "")).strip())
+
     @staticmethod
     def _mirror_key(pick: Dict[str, str]) -> tuple:
         """Canonical dedup key for a pick. MUST be built identically everywhere
@@ -7481,22 +7838,25 @@ class App(ctk.CTk):
 
         self._mirror_poll_id = self.after(MIRROR_HEARTBEAT_MS, self._mirror_poll)
 
-    def _mirror_check_now(self, when: str = "manual") -> None:
+    def _mirror_check_now(self, when: str = "manual",
+                          trigger: str = "") -> None:
         """One pass over the pick feed; buys anything new and eligible."""
         if not self._mirror_enabled.get():
             return
+        trigger = trigger or ("manual" if when == "manual" else "schedule")
         self._mirror_log_msg(f"Scheduled check ({when})...")
 
         def _worker():
             try:
                 picks = _fetch_quick_picks()
+                bought = self._mirror_bought_keys(picks)
                 new_picks = []
                 skipped: List[Dict[str, str]] = []
                 for pick in picks:
                     note = pick.get("note", "").lower()
                     sym = str(pick.get("symbol", "")).upper()
                     # Only Reg Alert / alert / early access
-                    if note not in ("reg alert", "alert", "early access"):
+                    if note not in MIRROR_NOTES:
                         # Recorded, not just dropped: "why didn't it buy TOMZ"
                         # is the question the Mirror page exists to answer, and
                         # 'conditional' vs 'OTC' are different answers.
@@ -7506,11 +7866,21 @@ class App(ctk.CTk):
                     if self._mirror_key(pick) in self._mirror_executed:
                         skipped.append({"symbol": sym, "reason": "already executed"})
                         continue
+                    # Bought by hand, or by an earlier install: the executed set
+                    # only knows about orders mirror itself placed, so without
+                    # this a Trade Desk buy gets bought a second time.
+                    if self._mirror_journal_key(pick) in bought:
+                        skipped.append({"symbol": sym, "reason": "already bought"})
+                        continue
+                    if not _pick_is_fresh(pick):
+                        skipped.append({"symbol": sym,
+                                        "reason": "past its round-up window"})
+                        continue
                     new_picks.append(pick)
 
                 try:
                     mirror_journal.record_scan(
-                        trigger="schedule" if when != "manual" else "manual",
+                        trigger=trigger,
                         slot=when, considered=len(picks),
                         queued=len(new_picks), skipped=skipped)
                 except Exception:
@@ -7518,7 +7888,7 @@ class App(ctk.CTk):
                 self.after(0, lambda: self._invalidate_page("mirror"))
 
                 if new_picks:
-                    self.after(0, lambda: self._mirror_execute(new_picks, when))
+                    self.after(0, lambda: self._mirror_execute(new_picks, when, trigger))
                 else:
                     self.after(0, lambda: self._mirror_log_msg("No new picks"))
             except Exception as e:
@@ -7531,11 +7901,16 @@ class App(ctk.CTk):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _mirror_execute(self, picks: List[Dict[str, str]],
-                        when: str = "manual") -> None:
-        """Execute BUY 1 share for each new pick on selected brokers."""
+                        when: str = "manual", trigger: str = "") -> None:
+        """Execute BUY 1 share for each new pick on the brokers still owed it."""
         if not self._mirror_selected_brokers:
             self._mirror_log_msg("No brokers selected — skipping")
             return
+
+        # Which brokers already hold each pick. A pick reaches here when at
+        # least one selected broker still owes it — buying blind on the whole
+        # set would double up on the ones that already filled.
+        holders = _pick_broker_map(picks)
 
         for pick in picks:
             symbol = pick.get("symbol", "").upper()
@@ -7546,17 +7921,24 @@ class App(ctk.CTk):
                 continue
 
             self._mirror_executed.add(key)
+            held = holders.get(self._mirror_journal_key(pick), set())
+            selected = sorted(self._mirror_selected_brokers - held)
+            if not selected:
+                continue
+            skipping = sorted(self._mirror_selected_brokers & held)
             self._mirror_log_msg(f"NEW PICK: {symbol} — executing BUY 1 share")
+            if skipping:
+                self._mirror_log_msg(
+                    f"  skipping {', '.join(skipping)} — already holds {symbol}")
             self._mirror_exec_count.configure(
                 text=f"{len(self._mirror_executed)} pick(s) already executed")
 
             # Route through a batch (origin=mirror) so it gets the same live
             # strip + completion receipt as a manual trade, and reuse the worker.
-            selected = sorted(self._mirror_selected_brokers)
             try:
                 run_id = mirror_journal.start_run(
                     symbol=symbol, side="buy", qty="1", brokers=selected,
-                    trigger="schedule" if when != "manual" else "manual",
+                    trigger=trigger or ("manual" if when == "manual" else "schedule"),
                     slot=when, note=str(pick.get("note", "")),
                     pick_date=str(pick.get("date", "")), dry_run=False)
             except Exception:
@@ -7728,7 +8110,9 @@ class App(ctk.CTk):
         self._discord_toggle_btn.pack(side="left")
 
         if on:
-            self.after(2000, self._discord_daily_check)
+            # Launch always pulls, even if today's scheduled pull already ran in
+            # an earlier session.
+            self.after(2000, lambda: self._discord_daily_check(force=True))
 
     def _apply_discord_lock(self) -> None:
         """Push self._discord_locked out to the widgets and the lock bar."""
@@ -7991,6 +8375,7 @@ class App(ctk.CTk):
                 f"Imported {len(added)} pick(s): {syms}"))
             self.after(0, lambda: self._push_notification(
                 f"Discord: imported {syms}", "success"))
+            self.after(0, lambda: self._mirror_after_import(added))
         elif buy_msgs:
             self.after(0, lambda: self._discord_log_msg("No new tickers found."))
 
@@ -8012,6 +8397,27 @@ class App(ctk.CTk):
                 f"Round-up confirmed: {ru}", "success"))
 
         self._publish_feed(batch)
+
+    def _mirror_after_import(self, added: List[Dict[str, str]]) -> None:
+        """Check the feed as soon as an import lands a new Reg Alert.
+
+        The schedule is three fixed slots, so a pick imported at 10:15 — or by
+        the launch pull — otherwise sat unbought until 12:30. This only fires
+        inside a window the schedule would itself act in: _mirror_due_slot is
+        None at night, at weekends and after 16:00 ET, so an evening import can
+        never place an order.
+        """
+        if not getattr(self, "_mirror_enabled", None) or not self._mirror_enabled.get():
+            return
+        if not any(str(p.get("note", "")).lower() in MIRROR_NOTES for p in added):
+            return
+        _state, _label, now = _market_status()
+        if _mirror_due_slot(now) is None:
+            self._mirror_log_msg(
+                "New pick imported outside the check window — it goes at the "
+                f"next scheduled check ({_mirror_schedule_label()})")
+            return
+        self._mirror_check_now("new pick imported", trigger="import")
 
     def _publish_feed(self, batch) -> None:
         """Publish the parsed batch to RSAMAXXED Cloud, if this machine is the
@@ -8064,10 +8470,16 @@ class App(ctk.CTk):
         _save_discord_state(self._discord_state)
         self._discord_daily_check()
 
-    def _discord_daily_check(self) -> None:
+    def _discord_daily_check(self, force: bool = False) -> None:
         """Pull at most once per calendar day (one request/day — invisible to
         server staff, minimal account footprint). Re-checks hourly so it still
         fires on a new day if the app is left open.
+
+        `force` is the launch pull. Opening the app is an explicit "show me what
+        is current", and the once-a-day gate used to mean a copy started after
+        that day's pull ran with a stale board until tomorrow — including the
+        alert that landed while it was closed. The pull is incremental (it asks
+        only for messages after `last_id`), so this costs one cheap request.
 
         The TRACK board has its own loop (`_track_loop`) — it is read-only and
         must not depend on this toggle, which exists to control whether we
@@ -8076,10 +8488,10 @@ class App(ctk.CTk):
         if not self._discord_state.get("enabled"):
             return
         today = datetime.now().strftime("%Y-%m-%d")
-        if self._discord_state.get("last_pull_date") != today:
+        if force or self._discord_state.get("last_pull_date") != today:
             self._discord_state["last_pull_date"] = today
             _save_discord_state(self._discord_state)
-            self._discord_log_msg("Daily pull...")
+            self._discord_log_msg("Startup pull..." if force else "Daily pull...")
             self._run_in_thread(self._discord_import_worker, True)
         else:
             self._discord_log_msg("Already pulled today — next pull tomorrow.")
@@ -8378,7 +8790,8 @@ class App(ctk.CTk):
         meta = []
         if run.get("dry_run"):
             meta.append("DRY RUN")
-        meta.append("scheduled" if run.get("trigger") == "schedule" else "manual")
+        meta.append({"schedule": "scheduled",
+                     "import": "on import"}.get(run.get("trigger"), "manual"))
         if run.get("slot") and run.get("slot") != "manual":
             meta.append(run["slot"])
         if run.get("elapsed"):
@@ -9782,7 +10195,14 @@ class App(ctk.CTk):
             try:
                 load_dotenv(ENV_FILE, override=True)
                 mod = _load_broker(broker)
-                output: BrokerOutput = mod.bootstrap()
+                # Robinhood's login can stall on a device approval waiting on the
+                # user's phone. Nothing on screen said so, and the poll has no
+                # timeout, so it read as a hang.
+                _approval = self._arm_device_approval_alert(mod)
+                try:
+                    output: BrokerOutput = mod.bootstrap()
+                finally:
+                    self._disarm_device_approval_alert(_approval)
             finally:
                 if held_slot is not None:
                     try:
@@ -9889,7 +10309,19 @@ class App(ctk.CTk):
         self._done_dismiss.pack(side="right")
         self._done_dismiss.bind("<Button-1>", lambda e: self._done_hide())
         self._done_chips = tk.Frame(dc, bg=BG_CARD)
-        self._done_chips.pack(fill="x", padx=22, pady=(10, 18))
+        self._done_chips.pack(fill="x", padx=22, pady=(10, 4))
+        # Retry row: only packed when a run left accounts unfilled.
+        self._done_retry_row = tk.Frame(dc, bg=BG_CARD)
+        self._done_retry_lbl = tk.Label(self._done_retry_row, text="", bg=BG_CARD,
+                                        fg=TEXT_SECONDARY, font=(FONT_FAMILY, 9),
+                                        anchor="w", justify="left")
+        self._done_retry_lbl.pack(side="left", padx=(0, 12))
+        self._done_retry_btn = PillButton(
+            self._done_retry_row, text="Retry failed accounts",
+            bg_color=BG_CARD_ALT, hover_color=ACCENT,
+            command=self._retry_failed_accounts, width=170, height=30,
+            font_size=9)
+        self._done_retry_btn.pack(side="right")
         self._done_card.pack(fill="x", pady=(0, 12))
         self._done_card.pack_forget()
 
@@ -10054,7 +10486,8 @@ class App(ctk.CTk):
         chip.pack(side="left", padx=(0, 8), pady=3)
 
     def _render_done_receipt(self, *, kind, verb, shares, symbol, total_ok,
-                             total_fail, ok_brokers, results, dry, elapsed) -> None:
+                             total_fail, ok_brokers, results, dry, elapsed,
+                             batch=None) -> None:
         if not hasattr(self, "_done_card"):
             return
         color = {"ok": GREEN, "warn": YELLOW, "fail": RED}[kind]
@@ -10087,7 +10520,94 @@ class App(ctk.CTk):
                 self._receipt_chip(self._done_chips, f"{name}  {r['ok_accounts']}/{tot}", YELLOW)
             else:
                 self._receipt_chip(self._done_chips, f"{name}  failed", RED)
+        self._render_retry_row(results=results, dry=dry, batch=batch)
         self._done_show()
+
+    def _render_retry_row(self, *, results, dry, batch) -> None:
+        """Offer a re-run of exactly the accounts that came back unfilled.
+
+        A broker that fills 5 of 10 leaves the other 5 invisible the moment the
+        receipt is dismissed, and re-running the whole broker would double-buy
+        the 5 that worked. The failed account ids are already in the result, so
+        the retry can name them.
+        """
+        if not hasattr(self, "_done_retry_row"):
+            return
+        self._retry_plan = {} if (dry or not batch) else self._failed_account_plan(results)
+        if not self._retry_plan:
+            self._retry_order = None
+            self._done_retry_row.pack_forget()
+            return
+        n = sum(len(v) for v in self._retry_plan.values())
+        where = ", ".join(f"{b.capitalize()} ({len(v)})"
+                          for b, v in sorted(self._retry_plan.items()))
+        # Quantity comes off the batch, never off the receipt: `shares` is the
+        # total filled across every account, so retrying with it would send
+        # "buy 5" to each account that was owed one share.
+        self._retry_order = {"side": batch.get("side", "buy"),
+                             "symbol": batch.get("symbol", ""),
+                             "qty": str(batch.get("qty", "1"))}
+        self._done_retry_lbl.configure(
+            text=f"{n} account{'s' if n != 1 else ''} still unfilled — {where}")
+        self._done_retry_row.pack(fill="x", padx=22, pady=(4, 16))
+
+    @staticmethod
+    def _failed_account_plan(results: List[dict]) -> Dict[str, List[str]]:
+        """broker -> the account ids that failed, for brokers that can retarget.
+
+        Brokers whose module can't narrow to a subset of accounts are left out:
+        offering a retry that silently re-runs all of them is worse than not
+        offering one.
+        """
+        plan: Dict[str, List[str]] = {}
+        for r in results or []:
+            broker = r.get("broker") or ""
+            if broker not in RETRYABLE_ACCOUNT_BROKERS:
+                continue
+            failed = [a.get("account_id") for a in (r.get("accounts") or [])
+                      if not a.get("ok") and a.get("account_id")]
+            if failed:
+                plan[broker] = failed
+        return plan
+
+    def _retry_failed_accounts(self) -> None:
+        plan = getattr(self, "_retry_plan", None)
+        order = getattr(self, "_retry_order", None)
+        if not plan or not order:
+            return
+        if getattr(self, "_trade_in_flight", False):
+            self._push_notification("A trade is already running — wait for it "
+                                    "to finish", "warning")
+            return
+        n = sum(len(v) for v in plan.values())
+        if not messagebox.askyesno(
+            "Retry failed accounts",
+            f"Retry {order['side'].upper()} {order['qty']} {order['symbol']} on "
+            f"the {n} account(s) that did not fill?\n\n"
+            + "\n".join(f"  {b}: {', '.join(v)}" for b, v in sorted(plan.items())),
+                parent=self):
+            return
+        brokers = sorted(plan)
+        batch = {
+            "pending": set(brokers),
+            "all_brokers": brokers,
+            "results": [],
+            "side": order["side"],
+            "symbol": order["symbol"],
+            "qty": order["qty"],
+            "dry_run": False,
+            "origin": "retry",
+            "finished": False,
+            "started": datetime.now(),
+        }
+        self._done_hide()
+        self._live_start(batch)
+        for broker in brokers:
+            accts = plan[broker]
+            self._log(f"  {broker}: retrying {len(accts)} failed account(s)...")
+            self._run_in_thread(self._trade_worker, broker, order["side"],
+                                order["symbol"], order["qty"], False, batch,
+                                accts)
 
 
 # ---------------------------------------------------------------------------
