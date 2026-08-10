@@ -228,7 +228,41 @@ class FennelBroker:
             pass
 
         acct_ids = client.get_account_ids()
-        return [(f"Account {i + 1}", str(aid)) for i, aid in enumerate(acct_ids)]
+        if acct_ids:
+            return [(f"Account {i + 1}", str(aid)) for i, aid in enumerate(acct_ids)]
+
+        # get_account_ids() keeps only accounts whose status is "APPROVED", and
+        # Fennel's status vocabulary has drifted out from under it: every
+        # account on a working login now reports CLOSED -- including the primary
+        # one, which holds a live settled cash balance and trades fine. Trusting
+        # that field means the broker reports zero accounts and goes silently
+        # dark. Fall back to the unfiltered list rather than believe a flag that
+        # demonstrably does not track whether an account works.
+        return self._accounts_unfiltered(client)
+
+    @staticmethod
+    def _accounts_unfiltered(client) -> List[Tuple[str, str]]:
+        """Every account on the login, whatever status Fennel labels it with."""
+        try:
+            headers = client.endpoints.build_headers(client.Bearer)
+            resp = client.session.post(client.endpoints.graphql, headers=headers,
+                                       data=client.endpoints.account_ids_query())
+            if resp.status_code != 200:
+                return []
+            rows = (((resp.json().get("data") or {}).get("user") or {})
+                    .get("accounts")) or []
+        except Exception:
+            return []
+
+        out: List[Tuple[str, str]] = []
+        # Same ordering the client uses, so account labels stay stable.
+        for row in sorted(rows, key=lambda r: (r or {}).get("created") or ""):
+            if not isinstance(row, dict):
+                continue
+            acct_id = row.get("id")
+            if acct_id:
+                out.append((str(row.get("name") or "Account"), str(acct_id)))
+        return out
 
     def ensure_authenticated(self) -> BrokerOutput:
         """
@@ -266,18 +300,16 @@ class FennelBroker:
 
                 acct_pairs = self._get_accounts(client)
                 if not acct_pairs:
-                    # The login is good; there is just nothing behind it. Fennel
-                    # marks a shut account CLOSED and the client keeps only the
-                    # APPROVED ones, so this comes back as an empty list rather
-                    # than an error. Reported as a failure because a broker with
-                    # no tradeable account cannot do anything we would ask of
+                    # Only reachable now if Fennel returns no accounts at all --
+                    # the status filter can no longer empty this list on its own
+                    # (see _get_accounts). Reported as a failure because a broker
+                    # with nothing behind it cannot do anything we would ask of
                     # it, and "Authenticated. Accounts: 0" reads like success.
                     any_fail = True
                     accounts_out.append(AccountOutput(
                         account_id=label, ok=False,
-                        message="Signed in, but Fennel reports no open accounts on "
-                                "this login — every one of them is CLOSED, so there "
-                                "is nothing to trade."))
+                        message="Signed in, but Fennel returned no accounts at all "
+                                "for this login — nothing to trade."))
                     continue
 
                 self._sessions.append(_LoginSession(label=label, email=email, client=client, accounts=acct_pairs, pkl_name=pkl))
