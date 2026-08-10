@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow
@@ -166,15 +166,23 @@ def _log_ctx() -> Dict[str, Any]:
 class _Tee:
     """Write-through stream: keeps the real console working while recording."""
 
-    def __init__(self, real, buf):
+    def __init__(self, real, buf, on_text=None):
         self._real = real
         self._buf = buf
+        self._on_text = on_text
 
     def write(self, s):
         try:
             self._buf.write(s)
         except Exception:
             pass
+        # Watch the stream as it is written, not after. The whole point is to
+        # react while the library is still blocked waiting for the user.
+        if self._on_text is not None and s:
+            try:
+                self._on_text(s)
+            except Exception:
+                pass
         try:
             if self._real is not None:
                 self._real.write(s)
@@ -197,7 +205,7 @@ class _Tee:
 
 
 @contextlib.contextmanager
-def _capture_console(buf):
+def _capture_console(buf, on_text=None):
     """Tee stdout/stderr into ``buf`` without hiding them.
 
     robin_stocks reports the whole verification handshake through print() —
@@ -206,13 +214,80 @@ def _capture_console(buf):
     Under pythonw there is no console, so every one of those messages was lost
     and a failed login looked like a silent hang. Tee (never redirect) so a
     terminal run still shows prompts live while the GUI run gets a transcript.
+
+    ``on_text`` sees each chunk as it is written, which is what lets the device
+    approval reach the user while the login is still waiting on it.
     """
     old_out, old_err = sys.stdout, sys.stderr
-    sys.stdout, sys.stderr = _Tee(old_out, buf), _Tee(old_err, buf)
+    sys.stdout = _Tee(old_out, buf, on_text)
+    sys.stderr = _Tee(old_err, buf, on_text)
     try:
         yield
     finally:
         sys.stdout, sys.stderr = old_out, old_err
+
+
+# =============================================================================
+# Device-approval alert
+# =============================================================================
+#
+# Re-login pushes a device approval to the phone and then BLOCKS polling for the
+# answer — robin_stocks' prompt branch is `while True:` with no timeout, so a
+# push nobody notices is not an error, it is a run that never ends. The only
+# announcement the library makes is a print(), which under pythonw goes nowhere.
+# Watching the teed stream is the only place to catch it while it still matters.
+
+DEVICE_APPROVAL_MESSAGE = (
+    "Robinhood sent a device-approval request to the Robinhood app on your "
+    "phone. Open the app and tap Approve to finish signing in."
+)
+
+# What robin_stocks prints when it sends the push. Matched case-insensitively.
+_DEVICE_APPROVAL_PATTERNS = (
+    "check robinhood app for device approvals",
+    "device approvals method",
+    "check robinhood app",
+)
+
+_device_approval_hook: Optional[Callable[[str], None]] = None
+
+
+def set_device_approval_hook(fn: Optional[Callable[[str], None]]) -> None:
+    """Register a callback fired when Robinhood pushes a device approval.
+
+    Called ON THE LOGIN THREAD, from inside a print(), while the login is
+    stalled — so the callback must not block and must not call back into this
+    module. Pass None to unregister.
+    """
+    global _device_approval_hook
+    _device_approval_hook = fn
+
+
+def _device_approval_watcher() -> Callable[[str], None]:
+    """A console watcher that fires the hook once, on the first push."""
+    state = {"fired": False, "tail": ""}
+
+    def _watch(chunk: str) -> None:
+        if state["fired"] or not chunk:
+            return
+        # Match on a rolling tail: the library prints in pieces, so the phrase
+        # can straddle two writes and be in neither of them.
+        state["tail"] = (state["tail"] + chunk)[-400:]
+        low = state["tail"].lower()
+        if not any(p in low for p in _DEVICE_APPROVAL_PATTERNS):
+            return
+        state["fired"] = True
+        fn = _device_approval_hook
+        if fn is None:
+            return
+        try:
+            fn(DEVICE_APPROVAL_MESSAGE)
+        except Exception:
+            # A broken listener must never take down a login that is already
+            # mid-handshake.
+            pass
+
+    return _watch
 
 
 def _log_login_transcript(pickle_name: str, text: str, secrets: Optional[List[Any]] = None) -> None:
@@ -336,6 +411,78 @@ def _get_login_callable(rh):
     if callable(login_fn):
         return login_fn
     return None
+
+
+# =============================================================================
+# Which accounts an order may touch
+# =============================================================================
+
+# Individual + Roth IRA + traditional IRA. The joint account is excluded by
+# _is_joint_account below, so this bounds what is left: a fourth funded account
+# appearing on its own is a surprise, and surprises should not be traded
+# automatically. Override with ROBINHOOD_MAX_TRADE_ACCOUNTS (0 = no limit).
+_DEFAULT_MAX_TRADE_ACCOUNTS = 3
+
+
+def _max_trade_accounts() -> int:
+    raw = _env("ROBINHOOD_MAX_TRADE_ACCOUNTS")
+    if not raw:
+        return _DEFAULT_MAX_TRADE_ACCOUNTS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_MAX_TRADE_ACCOUNTS
+
+
+def _is_joint_account(display_label: str) -> bool:
+    """True for a joint account, which must never be traded.
+
+    It holds no cash, so Robinhood rejects every order sent to it — and a
+    rejection arrives as an ordinary return value, not an exception, so those
+    rejections were being recorded as fills. Matched on the account TYPE, which
+    the label carries verbatim ('joint_tenancy_with_ros'), so it survives the
+    account being replaced by another joint one. Trading only; holdings still
+    cover every account.
+    """
+    return "joint" in (display_label or "").lower()
+
+
+def _order_rejection(resp: Any) -> str:
+    """Why Robinhood refused this order — '' when it accepted it.
+
+    robin_stocks does NOT raise on a rejected order. request_post treats 400,
+    401, 402 and 403 as acceptable status codes and hands back the error body,
+    so a refusal reaches the caller looking exactly like a success. Trusting
+    "no exception" is what booked a filled buy into a joint account holding no
+    cash: order_id came back null, which a real order never does.
+    """
+    if resp is None:
+        return "no response from Robinhood (the request failed)"
+    if not isinstance(resp, dict):
+        return f"unexpected response from Robinhood: {type(resp).__name__}"
+
+    oid = str(resp.get("id") or "").strip()
+    state = str(resp.get("state") or "").strip().lower()
+
+    if oid and state not in ("rejected", "cancelled", "canceled", "failed"):
+        # Accepted. Whether it FILLS is a separate question — this only says
+        # Robinhood took the order.
+        return ""
+
+    if oid:
+        reason = str(resp.get("reject_reason")
+                     or resp.get("cancel_reason") or "").strip()
+        return f"order {state}" + (f": {reason}" if reason else "")
+
+    # No id means an error body. Quote Robinhood rather than inventing a reason.
+    for key in ("detail", "error", "message"):
+        val = resp.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:300]
+    for key, val in resp.items():
+        if isinstance(val, list) and val and all(isinstance(x, str) for x in val):
+            return f"{key}: {'; '.join(val)}"[:300]
+    return "Robinhood returned no order id, so nothing was placed"
 
 
 def _safe_load_accounts(rh) -> List[Dict[str, Any]]:
@@ -680,7 +827,7 @@ def bootstrap() -> BrokerOutput:
             _console = io.StringIO()
             try:
                 if otp_provider is None:
-                    with _capture_console(_console):
+                    with _capture_console(_console, on_text=_device_approval_watcher()):
                         login_fn(**call_kwargs)
                 else:
                     with _suppress_console_noise():
@@ -1022,7 +1169,37 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
 
     order_fn = _rh_fn("order")
 
-    for _acct_i, (display_label, acct_num, pickle_name) in enumerate(_ACCOUNTS or []):
+    # Decide which accounts this order may touch before sending anything.
+    # Skipped accounts are deliberately kept OUT of `outs`: they are not
+    # failures, and counting them as such would report every run as "partial".
+    # They are named in the message instead, so nothing disappears silently.
+    tradable: List[Tuple[str, str, str]] = []
+    skipped: List[Tuple[str, str]] = []
+    for entry in (_ACCOUNTS or []):
+        if _is_joint_account(entry[0]):
+            skipped.append((entry[0], "joint account — never traded"))
+            continue
+        tradable.append(entry)
+
+    _cap = _max_trade_accounts()
+    if _cap and len(tradable) > _cap:
+        for entry in tradable[_cap:]:
+            skipped.append((entry[0], f"over the {_cap}-account limit"))
+        tradable = tradable[:_cap]
+
+    skip_note = ""
+    if skipped:
+        skip_note = "skipped " + ", ".join(f"{lbl} ({why})" for lbl, why in skipped)
+        if dry_run:
+            for lbl, why in skipped:
+                log_lines.append(f"[{lbl}] SKIPPED — {why}")
+            log_lines.append("")
+
+    if not tradable:
+        msg = "No tradable Robinhood accounts" + (f" — {skip_note}" if skip_note else "")
+        return BrokerOutput(broker=BROKER, state="failed", accounts=[], message=msg)
+
+    for _acct_i, (display_label, acct_num, pickle_name) in enumerate(tradable):
         if _acct_i > 0:
             time.sleep(random.uniform(1.0, 3.0))
         try:
@@ -1084,6 +1261,17 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
                         raise RuntimeError("Robinhood market order function not available")
                     resp = fn(sym, q, account_number=acct_num)
 
+            # Check what came back. robin_stocks returns a rejection instead of
+            # raising one, so "no exception" is not evidence an order exists.
+            rejection = _order_rejection(resp)
+            if rejection:
+                outs.append(AccountOutput(account_id=display_label, ok=False,
+                                          message=f"order rejected: {rejection}"))
+                if dry_run:
+                    log_lines.append(f"[{display_label}] REJECTED: {rejection}")
+                    log_lines.append("")
+                continue
+
             oid = resp.get("id") if isinstance(resp, dict) else None
             outs.append(AccountOutput(account_id=display_label, ok=True, message="order placed", order_id=oid))
 
@@ -1102,6 +1290,8 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
     if dry_run:
         log_path = _write_dry_run_log(content="\n".join(log_lines).rstrip() + "\n")
         msg = f"DRY RUN — NO ORDER SUBMITTED | log: {log_path}"
+    if skip_note:
+        msg = f"{msg} | {skip_note}" if msg else skip_note
 
     return BrokerOutput(broker=BROKER, state=state, accounts=outs, message=msg)
 
