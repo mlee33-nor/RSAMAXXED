@@ -12,10 +12,22 @@ from __future__ import annotations
 import argparse
 import importlib
 import sys
+from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
 
 from modules.outputs import BrokerOutput, log_event
 import trade_journal
+
+# Credentials live in .env and the broker modules read them straight off the
+# environment. The GUI loads that file before every operation; this CLI never
+# did, so every command here failed with "Missing <BROKER>_USERNAME" even though
+# the credentials were sitting right there. Load it once at import, from the
+# file next to this script rather than the current working directory, so the
+# commands work from anywhere.
+ENV_FILE = Path(__file__).resolve().parent / ".env"
+load_dotenv(ENV_FILE, override=True)
 
 
 BROKER_MODULES = {
