@@ -17,6 +17,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from queue import Queue
 from threading import Thread
+from urllib.parse import urlsplit
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 import pytz
@@ -854,12 +855,27 @@ async def _close_browser(browser, notify: Optional[NotifyFn] = None) -> None:
 # =============================================================================
 
 async def _is_logged_in_soft(page) -> bool:
+    """Are we authenticated? Decided on the URL PATH, never the query string.
+
+    The sign-in page carries where it will send you next in ?AuthRedUrl=..., and
+    that target IS the summary URL — so testing the whole URL string reports
+    "logged in" while sitting on the login form. Fidelity percent-encodes that
+    parameter only some of the time (%2F), so this passed on one run and
+    false-positived on the next, and the damage showed up far downstream as
+    "Timeout waiting for #previewOrderBtn" on a ticket that was really the login
+    page. Verified against sessions/fidelity/fidelity_nav.log for 2026-08-10.
+    """
     url = (await _current_url(page)).lower()
     if not url:
         return False
-    if "prgw/digital/login" in url or "login/full-page" in url:
+    try:
+        path = urlsplit(url).path
+    except Exception:
+        path = url.split("?", 1)[0]
+    # Any sign-on path is decisive: we are not logged in, whatever it redirects to.
+    if "signin" in path or "login" in path or "signon" in path:
         return False
-    if "ftgw/digital/portfolio/summary" in url:
+    if "ftgw/digital/portfolio/summary" in path:
         return True
     try:
         if await page.select("#accountDetails", timeout=1):
@@ -1092,7 +1108,16 @@ async def _login_on_page(
     if await _is_logged_in_soft(page):
         _trace("LOGIN | already logged-in (soft)", notify=notify)
         await _goto(page, SUMMARY_URL, "LOGIN | land summary", notify=notify, settle_s=0.6)
-        return True
+        # Confirm the landing instead of assuming it. On 2026-08-10 this goto
+        # was bounced straight back to signin/retail, the bounce was written to
+        # the log, and we returned True anyway — so the trade ran unauthenticated
+        # and died 15s later on a selector that was never going to be there.
+        if await _is_logged_in_soft(page):
+            return True
+        _trace("LOGIN | soft session was stale (bounced back to sign-on) — logging in properly",
+               notify=notify)
+        # Land on a clean sign-on form rather than whatever the bounce left us on.
+        await _goto(page, LOGIN_URL, "LOGIN | reopen sign-on", notify=notify, settle_s=1.0)
 
     user_input = None
     for sel in ("#dom-username-input", "input[name='username']", "#userId-input"):
@@ -1633,6 +1658,141 @@ async def _maybe_force_extended_hours(page) -> bool:
     return True
 
 
+# =============================================================================
+# Symbol typeahead
+# =============================================================================
+#
+# Typing a ticker opens a suggestion overlay directly under the symbol field —
+# and on the equity ticket the Action control sits directly under that field, so
+# an open overlay physically covers it. node.mouse_click() clicks a POINT on the
+# screen, not an element, so every click aimed at Action landed on a suggestion
+# instead. For MBAI the list is [MBAI, MBAIX]; the click took MBAIX, a mutual
+# fund, and Fidelity swapped the whole ticket for the fund order form — which
+# shares none of the selectors below, so everything after it failed on something
+# unrelated. The tell in the state dump was options_open=2 while Action still
+# read its 'Action' placeholder: two options with no menu open are suggestions.
+
+# Visible typeahead rows. Two filters keep the ticket's OWN menus out of this:
+# they live inside a dropdownlist wrapper, and their labels are control words,
+# whereas a suggestion always leads with a ticker token.
+_JS_SYMBOL_SUGGESTIONS = (
+    "function __sugg(){"
+    "var sym=document.querySelector('#eq-ticket-dest-symbol');"
+    "if(!sym)return [];"
+    "var ids=((sym.getAttribute('aria-controls')||'')+' '"
+    "+(sym.getAttribute('aria-owns')||'')).trim();"
+    "var opts=[];"
+    "if(ids){ids.split(/\\s+/).forEach(function(i){var b=document.getElementById(i);"
+    "if(b)opts=opts.concat([].slice.call(b.querySelectorAll('[role=\"option\"],li')));});}"
+    "if(!opts.length){opts=[].slice.call(document.querySelectorAll('[role=\"option\"]'))"
+    ".filter(function(o){"
+    "return !o.closest('[id*=\"dropdownlist\"],[class*=\"dropdownlist\"]');});}"
+    "var CTRL=/^(buy|sell|buy to cover|sell short|market|limit|stop.*|trailing.*|"
+    "day|good.*|dividend.*|reinvest.*|cash|margin)$/i;"
+    "return opts.filter(function(o){"
+    "var r=o.getBoundingClientRect();"
+    "if(r.width<=0||r.height<=0)return false;"
+    "var t=(o.innerText||o.textContent||'').replace(/\\s+/g,' ').trim();"
+    "if(!t||CTRL.test(t))return false;"
+    "return /^[A-Z][A-Z.\\-]{0,5}\\b/.test(t);});}"
+)
+
+
+async def _symbol_suggestions(page) -> List[str]:
+    """Text of the visible symbol-typeahead rows; [] when the overlay is closed."""
+    try:
+        out = await page.evaluate(
+            "(function(){" + _JS_SYMBOL_SUGGESTIONS
+            + "return __sugg().map(function(o){"
+            "return (o.innerText||o.textContent||'').replace(/\\s+/g,' ').trim();});})();"
+        )
+        return [str(t) for t in (out or [])]
+    except Exception:
+        return []
+
+
+async def _dismiss_symbol_suggestions(page, timeout_s: float = 3.0) -> bool:
+    """Close the typeahead overlay and confirm it is actually gone.
+
+    False means something is still showing — the caller must not fire coordinate
+    clicks at the ticket while that is true, because they will hit the overlay.
+    """
+    deadline = time.time() + max(0.0, timeout_s)
+    while True:
+        if not await _symbol_suggestions(page):
+            return True
+        if time.time() >= deadline:
+            return False
+        try:
+            await page.evaluate(
+                "(function(){var el=document.querySelector('#eq-ticket-dest-symbol');"
+                "if(!el)return;"
+                "var k={key:'Escape',code:'Escape',keyCode:27,which:27,"
+                "bubbles:true,cancelable:true};"
+                "try{el.dispatchEvent(new KeyboardEvent('keydown',k));"
+                "el.dispatchEvent(new KeyboardEvent('keyup',k));}catch(e){}"
+                "try{el.blur();}catch(e){}"
+                # An outside pointerdown is what actually dismisses the PVD
+                # overlays that ignore Escape. On body, never on a control.
+                "try{var o={bubbles:true,cancelable:true,view:window};"
+                "document.body.dispatchEvent(new MouseEvent('mousedown',o));"
+                "document.body.dispatchEvent(new MouseEvent('mouseup',o));}catch(e){}"
+                "})();"
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+
+
+async def _select_symbol_suggestion(page, want: str) -> bool:
+    """Click the suggestion row whose ticker is exactly `want`.
+
+    ENTER commits whatever the list has HIGHLIGHTED, which is not necessarily the
+    exact match — MBAI's list also carries MBAIX. Picking the row by ticker takes
+    the guess out of it. Returns False when no exact row is showing, so the caller
+    can fall back to ENTER.
+    """
+    try:
+        return bool(await page.evaluate(
+            "(function(){" + _JS_POINTER_CLICK + _JS_SYMBOL_SUGGESTIONS
+            + "var want='" + _js_str(want.upper()) + "';"
+            "var opts=__sugg();"
+            "for(var i=0;i<opts.length;i++){"
+            "var t=(opts[i].innerText||opts[i].textContent||'').trim().toUpperCase();"
+            "var m=t.match(/^[A-Z.\\-]+/);"
+            "if(m&&m[0]===want)return __pc(opts[i]);}"
+            "return false;})();"
+        ))
+    except Exception:
+        return False
+
+
+async def _non_equity_ticket_reason(page, want: str) -> Optional[str]:
+    """Why this is no longer the equity ticket — None when it still is.
+
+    Only POSITIVE evidence of a fund ticket counts. A merely missing selector
+    stays tolerable (Fidelity does rename things between builds); a fund order
+    form does not, because none of the equity selectors exist on it and every
+    later step would fail on something that looks unrelated.
+    """
+    try:
+        reason = await page.evaluate(
+            "(function(){"
+            "var u=(location.href||'').toLowerCase();"
+            "if(u.indexOf('mutual-fund')>=0||u.indexOf('mutualfund')>=0)"
+            "return 'the ticket is now a mutual-fund order form ('+location.href+')';"
+            "var eq=document.querySelector('#eq-ticket-dest-symbol')"
+            "||document.querySelector('.eq-ticket');"
+            "var mf=document.querySelector('[id*=\"mutual-fund\"],[class*=\"mutual-fund\"],"
+            "[id*=\"mf-ticket\"],[class*=\"mf-ticket\"]');"
+            "if(mf&&!eq)return 'the ticket is now a mutual-fund order form';"
+            "return '';})();"
+        )
+    except Exception:
+        return None
+    return (reason or "").strip() or None
+
+
 async def _enter_symbol_and_get_prices(page, symbol: str) -> Dict[str, float]:
     """
     Legacy DOM parsing: last/bid/ask.
@@ -1658,6 +1818,19 @@ async def _enter_symbol_and_get_prices(page, symbol: str) -> Dict[str, float]:
         tok = re.match(r"[A-Za-z.\-]+", (raw or "").strip())
         return tok.group(0).upper() if tok else ""
 
+    async def _symbol_field_present() -> bool:
+        """Does the symbol input exist at all?
+
+        This is what separates "the selector changed on this build" (tolerable,
+        the old behaviour) from "the field is sitting there empty" (the symbol
+        never went in, and nothing downstream will work).
+        """
+        try:
+            return bool(await page.evaluate(
+                "!!document.querySelector('#eq-ticket-dest-symbol')"))
+        except Exception:
+            return False
+
     # Same React re-render staleness as the account dropdown: grab a fresh handle
     # and retry rather than letting a "No node with given id found" kill the trade.
     # CRITICAL: clear before typing. send_keys APPENDS, so a field still holding a
@@ -1665,6 +1838,7 @@ async def _enter_symbol_and_get_prices(page, symbol: str) -> Dict[str, float]:
     # became e.g. 'MVISCSAI' and the ticket resolved some other security — a
     # silent wrong-symbol order. Nothing verified it afterwards.
     _sym_err: Optional[Exception] = None
+    _committed = False
     for _attempt in range(3):
         try:
             symbol_input = await page.select("#eq-ticket-dest-symbol", timeout=10)
@@ -1689,6 +1863,14 @@ async def _enter_symbol_and_get_prices(page, symbol: str) -> Dict[str, float]:
             except Exception:
                 pass
             await symbol_input.send_keys(want)
+            # ENTER commits the typed text. This is the path that has always
+            # worked. Clicking a suggestion row INSTEAD of pressing ENTER looked
+            # tidier and broke it: a synthetic click on that widget does not
+            # commit the ticket, so the quote panel never arrived and every
+            # account failed on "quote panel never appeared after entering
+            # 'MBAI'". Picking a row survives below as a CORRECTION only, where
+            # it cannot cost anything — it runs when ENTER resolved the wrong
+            # security.
             await symbol_input.send_keys(SpecialKeys.ENTER)
             _sym_err = None
         except Exception as e:
@@ -1699,22 +1881,68 @@ async def _enter_symbol_and_get_prices(page, symbol: str) -> Dict[str, float]:
         try:
             await page.wait_for("#ett-more-less-quote-link", timeout=10)
         except Exception:
+            # A fund ticket explains this exactly, and retrying on one is
+            # pointless — the equity quote panel is never coming back.
+            _wrong = await _non_equity_ticket_reason(page, want)
+            if _wrong:
+                raise RuntimeError(
+                    f"{_wrong} — {want!r} was requested. A suggestion for a "
+                    f"different security was selected; refusing to continue")
+            # Record it. This branch used to `continue` with _sym_err already
+            # cleared above, so three silent misses left the function returning
+            # SUCCESS on an empty ticket — and the trade then died a step later
+            # on "Action button reads ''", because Fidelity keeps Action inert
+            # until a symbol resolves. The quote panel not arriving is a symbol
+            # failure, and it has to be reported as one.
+            _sym_err = RuntimeError(
+                f"quote panel never appeared after entering {want!r} · "
+                f"{await _ticket_state(page)}")
             await _settle(page, sleep_s=0.4)
             continue
         await _settle(page, sleep_s=0.5)
 
+        _wrong = await _non_equity_ticket_reason(page, want)
+        if _wrong:
+            raise RuntimeError(
+                f"{_wrong} — {want!r} was requested. A suggestion for a "
+                f"different security was selected; refusing to continue")
+
         got = await _loaded_symbol()
-        if got == want or not got:
-            # '' means the field is unreadable on this build — the old behaviour.
-            # Don't fail the trade over a selector change, but never accept a
-            # ticker we can positively read as different.
+        if got != want and got:
+            # ENTER resolved a DIFFERENT security. For MBAI the typeahead also
+            # carries MBAIX, and whichever row was highlighted is what committed.
+            # Correcting it by clicking the row whose ticker matches exactly is
+            # strictly better than another blind retry — and the result is
+            # re-read rather than trusted, because a click on this widget does
+            # not reliably commit.
+            if await _select_symbol_suggestion(page, want):
+                await _settle(page, sleep_s=0.6)
+                got = await _loaded_symbol()
+
+        # Only now close the overlay: the correction above needs it open, and
+        # everything AFTER this function clicks by coordinates with Action
+        # sitting directly underneath it.
+        await _dismiss_symbol_suggestions(page)
+
+        if got == want:
+            _sym_err = None
+            _committed = True
+            break
+        if not got and not await _symbol_field_present():
+            # Field genuinely absent — the selector changed on this build. Keep
+            # the old tolerance for that. An EMPTY field that exists is a
+            # different thing entirely: the symbol never went in.
+            _sym_err = None
+            _committed = True
             break
         _sym_err = RuntimeError(
-            f"Fidelity ticket loaded '{got}' but '{want}' was requested")
+            f"Fidelity ticket shows {(got or '(empty)')!r} but {want!r} was requested")
         await _settle(page, sleep_s=0.4)
 
     if _sym_err is not None:
         raise _sym_err
+    if not _committed:
+        raise RuntimeError(f"Symbol {want!r} never registered on the ticket")
 
     price_data = await page.evaluate(
         """
@@ -1746,6 +1974,147 @@ async def _enter_symbol_and_get_prices(page, symbol: str) -> Dict[str, float]:
     bid = float(price_data.get("bid", 0.0) or 0.0)
     ask = float(price_data.get("ask", 0.0) or 0.0)
     return {"last": last, "bid": bid, "ask": ask}
+
+
+async def _ticket_state(page) -> str:
+    """What the order ticket actually looks like right now.
+
+    "button reads ''" is not a diagnosis — it cannot tell a missing element from
+    a disabled one from an unlabelled one, and those have completely different
+    causes. Fidelity keeps Action disabled until the symbol registers, so the
+    symbol field's real value belongs in the same snapshot.
+
+    ``options_open`` was in that snapshot but not what it looked like: the 2
+    options in the MBAI failure were the symbol typeahead's rows, not an open
+    Action menu. Both are now named separately, and so is whatever is physically
+    covering the button.
+    """
+    try:
+        return await page.evaluate(
+            """
+            (function(){
+              """ + _JS_SYMBOL_SUGGESTIONS + """
+              var q=function(s){return document.querySelector(s);};
+              var b=q('#dest-dropdownlist-button-action');
+              var sym=q('#eq-ticket-dest-symbol');
+              var dd=[].slice.call(
+                document.querySelectorAll('[id^="dest-dropdownlist-button-"]')
+              ).map(function(e){
+                var t=(e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();
+                return e.id+'='+(t||'(empty)')+(e.disabled?'[disabled]':'');
+              });
+              return JSON.stringify({
+                url: location.href,
+                ready: document.readyState,
+                action_btn: !!b,
+                action_text: b?((b.innerText||b.textContent||'').replace(/\\s+/g,' ').trim()):null,
+                action_aria: b?(b.getAttribute('aria-label')||null):null,
+                action_disabled: b?!!(b.disabled||b.getAttribute('aria-disabled')==='true'):null,
+                action_expanded: b?b.getAttribute('aria-expanded'):null,
+                symbol_field: sym?(sym.value||''):null,
+                preview_btn: !!q('#previewOrderBtn'),
+                options_open: document.querySelectorAll('[role="option"]').length,
+                symbol_suggestions: __sugg().slice(0,6).map(function(o){
+                  return (o.innerText||o.textContent||'').replace(/\\s+/g,' ').trim();
+                }),
+                dropdowns: dd
+              });
+            })();
+            """
+        )
+    except Exception as e:
+        return f"(ticket state unavailable: {type(e).__name__}: {e})"
+
+
+async def _wait_action_ready(page, timeout_s: float = 12.0) -> bool:
+    """Wait for the Action control to exist and be enabled.
+
+    Fidelity renders the ticket before it finishes wiring it, and keeps Action
+    disabled until the symbol registers — so opening the menu too early clicks a
+    dead button, three times, and reports an empty label. Waiting for the control
+    to be real is not a longer timeout; it is the precondition the picker always
+    assumed and never checked.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            ok = await page.evaluate(
+                "(function(){var b=document.querySelector('#dest-dropdownlist-button-action');"
+                "if(!b) return false;"
+                "if(b.disabled||b.getAttribute('aria-disabled')==='true') return false;"
+                "return true;})();")
+            if ok:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+    return False
+
+
+async def _action_button_obstruction(page) -> str:
+    """'' when a click at the Action button's centre would actually hit it.
+
+    Otherwise a description of whatever is on top. This exists because
+    node.mouse_click() targets a POINT, so an overlay covering the button
+    silently eats the trade's clicks — and the overlay parked there is the symbol
+    typeahead, whose rows are other securities.
+    """
+    try:
+        return (await page.evaluate(
+            "(function(){var b=document.querySelector('#dest-dropdownlist-button-action');"
+            "if(!b)return '';"
+            "try{b.scrollIntoView({block:'center'});}catch(e){}"
+            "var r=b.getBoundingClientRect();"
+            "if(r.width<=0||r.height<=0)return 'Action button is not visible';"
+            "var el=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);"
+            "if(!el)return '';"
+            "if(el===b||b.contains(el)||el.contains(b))return '';"
+            # Name the row, not the <span> inside it.
+            "el=el.closest('[role=\"option\"],li,[id]')||el;"
+            "var d=el.id?('#'+el.id):((''+(el.className||'')).trim()"
+            ".split(/\\s+/)[0]||el.tagName);"
+            "var t=(el.innerText||el.textContent||'').replace(/\\s+/g,' ').trim().slice(0,40);"
+            "return 'covered by '+d+(t?(' ('+t+')'):'');})();"
+        ) or "").strip()
+    except Exception:
+        return ""
+
+
+# The Action menu's own option list. The picker used to scan the WHOLE document
+# for [role="option"], which is also what the symbol typeahead renders.
+_JS_ACTION_MENU_SCOPE = (
+    "function __ascope(){"
+    "var b=document.querySelector('#dest-dropdownlist-button-action');"
+    "if(!b)return null;"
+    "var ac=(b.getAttribute('aria-controls')||b.getAttribute('aria-owns')||'').trim();"
+    "if(ac){var s=document.getElementById(ac.split(/\\s+/)[0]);if(s)return s;}"
+    "return b.closest('[class*=\"dropdownlist\"],[id*=\"dropdownlist\"]')||b.parentElement;}"
+)
+
+
+def _js_action_option_finder(label: str) -> str:
+    """JS declaring __aopt(): the Action option reading `label`, or null.
+
+    Scoped to the Action menu, and any row the typeahead is showing is skipped
+    outright — a click meant for Buy must never be able to land on a ticker.
+    """
+    return (
+        _JS_SYMBOL_SUGGESTIONS
+        + _JS_ACTION_MENU_SCOPE
+        + "function __aopt(){var want='" + _js_str(label) + "';"
+        "var sels=['[role=\"option\"]','li[role=\"option\"]',"
+        "'.pvd-menu__list-item','[data-action]'];"
+        "var sg=__sugg();"
+        "var scopes=[__ascope(),document].filter(Boolean);"
+        "for(var s=0;s<scopes.length;s++){for(var i=0;i<sels.length;i++){"
+        "var opts=scopes[s].querySelectorAll(sels[i]);"
+        "for(var j=0;j<opts.length;j++){var o=opts[j];"
+        "if(sg.indexOf(o)>=0)continue;"
+        "var t=(o.innerText||o.textContent||'').trim();"
+        "var da=(o.getAttribute('data-action')||'').trim();"
+        "if(t===want||da===want)return o;}}}"
+        "return null;}"
+    )
 
 
 async def _select_action(page, action_upper: str) -> Tuple[bool, str]:
@@ -1811,6 +2180,12 @@ async def _select_action(page, action_upper: str) -> Tuple[bool, str]:
     if await _action_committed():
         return True, ""
 
+    # The control has to be real before clicking it means anything. Without this
+    # the three attempts below hammer a not-yet-wired button for ~80s and then
+    # report an empty label, which reads as "Fidelity changed the ticket".
+    if not await _wait_action_ready(page):
+        return False, f"control never became ready · {await _ticket_state(page)}"
+
     for _attempt in range(3):
         if await _select_action_once(page, label, action_upper, _action_committed):
             return True, ""
@@ -1820,43 +2195,43 @@ async def _select_action(page, action_upper: str) -> Tuple[bool, str]:
         if await _action_committed(wait_s=1.0):
             return True, ""
 
-    return False, await _action_text()
+    _blocked = await _action_button_obstruction(page)
+    return False, (f"{await _action_text()!r}"
+                   + (f" · {_blocked}" if _blocked else "")
+                   + f" · {await _ticket_state(page)}")
 
 
 async def _select_action_once(page, label: str, action_upper: str, _action_committed) -> bool:
     """One open-menu-and-pick pass. True only if the action verifiably committed."""
     from zendriver.core.keys import SpecialKeys  # type: ignore
 
-    # Open the menu (stale-safe). The raw select+click here was throwing
-    # DOM.resolveNode 'Node with given id does not belong to the document' when the
-    # ticket re-rendered on the just-loaded quote; _stale_safe_click re-grabs a
-    # fresh handle and falls back to a pointer sequence (PVD opens on pointerdown).
-    await _stale_safe_click(page, "#dest-dropdownlist-button-action", settle_s=0.4)
+    # Never fire a coordinate click while something is on top of the button. The
+    # symbol typeahead renders directly over Action, so mouse_click() at Action's
+    # coordinates picked a SUGGESTION instead — MBAIX for MBAI — and loaded a
+    # mutual-fund ticket. Clear the overlay first; if the button is still covered,
+    # drive it handle-free, where the events go to the element and not to a point.
+    blocked = await _action_button_obstruction(page)
+    if blocked:
+        await _dismiss_symbol_suggestions(page)
+        blocked = await _action_button_obstruction(page)
+    if blocked:
+        await _js_pointer_click_selector(page, "#dest-dropdownlist-button-action")
+        await _settle(page, sleep_s=0.4)
+    else:
+        # Stale-safe. The raw select+click here was throwing DOM.resolveNode
+        # 'Node with given id does not belong to the document' when the ticket
+        # re-rendered on the just-loaded quote; _stale_safe_click re-grabs a fresh
+        # handle and falls back to a pointer sequence (PVD opens on pointerdown).
+        await _stale_safe_click(page, "#dest-dropdownlist-button-action", settle_s=0.4)
     dd = await _safe_select(page, "#dest-dropdownlist-button-action", 5)
     await _settle(page, sleep_s=0.4)
     # Wait up to ~3s for options to render, trying broadened selectors.
     target_id = None
     for _ in range(15):
         target_id = await page.evaluate(
-            """
-            (function() {
-                const sels = ['[role="option"]', 'li[role="option"]',
-                              '.pvd-menu__list-item', '[data-action]'];
-                for (const sel of sels) {
-                    const opts = document.querySelectorAll(sel);
-                    for (const opt of opts) {
-                        const t = (opt.innerText || opt.textContent || '').trim();
-                        const da = (opt.getAttribute('data-action') || '').trim();
-                        if (t === '"""
-            + label
-            + """' || da === '"""
-            + label
-            + """') return opt.id || ('__match__:' + sel);
-                    }
-                }
-                return null;
-            })();
-            """
+            "(function(){" + _js_action_option_finder(label)
+            + "var o=__aopt();"
+            "return o?(o.id||'__match__'):null;})();"
         )
         if target_id:
             break
@@ -1878,27 +2253,11 @@ async def _select_action_once(page, label: str, action_upper: str, _action_commi
             # instead of failing the whole trade.
             pass
 
-    # JS-driven click as a robust fallback (no element ID needed).
+    # JS-driven click as a robust fallback (no element ID needed). Handle-free and
+    # scoped, so it cannot reach a typeahead row however the menu re-rendered.
     clicked = await page.evaluate(
-        """
-        (function() {
-            const sels = ['[role="option"]', 'li[role="option"]',
-                          '.pvd-menu__list-item', '[data-action]'];
-            for (const sel of sels) {
-                const opts = document.querySelectorAll(sel);
-                for (const opt of opts) {
-                    const t = (opt.innerText || opt.textContent || '').trim();
-                    const da = (opt.getAttribute('data-action') || '').trim();
-                    if (t === '"""
-        + label
-        + """' || da === '"""
-        + label
-        + """') { opt.click(); return true; }
-                }
-            }
-            return false;
-        })();
-        """
+        "(function(){" + _JS_POINTER_CLICK + _js_action_option_finder(label)
+        + "var o=__aopt();return o?__pc(o):false;})();"
     )
     if clicked:
         await _settle(page, sleep_s=0.3)
@@ -1908,9 +2267,16 @@ async def _select_action_once(page, label: str, action_upper: str, _action_commi
     # Keyboard fallback: Buy is usually first, Sell second. "Usually" is why the
     # verify below is mandatory — a blind arrow count can land on the OPPOSITE
     # action, and this used to return with nobody checking.
+    #
+    # It is only safe while the Action menu is the thing listening. With the
+    # symbol typeahead open the arrows walk ITS list and Enter commits a ticker —
+    # that is the other way MBAI turned into MBAIX. Skip the fallback entirely
+    # rather than gamble on who has focus.
+    if await _symbol_suggestions(page):
+        await _dismiss_symbol_suggestions(page)
     if dd is None:
         dd = await _safe_select(page, "#dest-dropdownlist-button-action", 5)
-    if dd is not None:
+    if dd is not None and not await _symbol_suggestions(page):
         try:
             presses = 1 if action_upper == "BUY" else 2
             for _ in range(presses):
@@ -2650,6 +3016,86 @@ async def _open_trade_drawer_from_current_page(page) -> None:
     await page.select("#eq-ticket-dest-symbol", timeout=12)
 
 
+def _is_hard_error(msg: str) -> bool:
+    """Should this failure stop the rest of this login's accounts, or just this one?
+
+    Hard means Fidelity refusing the order — security not allowed, account
+    restricted — which it will refuse identically on the next account, so bailing
+    early saves minutes of certain failure. A timeout or a ticket that never came
+    up is NOT hard: it is this account at this moment, and counting it toward the
+    breaker is how two slow page loads turn into a whole login's accounts going
+    unbought and reported as "Skipped".
+    """
+    m = (msg or "").lower()
+    if "timeout" in m and "waiting for element" in m:
+        return False
+    if "did not load" in m or "not up" in m:
+        return False
+    if "stale" in m or "node with given id" in m:
+        return False
+    return True
+
+
+def _fid_account_matches(acct: Dict[str, Any], label: str, wanted: set) -> bool:
+    """True when this destination account is one the caller asked to trade.
+
+    Matched on the account number appearing in the requested string, so a label
+    copied straight off a result row ("Fidelity 1 · ROTH IRA (Z12345678)") works
+    as well as a bare account number.
+    """
+    num = str(acct.get("acctNum") or "").strip()
+    for w in wanted:
+        w = str(w).strip()
+        if not w:
+            continue
+        if w == label or (num and w == num):
+            return True
+        # Substring only for a number long enough to be unambiguous — a short
+        # one can appear inside a different account's number and trade the
+        # wrong account, which is the one mistake this must never make.
+        if num and len(num) >= 5 and num in w:
+            return True
+    return False
+
+
+async def _wait_for_trade_ticket(page, *, label: str = "",
+                                 notify: Optional[NotifyFn] = None,
+                                 first_s: float = 20.0,
+                                 retry_s: float = 30.0) -> None:
+    """Wait until order entry is really up, re-navigating once if it isn't.
+
+    `page.get()` returns when the document commits, but order entry is a React
+    app that only mounts #previewOrderBtn after it hydrates — so a single fixed
+    wait is racing Fidelity's boot time, and on a slow morning it loses. The old
+    15s wait then failed the whole account for what was, most of the time, a
+    page that would have been ready a second later.
+
+    A session quietly bounced to login produces the identical symptom — the
+    selector simply isn't there — which is why the failure message has to name
+    the URL we actually landed on. "Selector not found" sent us looking at the
+    ticket code for a problem that was never in it.
+    """
+    await _settle(page, sleep_s=0.4)
+    if await _safe_select(page, "#previewOrderBtn", first_s):
+        return
+
+    url = await _current_url(page)
+    _trace(f"TRADE | {label} | ticket not up after {first_s:.0f}s (url={url}) — reloading",
+           notify=notify)
+    await _goto(page, TRADE_URL, f"TRADE[{label}]", notify=notify, settle_s=1.0)
+    if await _safe_select(page, "#previewOrderBtn", retry_s):
+        return
+
+    url = await _current_url(page)
+    low = (url or "").lower()
+    hint = ""
+    if any(k in low for k in ("login", "signin", "sso", "auth")):
+        hint = " — the session was bounced back to login"
+    raise RuntimeError(
+        f"Fidelity order ticket did not load after two attempts "
+        f"(url: {url or 'unknown'}){hint}")
+
+
 async def _click_enter_new_order_if_present(page) -> bool:
     """
     On confirmation screen, click 'Enter new order' if present so next target starts cleanly.
@@ -2717,19 +3163,49 @@ def bootstrap(*args, **kwargs) -> BrokerOutput:
                     otp_provider=otp_provider,
                     notify=notify,
                 )
-                # Count sub-accounts from any existing positions CSV
-                n_sub = 0
+                # Enumerate the real destination accounts.
+                #
+                # This used to return ONE row per login and count sub-accounts
+                # out of a cached positions CSV, so a login with ten accounts
+                # reported as "1 account(s) connected" whenever that file was
+                # stale or missing — the app counts len(accounts).
+                #
+                # The ticket's own dropdown is the live, authoritative list, and
+                # opening it here also proves the session genuinely works. That
+                # is the check that would have caught the soft-login false
+                # positive at bootstrap instead of at trade time.
+                sub: List[Dict[str, str]] = []
                 if ok:
                     try:
-                        dl_dir = _root_dir() / "sessions" / "fidelity" / f"downloads_{c.idx_1based}"
-                        csvs = sorted(dl_dir.glob("Portfolio_Positions_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-                        if csvs:
-                            sub_accounts = _parse_positions_csv(csvs[0], label_prefix=c.label)
-                            n_sub = len([a for a in sub_accounts if a.ok])
-                    except Exception:
-                        pass
-                msg = f"ok ({n_sub} accounts)" if ok and n_sub > 1 else ("ok" if ok else "auth failed")
-                outs.append(AccountOutput(account_id=c.label, ok=ok, message=msg))
+                        await page.get(TRADE_URL)
+                        await _wait_for_trade_ticket(page, label=c.label, notify=notify)
+                        sub = await _open_account_dropdown_and_scrape(page)
+                        _trace(f"BOOTSTRAP | {c.label} | {len(sub)} destination account(s)",
+                               notify=notify)
+                    except Exception as e:
+                        _trace(f"BOOTSTRAP | {c.label} | account enumeration failed: "
+                               f"{type(e).__name__}: {e}", notify=notify)
+                        sub = []
+
+                if ok and sub:
+                    for a in sub:
+                        outs.append(AccountOutput(
+                            account_id=f"{c.label} · {a.get('name', 'Account')} ({a['acctNum']})",
+                            ok=True, message="Connected"))
+                else:
+                    # Fall back to the cached CSV count, then to a bare row.
+                    n_sub = 0
+                    if ok:
+                        try:
+                            dl_dir = _root_dir() / "sessions" / "fidelity" / f"downloads_{c.idx_1based}"
+                            csvs = sorted(dl_dir.glob("Portfolio_Positions_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+                            if csvs:
+                                sub_accounts = _parse_positions_csv(csvs[0], label_prefix=c.label)
+                                n_sub = len([a for a in sub_accounts if a.ok])
+                        except Exception:
+                            pass
+                    msg = f"ok ({n_sub} accounts)" if ok and n_sub > 1 else ("ok" if ok else "auth failed")
+                    outs.append(AccountOutput(account_id=c.label, ok=ok, message=msg))
                 any_ok = any_ok or ok
                 any_fail = any_fail or (not ok)
             except Exception as e:
@@ -2882,6 +3358,11 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
     if not sym:
         return BrokerOutput(broker=BROKER, state="failed", accounts=[], message="Invalid symbol")
 
+    # Optional: trade only these destination accounts (a retry of the ones that
+    # failed). Empty means every account, which is the normal path.
+    only_accounts = {str(a).strip() for a in (kwargs.get("only_accounts") or [])
+                     if str(a).strip()}
+
     smart_sell = bool(kwargs.get("smart_sell") or False) and side_upper == "SELL"
     forced_order_type = str(kwargs.get("order_type") or "").strip().lower()
     if forced_order_type not in ("", "market", "limit"):
@@ -2914,6 +3395,10 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
         log_lines: List[str] = []
         processed_targets: set[Tuple[str, str]] = set()
         hard_stop = False
+        # Did any login actually hold one of the requested accounts? Without
+        # this a retry naming an account nobody owns returns an empty success-
+        # shaped result, which reads as "nothing to do" instead of "not found".
+        matched_any = not only_accounts
 
         if dry_run:
             log_lines.append("DRY RUN — NO ORDER SUBMITTED")
@@ -2974,7 +3459,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                     _trace(f"TRADE | {c.label} | navigating to trade page", notify=notify)
                     await page.get(TRADE_URL)
                     _trace(f"TRADE | {c.label} | waiting for trade form", notify=notify)
-                    await page.select("#previewOrderBtn", timeout=15)
+                    await _wait_for_trade_ticket(page, label=c.label, notify=notify)
                     await _ensure_expanded_ticket_mode(page, notify=notify)
 
                 # Scrape destination accounts (legacy)
@@ -2987,6 +3472,31 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         log_lines.append("")
                     any_fail = True
                     continue
+
+                # Caller asked for specific accounts (a retry of the ones that
+                # failed). A login holding none of them is skipped silently —
+                # the requested accounts live under one of the other logins.
+                if only_accounts:
+                    if c.label in only_accounts:
+                        # A login-level failure (ticket never loaded, auth) is
+                        # reported as the bare login label because no account was
+                        # ever reached. Asking for it back means the whole login,
+                        # not nothing.
+                        matched_any = True
+                        _trace(f"TRADE | {c.label} | retrying the whole login", notify=notify)
+                    else:
+                        wanted = [a for a in acct_list
+                                  if _fid_account_matches(
+                                      a, f"{c.label} · {a.get('name', 'Account')} ({a['acctNum']})",
+                                      only_accounts)]
+                        if not wanted:
+                            _trace(f"TRADE | {c.label} | none of the requested accounts are here, skipping",
+                                   notify=notify)
+                            continue
+                        matched_any = True
+                        _trace(f"TRADE | {c.label} | limited to {len(wanted)}/{len(acct_list)} account(s)",
+                               notify=notify)
+                        acct_list = wanted
 
                 # Iterate destination accounts
                 _consec_errors = 0  # stop after 2 consecutive errors
@@ -3018,7 +3528,8 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                             await _open_trade_drawer_from_current_page(page)
                         else:
                             await page.get(TRADE_URL)
-                            await page.select("#previewOrderBtn", timeout=15)
+                            await _wait_for_trade_ticket(page, label=acct_label,
+                                                         notify=notify)
                             await _ensure_expanded_ticket_mode(page, notify=notify)
 
                         # ------------------------------
@@ -3107,6 +3618,13 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         last_price = prices["last"]
                         bid_price = prices["bid"]
                         ask_price = prices["ask"]
+                        # Traced unconditionally, not only under dry_run: the
+                        # nav log used to jump from "starting (1/10)" straight to
+                        # a failure 80s later with nothing in between, so there
+                        # was no way to tell which step actually went wrong.
+                        _trace(f"TRADE | {acct_label} | symbol {sym} "
+                               f"last={last_price} bid={bid_price} ask={ask_price}",
+                               notify=notify)
 
                         # Choose reference price like legacy
                         ref_price = 0.0
@@ -3122,10 +3640,12 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         if dry_run:
                             log_lines.append(f"[{acct_label}] step=select_action side={side_upper}")
                         _act_ok, _act_seen = await _select_action(page, side_upper)
+                        _trace(f"TRADE | {acct_label} | action {side_upper} "
+                               f"{'set' if _act_ok else 'FAILED'}", notify=notify)
                         if not _act_ok:
                             raise RuntimeError(
-                                f"Could not set Action to {side_upper} — button reads "
-                                f"{_act_seen!r} — refusing to continue"
+                                f"Could not set Action to {side_upper} — "
+                                f"{_act_seen} — refusing to continue"
                             )
 
                         qty_order = str(qty_int)
@@ -3300,6 +3820,14 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         if order_type == "Limit":
                             if limit_price is None:
                                 limit_price = ref_price if ref_price > 0 else last_price
+                            if not limit_price or float(limit_price) <= 0:
+                                # Every price on the ticket read zero, so the
+                                # ticket never resolved a security. A $0.00 limit
+                                # is never a real order — refuse rather than send
+                                # one and find out what Fidelity does with it.
+                                raise RuntimeError(
+                                    f"Refusing a Limit order for {sym} with no quote "
+                                    f"(last={last_price} bid={bid_price} ask={ask_price})")
                             limit_price_str = _quantize_limit_price(
                                 float(limit_price), side=side_upper
                             )
@@ -3362,8 +3890,10 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                             if dry_run:
                                 log_lines.append(f"[{acct_label}] ERROR: preview failed: {err_txt}")
                                 log_lines.append("")
-                            _consec_errors += 1
-                            # Stop after 2 consecutive errors (e.g. security not allowed)
+                            # Stop after 2 consecutive REFUSALS (e.g. security not
+                            # allowed). A transient failure breaks the chain
+                            # instead of extending it — see _is_hard_error.
+                            _consec_errors = _consec_errors + 1 if _is_hard_error(err_txt) else 0
                             if _consec_errors >= 2:
                                 _trace(f"TRADE | {c.label} | 2 consecutive errors, skipping remaining accounts", notify=notify)
                                 for remaining_acct in acct_list[_acct_i + 1:]:
@@ -3468,7 +3998,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         if "auth" in err_str or "login" in err_str or "browser" in err_str:
                             hard_stop = True
                             break
-                        _consec_errors += 1
+                        _consec_errors = _consec_errors + 1 if _is_hard_error(str(e)) else 0
                         if _consec_errors >= 2:
                             _trace(f"TRADE | {c.label} | 2 consecutive errors, skipping remaining accounts", notify=notify)
                             for remaining_acct in acct_list[_acct_i + 1:]:
@@ -3493,6 +4023,12 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
             state = "partial" if any_ok else "failed"
         else:
             state = "success" if any_ok and not any_fail else ("partial" if any_ok and any_fail else "failed")
+
+        if only_accounts and not matched_any:
+            outs.append(AccountOutput(
+                account_id="Fidelity", ok=False,
+                message=f"None of the requested accounts were found: {sorted(only_accounts)}"))
+            state = "failed"
 
         if smart_sell and (not any_ok) and (not any_fail) and not outs:
             outs.append(AccountOutput(account_id="Fidelity", ok=False, message=f"Smart Sell: no matching destination accounts for {sym}"))
