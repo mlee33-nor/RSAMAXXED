@@ -899,6 +899,9 @@ def _build_ctx(kwargs: Dict[str, Any]) -> Dict[str, Any]:
         "qty": qty,
         "symbol": symbol,
         "dry_run": dry_run,
+        # Optional: trade only these accounts (a retry of the ones that failed).
+        # Empty/absent means every account, which is the normal path.
+        "only_accounts": list(kwargs.get("only_accounts") or []),
 
         "_write_dry_run_log": _write_dry_run_log,
 
@@ -957,11 +960,42 @@ async def _cmd_login(ctx) -> BrokerOutput:
             except Exception:
                 pass
 
+        if not ok:
+            return BrokerOutput(
+                broker=BROKER,
+                state="failed",
+                accounts=[AccountOutput(account_id="Wells Fargo", ok=False, message="Login failed")],
+                message="Login failed",
+            )
+
+        # Enumerate the real accounts. Bootstrap used to return one placeholder
+        # row ("Wells Fargo"), and the app counts len(accounts) — so ten
+        # WellsTrade accounts reported as "1 account(s) connected". The overview
+        # page is already open behind us and positions parses it from there, so
+        # this is the same read, not a second trip.
+        accounts: List[AccountOutput] = []
+        try:
+            accts = await ctx["_fetch_initial_account_data"](page, notify=notify)
+        except Exception as e:
+            _trace(f"LOGIN | account enumeration failed: {type(e).__name__}: {e}", notify=notify)
+            accts = []
+        for a in accts:
+            label = a.get("account_id") or "Wells Fargo"
+            bal = a.get("balance")
+            accounts.append(AccountOutput(
+                account_id=label, ok=True,
+                message="Connected" if bal is None else f"Connected · ${bal:,.2f}"))
+        if not accounts:
+            # Logged in but the overview didn't parse. Say that, rather than
+            # reporting a confident "1 account".
+            accounts = [AccountOutput(account_id="Wells Fargo", ok=True,
+                                      message="Login ok — account list unavailable")]
+
         return BrokerOutput(
             broker=BROKER,
-            state="success" if ok else "failed",
-            accounts=[AccountOutput(account_id="Wells Fargo", ok=ok, message="Login ok" if ok else "Login failed")],
-            message="Login ok" if ok else "Login failed",
+            state="success",
+            accounts=accounts,
+            message=f"Login ok — {len(accts)} account(s)" if accts else "Login ok",
         )
 
     except Exception as e:
@@ -1316,6 +1350,170 @@ async def _get_account_mask(page) -> str:
     return full_text
 
 
+async def _capture_page_state(page, symbol: str = "") -> str:
+    """What the page actually was at the moment something timed out.
+
+    The trade path used to record nothing at all — the nav log jumps straight
+    from "POSITIONS | rows=11" to "2 consecutive errors", so a failure could not
+    be told apart from any other. A bare "selector not found" names the one thing
+    we know isn't there and nothing about what is, which is why #prevdata
+    timeouts were unexplainable after the fact.
+    """
+    try:
+        state = await page.evaluate(
+            "(function(){var d=document;"
+            "var sym=d.querySelector('#Symbol');"
+            "var err=d.querySelector('.alert-msg-summary');"
+            "return JSON.stringify({"
+            "url:location.href,ready:d.readyState,"
+            "form:!!d.querySelector('#eqentryfrm'),"
+            "symbol:sym?sym.value:null,"
+            "prevdata:!!d.querySelector('#prevdata'),"
+            "last:!!d.querySelector('#last'),"
+            "err:err?(err.innerText||'').slice(0,180):null});})();")
+        return f"{state} wanted={symbol}"
+    except Exception as e:
+        return f"(page state unavailable: {type(e).__name__}: {e})"
+
+
+async def _quote_ready(page, symbol: str) -> bool:
+    """Is the ticket already showing a quote for `symbol`?
+
+    True only when the symbol field really holds this symbol AND the quote block
+    is rendered — so a leftover quote for the previous account's symbol can never
+    be mistaken for this one's.
+    """
+    want = re.sub(r"[^A-Za-z0-9.\-]", "", symbol or "").upper()
+    if not want:
+        return False
+    try:
+        return bool(await page.evaluate(
+            "(function(){var e=document.querySelector('#Symbol');"
+            "if(!e||!e.value) return false;"
+            f"if(e.value.trim().toUpperCase()!=='{want}') return false;"
+            "return !!document.querySelector('#prevdata');})();"))
+    except Exception:
+        return False
+
+
+async def _commit_symbol(page, symbol: str) -> bool:
+    """Put `symbol` in #Symbol and make the field actually commit it.
+
+    WF fires its quote lookup on the symbol field's change/blur, not on
+    keystrokes. Sending TAB usually blurs it, but when the send races the page
+    the value never registers and no lookup is ever requested — which is
+    indistinguishable, from the outside, from a slow quote. So set the value and
+    dispatch change+blur explicitly, then read the field back.
+    """
+    sym_in = await page.select("#Symbol", timeout=10)
+    await sym_in.scroll_into_view()
+    try:
+        await sym_in.clear_input()
+    except Exception:
+        pass
+    await sym_in.send_keys(symbol)
+    if SpecialKeys is not None:
+        await sym_in.send_keys(SpecialKeys.TAB)
+    else:
+        await sym_in.send_keys("\t")
+    try:
+        got = await page.evaluate(
+            "(function(){var e=document.querySelector('#Symbol');"
+            "if(!e) return '';"
+            "if(e.value) {e.dispatchEvent(new Event('change',{bubbles:true}));"
+            "e.dispatchEvent(new Event('blur',{bubbles:true}));}"
+            "return e.value||'';})();")
+    except Exception:
+        return True  # can't verify — let the #prevdata wait be the judge
+    return str(got or "").strip().upper() == symbol.upper()
+
+
+async def _wait_for_quote(page, symbol: str, acct_label: str,
+                          notify: Optional[NotifyFn] = None) -> None:
+    """Get a quote for `symbol` on the ticket, without racing WF's blur handler.
+
+    #prevdata is the block WF renders when the quote comes back, and the lookup
+    is triggered by the symbol field blurring — not by keystrokes. One blur plus
+    one fixed 10s wait was the whole strategy, so a blur that never fired and a
+    quote WF was slow to return both cost the account permanently, and looked
+    identical afterwards.
+
+    The ticket is now opened as equity.do?...&symbol=SYM, so Wells Fargo renders
+    the quote server-side and there is no client-side lookup to race. Typing
+    stays as the fallback for when that parameter doesn't take.
+    """
+    if await _quote_ready(page, symbol):
+        return
+
+    _trace(f"TRADE | Wells Fargo | {acct_label}: ticket did not preload {symbol}, typing it",
+           notify=notify)
+    committed = await _commit_symbol(page, symbol)
+    if not committed:
+        _trace(f"TRADE | Wells Fargo | {acct_label}: symbol field did not take {symbol}",
+               notify=notify)
+    try:
+        await page.select("#prevdata", timeout=12)
+        return
+    except Exception:
+        pass
+    # Record what the page was BEFORE the retry mutates it — this is the
+    # evidence that says which of the two causes it was: a blur that never fired
+    # (symbol field empty / committed False) or a quote WF simply didn't return
+    # in time (field holds the symbol, no #prevdata).
+    _trace(f"TRADE | Wells Fargo | {acct_label}: no quote after 12s "
+           f"(committed={committed}) state={await _capture_page_state(page, symbol)}",
+           notify=notify)
+    await _commit_symbol(page, symbol)
+    await page.sleep(1.0)
+    try:
+        await page.select("#prevdata", timeout=25)
+    except Exception:
+        _trace(f"TRADE | Wells Fargo | {acct_label}: still no quote after retry "
+               f"state={await _capture_page_state(page, symbol)}", notify=notify)
+        raise
+    _trace(f"TRADE | Wells Fargo | {acct_label}: quote arrived on retry", notify=notify)
+
+
+def _is_hard_error(msg: str) -> bool:
+    """Should this failure stop the whole account list, or just this account?
+
+    Hard means Wells Fargo refusing the order itself — security not allowed,
+    account restricted — which it will refuse identically on the other nine
+    accounts, so bailing early saves ten minutes of certain failure. A timeout
+    waiting for an element is NOT hard: it is this account at this moment, and
+    counting it toward the breaker is how two slow quotes turned into five
+    unbought accounts.
+    """
+    m = (msg or "").lower()
+    if "timeout" in m and "waiting for element" in m:
+        return False
+    if "quote loaded but last price" in m:
+        return False
+    if "did not load" in m:
+        # Our own fallback text when even the error banner was missing. That is
+        # a page that never arrived, not Wells Fargo stating a reason.
+        return False
+    return True
+
+
+def _account_matches(acct: Dict[str, Any], wanted: set) -> bool:
+    """True when this account is one the caller asked to trade.
+
+    Matched on the last-4 mask found anywhere in the requested string, so a
+    label copied straight off a result row ("WELLSTRADE (****4852)") works as
+    well as a bare "4852".
+    """
+    mask = str(acct.get("mask") or "").strip()
+    label = str(acct.get("account_id") or "").strip()
+    for w in wanted:
+        w = str(w).strip()
+        if not w:
+            continue
+        if w == label or (mask and mask in w) or (mask and w == mask):
+            return True
+    return False
+
+
 async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
     notify = ctx.get("notify")
     otp_provider = ctx.get("otp_provider")
@@ -1406,6 +1604,21 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                 message="No accounts found",
             )
 
+        # Caller asked for specific accounts (a retry of the ones that failed).
+        only = {str(a) for a in (ctx.get("only_accounts") or []) if str(a).strip()}
+        if only:
+            wanted = [a for a in accts if _account_matches(a, only)]
+            if not wanted:
+                return BrokerOutput(
+                    broker=BROKER,
+                    state="failed",
+                    accounts=[AccountOutput(account_id="Wells Fargo", ok=False,
+                                            message=f"None of the requested accounts were found: {sorted(only)}")],
+                    message="Requested accounts not found",
+                )
+            _trace(f"TRADE | Wells Fargo | limited to {len(wanted)}/{len(accts)} account(s)", notify=notify)
+            accts = wanted
+
         outputs: List[AccountOutput] = []
         _consec_hard_errors = 0  # stop after 2 consecutive hard errors (e.g. security not allowed)
 
@@ -1418,8 +1631,21 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
             x_param = acct.get("x_param") or ""
             acct_label = acct.get("account_id") or "Wells Fargo"
 
+            _trace(f"TRADE | Wells Fargo | {acct_label} | starting "
+                   f"({_acct_i + 1}/{len(accts)}) {action} {qty_int} {symbol}",
+                   notify=notify)
+
             try:
-                trade_url = f"https://wfawellstrade.wellsfargo.com/BW/equity.do?account={idx}&symbol=&selectedAction="
+                # Deep-link the symbol. WF's own ticket URL carries a `symbol`
+                # parameter and we were sending it empty, then typing the symbol
+                # in and waiting on the blur-triggered quote AJAX — the race that
+                # loses accounts to '#prevdata' timeouts. Filled in, the server
+                # renders the quote with the page. selectedAction stays empty on
+                # purpose: Buy/Sell is still set explicitly through the dropdown
+                # below, so a parameter we are inferring can never flip a side.
+                safe_symbol = re.sub(r"[^A-Za-z0-9.\-]", "", symbol).upper()
+                trade_url = (f"https://wfawellstrade.wellsfargo.com/BW/equity.do?"
+                             f"account={idx}&symbol={safe_symbol}&selectedAction=")
                 if x_param:
                     trade_url = f"{trade_url}&{x_param}"
 
@@ -1427,10 +1653,19 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                 await page.wait_for_ready_state("complete")
                 await page.wait()
 
-                try:
-                    await page.select("#eqentryfrm", timeout=10)
-                except Exception:
-                    pass
+                # The order form is the gate for everything below. Swallowing a
+                # miss here is what turned "the ticket never loaded" into a
+                # baffling #prevdata timeout ten seconds later, so reload once
+                # and then say plainly where we actually are.
+                if not await _safe_select(page, "#eqentryfrm", 12):
+                    _trace(f"TRADE | Wells Fargo | {acct_label}: order form missing, reloading",
+                           notify=notify)
+                    await _goto(page, trade_url, f"TRADE[{acct_label}]",
+                                notify=notify, settle_s=1.5)
+                    if not await _safe_select(page, "#eqentryfrm", 20):
+                        u = await _current_url(page)
+                        raise RuntimeError(
+                            f"Order form did not load for this account (url: {u or 'unknown'})")
 
                 mask = await _get_account_mask(page)
                 if mask and mask not in acct_label:
@@ -1438,19 +1673,7 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
 
                 await _select_dropdown_option(page, "#BuySellBtn", action)
 
-                sym_in = await page.select("#Symbol", timeout=10)
-                await sym_in.scroll_into_view()
-                try:
-                    await sym_in.clear_input()
-                except Exception:
-                    pass
-                await sym_in.send_keys(symbol)
-                if SpecialKeys is not None:
-                    await sym_in.send_keys(SpecialKeys.TAB)
-                else:
-                    await sym_in.send_keys("\t")
-
-                await page.select("#prevdata", timeout=10)
+                await _wait_for_quote(page, symbol, acct_label, notify=notify)
 
                 if action == "Sell":
                     try:
@@ -1530,7 +1753,9 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                     except Exception:
                         pass
                     outputs.append(AccountOutput(account_id=acct_label, ok=False, message=f"Wells Fargo HARD Error for {symbol}: {err_txt}"))
-                    _consec_hard_errors += 1
+                    # A soft failure breaks the chain — the counter is
+                    # "consecutive refusals", not "failures so far".
+                    _consec_hard_errors = _consec_hard_errors + 1 if _is_hard_error(err_txt) else 0
                     if _consec_hard_errors >= 2:
                         _trace(f"TRADE | Wells Fargo | 2 consecutive errors, skipping remaining accounts", notify=notify)
                         for remaining in accts[_acct_i + 1:]:
@@ -1576,11 +1801,16 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                 if warn_txt:
                     msg += f" | Warning: {warn_txt}"
                 outputs.append(AccountOutput(account_id=acct_label, ok=True, message=msg))
+                _trace(f"TRADE | Wells Fargo | {acct_label} | {msg}", notify=notify)
                 _consec_hard_errors = 0
 
             except Exception as e:
                 outputs.append(AccountOutput(account_id=acct_label, ok=False, message=str(e)))
-                _consec_hard_errors += 1
+                _trace(f"TRADE | Wells Fargo | {acct_label} | FAILED: {e} "
+                       f"state={await _capture_page_state(page, symbol)}", notify=notify)
+                # Only a refusal counts toward the breaker. A page timeout is
+                # this account's bad luck, not a verdict on the next one.
+                _consec_hard_errors = _consec_hard_errors + 1 if _is_hard_error(str(e)) else 0
                 if _consec_hard_errors >= 2:
                     _trace(f"TRADE | Wells Fargo | 2 consecutive errors, skipping remaining accounts", notify=notify)
                     for remaining in accts[_acct_i + 1:]:
