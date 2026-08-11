@@ -369,10 +369,18 @@ def _market_status() -> tuple:
 
 
 # Mirror trading checks the pick feed on a fixed intraday schedule rather than
-# polling every minute. RSA alerts land a handful of times a day, so three
-# passes inside the session catch everything while keeping the activity log
-# readable and the feed request count trivial.
-MIRROR_CHECK_TIMES_ET: List[Tuple[int, int]] = [(9, 45), (12, 30), (15, 30)]
+# polling every minute. Hourly through the session: an alert that lands just
+# after a check waits an hour to be bought instead of most of the day, and the
+# feed request count is still trivial.
+#
+# :45 rather than on the hour — the first slot deliberately sits 15 minutes
+# after the open, past the opening auction, and the last sits 15 minutes before
+# the close so a fill still has room. An import triggers its own immediate
+# check (_mirror_after_import), so this schedule is the floor, not the only
+# path to a buy.
+MIRROR_CHECK_TIMES_ET: List[Tuple[int, int]] = [
+    (9, 45), (10, 45), (11, 45), (12, 45), (13, 45), (14, 45), (15, 45),
+]
 MIRROR_HEARTBEAT_MS = 300_000  # 5 min wall-clock re-check — NOT a feed poll
 
 # Pick notes mirror will act on. Everything else (conditional, OTC) is a
@@ -409,7 +417,27 @@ def _mirror_due_slot(now: datetime) -> Optional[str]:
 
 
 def _mirror_schedule_label() -> str:
-    return ", ".join(f"{hh:02d}:{mm:02d}" for hh, mm in MIRROR_CHECK_TIMES_ET) + " ET"
+    """The schedule in words, for the Mirror page and the activity log.
+
+    Listing seven slots reads as noise, so an evenly spaced run collapses to
+    "hourly, 09:45-15:45 ET". Anything irregular still lists every time, which
+    is what makes an odd schedule obvious rather than hidden behind a summary.
+    """
+    times = list(MIRROR_CHECK_TIMES_ET)
+    if len(times) >= 3:
+        mins = [hh * 60 + mm for hh, mm in times]
+        gaps = {b - a for a, b in zip(mins, mins[1:])}
+        if len(gaps) == 1:
+            gap = gaps.pop()
+            if gap == 60:
+                every = "hourly"
+            elif gap % 60 == 0:
+                every = f"every {gap // 60}h"
+            else:
+                every = f"every {gap}m"
+            return (f"{every}, {times[0][0]:02d}:{times[0][1]:02d}"
+                    f"-{times[-1][0]:02d}:{times[-1][1]:02d} ET")
+    return ", ".join(f"{hh:02d}:{mm:02d}" for hh, mm in times) + " ET"
 
 
 def _mirror_skip_reason(note: str) -> str:
@@ -8401,11 +8429,11 @@ class App(ctk.CTk):
     def _mirror_after_import(self, added: List[Dict[str, str]]) -> None:
         """Check the feed as soon as an import lands a new Reg Alert.
 
-        The schedule is three fixed slots, so a pick imported at 10:15 — or by
-        the launch pull — otherwise sat unbought until 12:30. This only fires
-        inside a window the schedule would itself act in: _mirror_due_slot is
-        None at night, at weekends and after 16:00 ET, so an evening import can
-        never place an order.
+        The schedule runs on fixed slots, so a pick imported at 10:15 — or by
+        the launch pull — otherwise sits unbought until the next one. This only
+        fires inside a window the schedule would itself act in: _mirror_due_slot
+        is None at night, at weekends and after 16:00 ET, so an evening import
+        can never place an order.
         """
         if not getattr(self, "_mirror_enabled", None) or not self._mirror_enabled.get():
             return
