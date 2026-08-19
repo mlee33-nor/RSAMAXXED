@@ -1414,6 +1414,10 @@ class App(ctk.CTk):
         self._build_shell()
         self._build_notification_bar()
         self._build_frames()
+        # First paint of the two "N brokers linked" readouts. They are built
+        # empty because the same call refreshes them later, when a broker is
+        # linked from the Brokers page.
+        self._render_linked_count()
         self._install_input_hook()
         self._install_shortcuts()
         self._show_frame("dashboard")
@@ -1501,11 +1505,12 @@ class App(ctk.CTk):
         left = tk.Frame(bar, bg=BG_SECONDARY)
         left.pack(side="left", fill="y", padx=(16, 0))
         StatusDot(left, color=GREEN, size=6).pack(side="left", padx=(0, 6), pady=6)
-        n_conn = sum(1 for b in BROKER_MODULES if _broker_has_creds(b))
-        tk.Label(left, text=f"OPERATIONAL   ·   {n_conn} BROKER"
-                            f"{'S' if n_conn != 1 else ''} LINKED",
-                 bg=BG_SECONDARY, fg=TEXT_MUTED,
-                 font=(FONT_FAMILY, 7, "bold")).pack(side="left")
+        # Held on self: this counts what .env had at startup, and brokers get
+        # linked later. Without a handle it could never be corrected.
+        self._statusbar_conn_lbl = tk.Label(
+            left, bg=BG_SECONDARY, fg=TEXT_MUTED,
+            font=(FONT_FAMILY, 7, "bold"))
+        self._statusbar_conn_lbl.pack(side="left")
 
         right = tk.Frame(bar, bg=BG_SECONDARY)
         right.pack(side="right", fill="y", padx=(0, 16))
@@ -1937,10 +1942,8 @@ class App(ctk.CTk):
         foot.pack(fill="x", padx=18, pady=(0, 16))
         self._sidebar_conn_dot = StatusDot(foot, color=GREEN, size=7)
         self._sidebar_conn_dot.pack(side="left", padx=(0, 7))
-        n_conn = sum(1 for b in BROKER_MODULES if _broker_has_creds(b))
         self._sidebar_conn_lbl = tk.Label(
-            foot, text=f"{n_conn} broker{'s' if n_conn != 1 else ''} linked",
-            bg=SIDEBAR_BG, fg=TEXT_SECONDARY, font=(FONT_FAMILY, 8))
+            foot, bg=SIDEBAR_BG, fg=TEXT_SECONDARY, font=(FONT_FAMILY, 8))
         self._sidebar_conn_lbl.pack(side="left")
         tk.Label(foot, text="v2.2", bg=SIDEBAR_BG, fg=TEXT_MUTED,
                  font=(FONT_MONO, 8)).pack(side="right")
@@ -6189,26 +6192,14 @@ class App(ctk.CTk):
 
         chips_wrap = tk.Frame(broker_frame, bg=BG_CARD)
         chips_wrap.pack(side="left")
-
-        # only show brokers that have credentials
-        linked_brokers = sorted([b for b in BROKER_MODULES if _broker_has_creds(b)])
-
-        chip_row_frame = tk.Frame(chips_wrap, bg=BG_CARD)
-        chip_row_frame.pack(anchor="w")
-        chips_per_row = 5
-
-        for idx, broker in enumerate(linked_brokers):
-            if idx > 0 and idx % chips_per_row == 0:
-                chip_row_frame = tk.Frame(chips_wrap, bg=BG_CARD)
-                chip_row_frame.pack(anchor="w", pady=(6, 0))
-            chip = self._make_chip(chip_row_frame, broker.capitalize(),
-                                   lambda b=broker: self._toggle_broker_chip(b))
-            chip.pack(side="left", padx=(0, 6), pady=2)
-            self._trade_broker_chips[broker] = {"label": chip, "selected": False}
+        self._trade_chips_wrap = chips_wrap
 
         def toggle_all():
-            all_selected = len(self._trade_selected_brokers) == len(linked_brokers)
-            for b in linked_brokers:
+            linked = list(self._linked_brokers)
+            if not linked:
+                return
+            all_selected = len(self._trade_selected_brokers) == len(linked)
+            for b in linked:
                 sel = not all_selected
                 self._trade_broker_chips[b]["selected"] = sel
                 self._style_chip(self._trade_broker_chips[b]["label"], sel)
@@ -6221,7 +6212,7 @@ class App(ctk.CTk):
 
         select_all_chip.configure(command=toggle_all)
         self._select_all_chip = select_all_chip
-        self._linked_brokers = linked_brokers
+        self._render_trade_broker_chips()
 
         # side — segmented BUY / SELL
         row += 1
@@ -6346,6 +6337,67 @@ class App(ctk.CTk):
         ops = f"{n_ops} orders running" if n_ops > 1 else "order running"
         lbl.configure(text=f"{ops} · {names} busy — any other broker is free")
 
+    def _render_trade_broker_chips(self) -> None:
+        """(Re)build the desk's broker chips from whatever is in .env now.
+
+        Called at build time and again whenever credentials are saved. It used
+        to run once at startup, which meant a copy launched before any broker
+        was linked showed an empty BROKERS row for the rest of the session:
+        saving credentials on the Brokers page updated that page and nothing
+        else, so the desk stayed unusable until the app was restarted, with
+        nothing on screen saying so.
+        """
+        wrap = getattr(self, "_trade_chips_wrap", None)
+        if wrap is None:
+            return
+        for child in wrap.winfo_children():
+            child.destroy()
+        self._trade_broker_chips = {}
+
+        linked = sorted(b for b in BROKER_MODULES if _broker_has_creds(b))
+        self._linked_brokers = linked
+        # A broker that lost its credentials must not stay armed for an order.
+        self._trade_selected_brokers &= set(linked)
+
+        if not linked:
+            self._broker_empty_hint(wrap, "No brokers linked yet.")
+            self._style_chip(self._select_all_chip, False)
+            return
+
+        chip_row_frame = tk.Frame(wrap, bg=BG_CARD)
+        chip_row_frame.pack(anchor="w")
+        chips_per_row = 5
+
+        for idx, broker in enumerate(linked):
+            if idx > 0 and idx % chips_per_row == 0:
+                chip_row_frame = tk.Frame(wrap, bg=BG_CARD)
+                chip_row_frame.pack(anchor="w", pady=(6, 0))
+            selected = broker in self._trade_selected_brokers
+            chip = self._make_chip(chip_row_frame, broker.capitalize(),
+                                   lambda b=broker: self._toggle_broker_chip(b),
+                                   selected=selected)
+            chip.pack(side="left", padx=(0, 6), pady=2)
+            self._trade_broker_chips[broker] = {"label": chip, "selected": selected}
+
+        self._style_chip(self._select_all_chip,
+                         len(self._trade_selected_brokers) == len(linked))
+
+    def _broker_empty_hint(self, parent, text: str) -> None:
+        """Say why a broker row is empty, and offer the way out of it.
+
+        An empty row reads as a broken page. The credentials live on the
+        Brokers page, so the hint carries a button that goes there rather than
+        leaving the reader to find it.
+        """
+        box = tk.Frame(parent, bg=BG_CARD)
+        box.pack(anchor="w")
+        tk.Label(box, text=text, bg=BG_CARD, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 9)).pack(side="left", padx=(0, 10), pady=2)
+        PillButton(box, text="Link a broker", bg_color=BG_CARD_ALT,
+                   hover_color=ACCENT,
+                   command=lambda: self._show_frame("accounts"),
+                   width=120, height=28, font_size=9).pack(side="left", pady=2)
+
     def _toggle_broker_chip(self, broker: str) -> None:
         chip = self._trade_broker_chips[broker]
         chip["selected"] = not chip["selected"]
@@ -6355,7 +6407,8 @@ class App(ctk.CTk):
         else:
             self._trade_selected_brokers.discard(broker)
         self._style_chip(self._select_all_chip,
-                         len(self._trade_selected_brokers) == len(self._linked_brokers))
+                         bool(self._linked_brokers)
+                         and len(self._trade_selected_brokers) == len(self._linked_brokers))
         self._update_trade_estimate()
 
     def _update_trade_estimate(self, *_args) -> None:
@@ -9019,22 +9072,8 @@ class App(ctk.CTk):
         self._mirror_broker_chips: Dict[str, Dict[str, Any]] = {}
         mirror_chips_frame = tk.Frame(broker_section, bg=BG_CARD)
         mirror_chips_frame.pack(anchor="w")
-
-        linked_brokers = sorted([b for b in BROKER_MODULES if _broker_has_creds(b)])
-        chip_row = tk.Frame(mirror_chips_frame, bg=BG_CARD)
-        chip_row.pack(anchor="w")
-
-        for idx, broker in enumerate(linked_brokers):
-            if idx > 0 and idx % 5 == 0:
-                chip_row = tk.Frame(mirror_chips_frame, bg=BG_CARD)
-                chip_row.pack(anchor="w", pady=(2, 0))
-
-            is_selected = broker in self._mirror_selected_brokers
-            chip = self._make_chip(chip_row, broker.capitalize(),
-                                   lambda b=broker: self._toggle_mirror_broker(b),
-                                   selected=is_selected)
-            chip.pack(side="left", padx=(0, 6), pady=2)
-            self._mirror_broker_chips[broker] = {"label": chip, "selected": is_selected}
+        self._mirror_chips_frame = mirror_chips_frame
+        self._render_mirror_broker_chips()
 
         # Activity log for mirror trading
         activity_section = tk.Frame(mirror_card.inner, bg=BG_CARD)
@@ -9255,6 +9294,49 @@ class App(ctk.CTk):
     def _cloud_push_async(self, force: bool = False) -> None:
         threading.Thread(target=self._cloud_push, kwargs={"force": force},
                          daemon=True).start()
+
+    def _render_mirror_broker_chips(self) -> None:
+        """(Re)build the mirror broker chips from whatever is in .env now.
+
+        Same fix as the desk's: this ran once at startup, so a copy launched
+        before any broker was linked showed no chips at all, and adding
+        credentials afterwards changed nothing until a restart. With no chip to
+        click there was no way to select a broker, and Enable Mirror Trading
+        answered "Select at least one broker for mirror trading first" -- an
+        instruction the page gave no means of following. That is the state the
+        second machine was stuck in.
+        """
+        frame = getattr(self, "_mirror_chips_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        self._mirror_broker_chips = {}
+
+        linked = sorted(b for b in BROKER_MODULES if _broker_has_creds(b))
+        # Mirror places real orders unattended, so a broker whose credentials
+        # are gone is dropped rather than left armed. In memory only: if .env
+        # ever fails to load, every broker looks unlinked for a moment, and
+        # writing that through would erase the saved selection for good.
+        self._mirror_selected_brokers &= set(linked)
+
+        if not linked:
+            self._broker_empty_hint(
+                frame, "No brokers linked yet — mirror has nothing to buy on.")
+            return
+
+        chip_row = tk.Frame(frame, bg=BG_CARD)
+        chip_row.pack(anchor="w")
+        for idx, broker in enumerate(linked):
+            if idx > 0 and idx % 5 == 0:
+                chip_row = tk.Frame(frame, bg=BG_CARD)
+                chip_row.pack(anchor="w", pady=(2, 0))
+            is_selected = broker in self._mirror_selected_brokers
+            chip = self._make_chip(chip_row, broker.capitalize(),
+                                   lambda b=broker: self._toggle_mirror_broker(b),
+                                   selected=is_selected)
+            chip.pack(side="left", padx=(0, 6), pady=2)
+            self._mirror_broker_chips[broker] = {"label": chip, "selected": is_selected}
 
     def _toggle_mirror_broker(self, broker: str) -> None:
         chip = self._mirror_broker_chips[broker]
@@ -11802,6 +11884,34 @@ class App(ctk.CTk):
                 "dot": dot, "status": status_lbl, "entries": entries,
             }
 
+    def _refresh_linked_brokers(self) -> None:
+        """Re-read .env into everything built from it.
+
+        All of this is built once, at startup. Credentials are entered on a
+        different page and at a later time, so whatever it was built from is
+        already out of date by the time anyone links a broker -- the selectors
+        stayed empty and both counters sat at "0 brokers linked" for the rest of
+        the session.
+        """
+        for render in (self._render_trade_broker_chips,
+                       self._render_mirror_broker_chips,
+                       self._render_linked_count):
+            try:
+                render()
+            except Exception as exc:      # one broken piece must not eat the save
+                self._log(f"Accounts: could not refresh broker UI — {exc}", "warn")
+
+    def _render_linked_count(self) -> None:
+        """The two "N brokers linked" readouts, in the sidebar and status bar."""
+        n = sum(1 for b in BROKER_MODULES if _broker_has_creds(b))
+        plural = "s" if n != 1 else ""
+        if getattr(self, "_sidebar_conn_lbl", None) is not None:
+            self._sidebar_conn_lbl.configure(text=f"{n} broker{plural} linked")
+            self._sidebar_conn_dot.set_color(GREEN if n else TEXT_MUTED)
+        if getattr(self, "_statusbar_conn_lbl", None) is not None:
+            self._statusbar_conn_lbl.configure(
+                text=f"OPERATIONAL   ·   {n} BROKER{plural.upper()} LINKED")
+
     def _save_account_creds(self, broker: str) -> None:
         widgets = self._account_widgets[broker]
         updates = {}
@@ -11812,6 +11922,12 @@ class App(ctk.CTk):
         widgets["dot"].set_color(GREEN if has else TEXT_MUTED)
         widgets["status"].configure(text="saved", fg=GREEN)
         self._log(f"Accounts: saved credentials for {broker}")
+        # The desk, the mirror card and both "N brokers linked" readouts are all
+        # built from .env at startup, so without this a broker linked now stayed
+        # invisible to every one of them until the app was restarted -- and
+        # mirror could not be enabled at all, because enabling it needs a chip
+        # to select and there was none to click.
+        self._refresh_linked_brokers()
         if broker in self._broker_status_labels:
             self._broker_status_labels[broker]["dot"].set_color(GREEN if has else TEXT_MUTED)
             self._broker_status_labels[broker]["status"].configure(
