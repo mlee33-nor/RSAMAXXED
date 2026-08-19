@@ -1064,6 +1064,7 @@ def get_holdings(*args, **kwargs) -> BrokerOutput:
                     raw_positions = []
 
                 cash_skipped = 0
+                cash_value = 0.0
                 parsed = 0
 
                 for pos in raw_positions:
@@ -1074,6 +1075,14 @@ def get_holdings(*args, **kwargs) -> BrokerOutput:
                     long_name = str(pos.get("instrumentLongName") or "")
                     if "Cash" in long_name:
                         cash_skipped += 1
+                        # Counted but discarded, which is right for a holdings
+                        # list and wrong for anything that wants to know what
+                        # the account can buy. Keep the dollars on the side.
+                        # A cash line prices at 1.00, so quantity alone is the
+                        # value whenever no price comes back.
+                        _q = _as_float(pos.get("tradedUnitQuantity")) or 0.0
+                        _p = _as_float((pos.get("marketPrice") or {}).get("baseValueAmount"))
+                        cash_value += _q * _p if _p else _q
                         continue
 
                     # --- build symbol ---
@@ -1139,6 +1148,8 @@ def get_holdings(*args, **kwargs) -> BrokerOutput:
                     "account_value_reported": float(acc_val) if acc_val is not None else None,
                     "raw_positions_count": int(len(raw_positions)),
                     "cash_positions_skipped": int(cash_skipped),
+                    "cash": float(cash_value),
+                    "cash_source": "cash_positions",
                     "positions_parsed": int(parsed),
                 }
 

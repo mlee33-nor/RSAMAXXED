@@ -1349,6 +1349,7 @@ def _parse_positions_csv(path: Path, *, label_prefix: str = "") -> List[AccountO
                     "acc_num": acc_num,
                     "acct_name": acct_name,
                     "total": 0.0,
+                    "cash": 0.0,
                     "rows": [],
                     "raw_rows": 0,
                     "parsed_rows": 0,
@@ -1368,8 +1369,13 @@ def _parse_positions_csv(path: Path, *, label_prefix: str = "") -> List[AccountO
 
             symbol = _clean_symbol(symbol_raw)
 
-            # Hard rule: never show Fidelity cash sweep
+            # Hard rule: never show Fidelity cash sweep as a holding, and
+            # never let it into the securities total. It is still the account's
+            # buying power, though, and it was being dropped on the floor one
+            # line before the only place that wanted it — so record it on the
+            # side for the Invest page and carry on discarding it here.
             if symbol == "FCASH":
+                buckets[bucket_key]["cash"] += current_val
                 continue
 
             buckets[bucket_key]["raw_rows"] += 1
@@ -1425,6 +1431,8 @@ def _parse_positions_csv(path: Path, *, label_prefix: str = "") -> List[AccountO
             "account_last4": _digits_only(acc_num)[-4:] if _digits_only(acc_num) else (acc_num[-4:] if acc_num else "----"),
             "account_name": acct_name[:120],
             "account_total_value_calc": total,
+            "cash": float(info.get("cash") or 0.0),
+            "cash_source": "fcash",
             "csv_file": csv_name,
             "csv_mtime_epoch": csv_mtime,
             "csv_columns": fieldnames[:200],

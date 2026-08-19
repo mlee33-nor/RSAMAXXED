@@ -19,7 +19,7 @@ import re
 import threading
 import tkinter as tk
 import winsound
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import ttk, messagebox
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,7 +31,10 @@ import customtkinter as ctk
 from dotenv import load_dotenv
 
 from modules.outputs import BrokerOutput, log_event
+import balances
 import discord_feed
+import etf_journal
+import etf_plan
 import lifecycle
 import logo
 import mirror_journal
@@ -282,10 +285,33 @@ ICONS = {
 # that do not survive a copy/paste round-trip through tooling.
 ICONS["lock"] = chr(0xE72E)
 ICONS["unlock"] = chr(0xE785)
+ICONS["calendar"] = chr(0xE787)
 
 
 def icon(name: str) -> str:
     return ICONS.get(name, "")
+
+
+def _fetch_history(symbol: str, rng: str = "6mo",
+                   interval: str = "1d") -> List[float]:
+    """Daily closes for a chart. [] on any failure.
+
+    Separate from _fetch_quote, which asks for one day at five-minute
+    resolution to drive the sparkline and the change figure. A six-month line
+    needs a different range, and asking for both in one call would make every
+    quote refresh twenty times heavier than it needs to be.
+    """
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+           f"?range={rng}&interval={interval}")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        result = data["chart"]["result"][0]
+        closes = result["indicators"]["quote"][0]["close"]
+        return [float(c) for c in closes if c is not None]
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +754,23 @@ def _sell_legs_text(sell: Dict[str, Any]) -> str:
         n = f"{low}-{high}" if high > low else str(low)
         parts.append(f"{broker} x{n}" if low else broker)
     return "  ·  ".join(parts)
+
+
+def _sell_leg_broker_keys(sell: Dict[str, Any]) -> List[str]:
+    """App broker keys a sell alert names, in the order it wrote them.
+
+    'Wells Fargo x3' -> 'wellsfargo'. Only brokers this tool actually trades
+    survive: the feed names brokerages we don't automate (Webull, Vanguard) and
+    there is no chip on the desk to arm for those.
+    """
+    keys: List[str] = []
+    for leg in sell.get("legs") or []:
+        if not isinstance(leg, dict):
+            continue
+        key = lifecycle.app_key(str(leg.get("broker") or ""))
+        if key in BROKER_MODULES and key not in keys:
+            keys.append(key)
+    return keys
 
 
 PICKS_FILE = ROOT_DIR / "picks.json"
@@ -1283,7 +1326,12 @@ class App(ctk.CTk):
         # ---- runtime state ----
         self._log_lines: List[tuple] = []
         # Execution / live-activity state (Activity page + double-submit guard)
-        self._trade_in_flight: bool = False   # a Trade Desk batch is running
+        self._trade_in_flight: bool = False   # ANY batch is running (automation gate)
+        # Which brokers are mid-order right now. The desk guards on THIS, not on
+        # _trade_in_flight: selling AIFA at Fidelity and BBBB at Robinhood at the
+        # same time is two independent sessions and perfectly safe, while a second
+        # order at a broker already working is the duplicate that must be refused.
+        self._brokers_in_flight: set = set()
         self._live_batches: List[dict] = []   # batches currently shown live
         self._live_anim_id: Optional[str] = None
         self._live_frame: int = 0
@@ -1297,6 +1345,35 @@ class App(ctk.CTk):
         # Bumped on every quote merge. Pages fingerprint against it instead of
         # hashing the whole quote dict on every tab switch.
         self._quotes_rev: int = 0
+        # Invest page. Initialised here, before _build_frames, because
+        # _build_invest renders itself on the way up and reads all of it.
+        # ETF quotes are kept apart from self._quotes: that cache is driven by
+        # the RSA pick list and is rewritten every 45 seconds, which would
+        # evict SPY the moment the picks changed.
+        self._etf_quotes: Dict[str, Dict[str, Any]] = {}
+        self._etf_exposure: str = etf_plan.EXPOSURES[0].key
+        self._etf_tier: str = "low"          # the tier most accounts can reach
+        self._etf_symbol: str = etf_plan.funds_in_tier("low")[0].symbol
+        self._etf_auto = tk.BooleanVar(value=True)
+        self._etf_fund = None
+        self._etf_reco = None
+        self._etf_history: Dict[str, List[float]] = {}
+        self._etf_history_busy: set = set()
+        self._etf_cash_status: Dict[str, tuple] = {}
+        self._invest_expanded: set = set()   # brokers opened in the cash list
+        self._invest_editing = None          # the one live cash Entry, if any
+        # "max" by default: a fixed per-account figure has to be guessed, and
+        # any guess is wrong for a fleet whose accounts hold anything from $20
+        # to $250 -- a $100 default silently excluded most of them. Deploying
+        # what is actually there needs no guess.
+        self._etf_mode: str = "max"
+        self._etf_target = tk.StringVar(value="100")
+        self._etf_dry = tk.BooleanVar(value=False)
+        self._etf_plan = None
+        self._etf_quotes_busy: bool = False
+        self._etf_cash_busy: bool = False
+        # Counts ETF batches out and back — an invest run can be more than one.
+        self._invest_in_flight: int = 0
         # Last-rendered fingerprint per page — see _page_signature.
         self._page_sig: Dict[str, Any] = {}
         self._notifications: List[Dict[str, Any]] = []
@@ -1820,6 +1897,9 @@ class App(ctk.CTk):
             ("holdings", "Positions", "positions"),       # what you hold
             ("exits", "Exits", "export"),                 # close it
         ]),
+        ("INVEST", [
+            ("invest", "Invest", "pie"),          # what the profit does next
+        ]),
         ("PERFORMANCE", [
             ("stats", "Analytics", "analytics"),
         ]),
@@ -1954,6 +2034,7 @@ class App(ctk.CTk):
         self._build_holdings()
         self._build_trade()
         self._build_exits()
+        self._build_invest()
         self._build_stats()
         self._build_settings()
         # After settings: the Mirror page reads the mirror state vars that
@@ -1970,6 +2051,7 @@ class App(ctk.CTk):
         "mirror":    ("lightning", "Mirror", "Every order automation placed for you, run by run"),
         "exits":     ("export", "Exits", "Plays that resolved — what to sell, and where"),
         "settings":  ("automation", "Automation", "Mirror trading and rules engine"),
+        "invest":    ("pie", "Invest", "Put idle cash to work in ETFs, and track it"),
         "stats":     ("analytics", "Analytics", "Performance, risk and realized P/L"),
         "accounts":  ("brokers", "Brokers", "Connections, credentials and bootstrap"),
         "logs":      ("activity", "Activity", "Live session event log"),
@@ -2017,6 +2099,7 @@ class App(ctk.CTk):
 
         renderer = {
             "stats": self._refresh_stats,
+            "invest": self._render_invest,
             "watchlist": self._render_watchlist,
             "holdings": self._render_allocation,
             "exits": self._render_exits,
@@ -2057,7 +2140,16 @@ class App(ctk.CTk):
                          and self._mirror_enabled.get()),
                     tuple(sorted(getattr(self, "_mirror_selected_brokers", ()))),
                     len(getattr(self, "_mirror_failed", ())))
-        if name in ("holdings", "stats"):
+        if name == "invest":
+            return ("invest", balances.version(), etf_journal.version(),
+                    self._etf_symbol, self._etf_mode, self._etf_auto.get(),
+                    len(self._etf_quotes))
+        if name == "stats":
+            # The ETF journal is in here too: Analytics carries an Investments
+            # card, so a buy on the Invest page has to be able to redraw it.
+            return ("stats", self._journal_version(), etf_journal.version(),
+                    len(getattr(self, "_etf_quotes", ())))
+        if name == "holdings":
             return (name, self._journal_version())
         if name == "watchlist":
             return ("watchlist", tuple(self._watchlist),
@@ -2705,12 +2797,93 @@ class App(ctk.CTk):
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
         inner.bind("<Configure>",
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
-        def _wheel(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        outer.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _wheel))
-        outer.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        self._attach_wheel(canvas, outer)
         return outer, inner
+
+    @staticmethod
+    def _pointer_in(w) -> bool:
+        """Is the mouse pointer over this widget, or something inside it?
+
+        Asked of the widget stack rather than of the rectangle, so an overlay
+        sitting on top of the page — the device-approval alert, a dialog —
+        keeps the wheel instead of scrolling the page underneath it. Falls
+        back to the rectangle if the lookup cannot name what it found.
+        """
+        try:
+            if not w.winfo_ismapped():
+                return False
+            x, y = w.winfo_pointerxy()
+        except Exception:
+            return False
+        try:
+            under = w.winfo_containing(x, y)
+            while under is not None:
+                if under is w:
+                    return True
+                under = getattr(under, "master", None)
+            return False
+        except Exception:
+            pass
+        try:
+            rx, ry = w.winfo_rootx(), w.winfo_rooty()
+            return (rx <= x < rx + w.winfo_width()
+                    and ry <= y < ry + w.winfo_height())
+        except Exception:
+            return False
+
+    def _attach_wheel(self, canvas: tk.Canvas, region) -> None:
+        """Scroll `canvas` when the wheel turns anywhere over `region`.
+
+        The obvious version of this — bind <Enter> on the region to install a
+        bind_all handler and <Leave> to remove it — tears itself down at the
+        worst moment. Tk sends a container a <Leave> the instant the pointer
+        crosses onto one of its own children, so on a page made of cards the
+        binding was being dropped and re-added on every card boundary, and
+        whichever side of that flap you landed on decided whether the wheel
+        did anything at all.
+
+        So bind once, for the life of the window, and ask at wheel time
+        whether the pointer is inside the region. Pages that are packed away
+        are unmapped and answer no, which is what keeps several scrollers
+        from fighting over one wheel.
+        """
+        def _wheel(e):
+            if not self._pointer_in(region):
+                return None
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            return "break"
+        canvas.bind_all("<MouseWheel>", _wheel, add="+")
+
+    def _claim_wheel(self, widget, page_canvas: tk.Canvas) -> None:
+        """Let a table inside a scrolling page own the wheel over itself.
+
+        A ttk.Treeview already scrolls on <MouseWheel> through its class
+        binding, and the page's handler then ran straight afterwards — one
+        notch moved the table *and* the page underneath it, which is what
+        made the tables here feel broken. A widget-level binding runs before
+        the class binding, so returning "break" leaves exactly one thing
+        moving: the table, or the page once the table has reached its end in
+        that direction.
+        """
+        def _wheel(e):
+            step = int(-1 * (e.delta / 120)) or (-1 if e.delta > 0 else 1)
+            try:
+                first, last = widget.yview()
+            except Exception:
+                first, last = 0.0, 1.0
+            spent = (step < 0 and first <= 0.0) or (step > 0 and last >= 1.0)
+            (page_canvas if spent else widget).yview_scroll(step, "units")
+            return "break"
+        widget.bind("<MouseWheel>", _wheel)
+
+    def _claim_wheel_below(self, root, page_canvas: tk.Canvas) -> None:
+        """Apply _claim_wheel to every table under `root`."""
+        def walk(w) -> None:
+            if isinstance(w, ttk.Treeview):
+                self._claim_wheel(w, page_canvas)
+            for ch in w.winfo_children():
+                walk(ch)
+        walk(root)
 
     # ---- Shared micro-components -------------------------------------------
 
@@ -3096,17 +3269,7 @@ class App(ctk.CTk):
             canvas.itemconfig(win_id, width=e.width)
         canvas.bind("<Configure>", _on_canvas_configure)
 
-        def _dash_mousewheel(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-
-        def _dash_enter(e):
-            canvas.bind_all("<MouseWheel>", _dash_mousewheel)
-
-        def _dash_leave(e):
-            canvas.unbind_all("<MouseWheel>")
-
-        outer.bind("<Enter>", _dash_enter)
-        outer.bind("<Leave>", _dash_leave)
+        self._attach_wheel(canvas, outer)
 
         # ===== Hero: portfolio value + live top movers =====
         hero_row = tk.Frame(frame, bg=BG_PRIMARY)
@@ -3406,13 +3569,23 @@ class App(ctk.CTk):
             # Only offer the action for something we actually hold — an alerter
             # exiting says nothing about our own position.
             if sym in held:
-                act = tk.Label(top, text="Sell 1 ea →",
+                # The alert names the brokerage; the ticket should open armed at
+                # that one alone, not at every broker we happen to have linked.
+                keys = [b for b in _sell_leg_broker_keys(sell)
+                        if b in getattr(self, "_trade_broker_chips", {})]
+                if len(keys) == 1:
+                    act_text = f"Sell 1 ea at {rsa_feed.normalize_broker(keys[0])} →"
+                elif keys:
+                    act_text = f"Sell 1 ea at {len(keys)} brokers →"
+                else:
+                    act_text = "Sell 1 ea →"
+                act = tk.Label(top, text=act_text,
                                bg=_blend(RED, row_bg, 0.82), fg=RED,
                                font=(FONT_FAMILY, 9, "bold"), padx=10, pady=3,
                                cursor="hand2")
                 act.pack(side="right")
                 act.bind("<Button-1>",
-                         lambda e, s=sym: self._prefill_trade(s, "sell", "1"))
+                         lambda e, s=sym, k=keys: self._sell_alert_trade(s, k))
             else:
                 tk.Label(top, text="not held", bg=row_bg, fg=TEXT_MUTED,
                          font=(FONT_FAMILY, 8)).pack(side="right")
@@ -3439,6 +3612,27 @@ class App(ctk.CTk):
                          font=(FONT_FAMILY, 8), justify="left",
                          wraplength=760).pack(anchor="w", pady=(2, 0))
             self._bind_row_hover(row, row_bg, BG_CARD_ALT)
+
+    def _sell_alert_trade(self, symbol: str, brokers: List[str]) -> None:
+        """Sell-alert row → Trade Desk, armed only where the alert says.
+
+        Nothing is sent: the desk still needs Execute. This only saves you from
+        deselecting nine brokers by hand, and from firing an order at brokers the
+        exit never mentioned.
+        """
+        self._prefill_trade(symbol, "sell", "1", brokers=brokers or None)
+        armed = [b for b in (brokers or [])
+                 if b in getattr(self, "_trade_selected_brokers", set())]
+        if armed:
+            self._log(f"Sell alert {symbol}: selected "
+                      f"{', '.join(rsa_feed.normalize_broker(b) for b in armed)}"
+                      f" — review the quantity, then Execute")
+        elif brokers:
+            self._log(f"Sell alert {symbol}: none of its brokers are linked "
+                      f"here — pick brokers by hand", "warn")
+        else:
+            self._log(f"Sell alert {symbol}: no brokerage named — "
+                      f"pick brokers by hand", "warn")
 
     def _switch_picks_tab(self, tab: str) -> None:
         """Switch between Quick Picks and Purchased tabs."""
@@ -3910,8 +4104,14 @@ class App(ctk.CTk):
                      font=(FONT_FAMILY, 8), justify="left",
                      wraplength=620).pack(anchor="w", pady=(1, 0))
 
-    def _prefill_trade(self, ticker: str, side: str = "buy", qty: str = "1") -> None:
-        """Jump to the Trade Desk with side / symbol / qty pre-filled."""
+    def _prefill_trade(self, ticker: str, side: str = "buy", qty: str = "1",
+                       brokers: Optional[List[str]] = None) -> None:
+        """Jump to the Trade Desk with side / symbol / qty pre-filled.
+
+        `brokers` (app keys) arms exactly those chips: an exit that names one
+        brokerage should not arrive with all ten selected. Left None the current
+        selection is untouched.
+        """
         self._show_frame("trade")
         try:
             self._set_trade_side(side)
@@ -3919,9 +4119,30 @@ class App(ctk.CTk):
             self._trade_symbol.insert(0, ticker.upper())
             self._trade_qty.delete(0, "end")
             self._trade_qty.insert(0, qty)
+            if brokers:
+                self._select_only_brokers(brokers)
             self._update_trade_estimate()
         except Exception:
             pass
+
+    def _select_only_brokers(self, brokers) -> List[str]:
+        """Arm exactly these broker chips (app keys), disarm every other one.
+
+        Returns the keys actually armed. A broker with no chip — not linked on
+        this machine — is dropped, and if that leaves nothing the existing
+        selection stays put rather than handing back an empty ticket.
+        """
+        chips = getattr(self, "_trade_broker_chips", None)
+        if not chips:
+            return []
+        want = [b for b in dict.fromkeys(brokers) if b in chips]
+        if not want:
+            return []
+        for broker, chip in chips.items():
+            should = broker in want
+            if chip["selected"] != should:
+                self._toggle_broker_chip(broker)
+        return want
 
     def _quick_pick_buy(self, symbol: str) -> None:
         """Jump to Trade tab with symbol and qty pre-filled."""
@@ -4635,6 +4856,20 @@ class App(ctk.CTk):
         for t in threads:
             t.join()
 
+        # Keep the cash figures the brokers just handed us. Every module works
+        # one out and hangs it on AccountOutput.extra, and until now nothing
+        # ever read that attribute -- it was computed and dropped on every
+        # refresh. Done off the UI thread because it touches disk.
+        try:
+            state = balances.load()
+            for broker, out in results.items():
+                balances.record_broker_output(broker, out.accounts, state,
+                                              persist=False)
+            balances.save(state)
+        except Exception as exc:
+            self.after(0, lambda e=exc: self._log(f"Balances: not saved - {e}",
+                                                  "warn"))
+
         def update_ui() -> None:
             # Realized P/L hero is journal-based (accurate); refresh it too.
             self._apply_dashboard_summary()
@@ -4663,6 +4898,1097 @@ class App(ctk.CTk):
             self._log("Dashboard: refresh complete")
 
         self.after(0, update_ui)
+
+    # ---- Invest (ETFs) ------------------------------------------------------
+    #
+    # The RSA side of this app answers "what do we buy today". This page
+    # answers the question that comes after it: the profit lands as cash spread
+    # across dozens of accounts and then sits there.
+    #
+    # Two facts shape the whole page. execute_trade() takes no account
+    # parameter, so one call sends ONE quantity to every account a broker owns
+    # -- the plan is per broker, never per account. And a third of the fleet
+    # cannot buy fractions at all, so at $770 a share of SPY is unreachable in
+    # a Fidelity account holding $300 while SCHX at $30 is not. That is why the
+    # menu is filed by SHARE PRICE rather than by index: the price is the
+    # constraint, so it belongs in front of the choice. The arithmetic lives in
+    # etf_plan.py where it can be tested without a broker session.
+    #
+    # The page is built once into fixed sections and each one redraws on its
+    # own. Picking a fund must not rebuild the cash list -- that list is one row
+    # per account across the whole fleet, and rebuilding it on every click is
+    # what made this feel slow.
+    #
+    # Everything bought here is recorded in etf_journal, never trades.json.
+
+    _INVEST_SECTIONS = ("pull", "picker", "detail", "cash", "holdings")
+
+    def _build_invest(self) -> None:
+        frame = tk.Frame(self._content, bg=BG_PRIMARY)
+        self._frames["invest"] = frame
+        outer, body = self._make_vscroll(frame)
+        outer.pack(fill="both", expand=True)
+        self._invest_body = body
+
+        # The cards are built ONCE and refilled in place.
+        #
+        # Every CustomTkinter frame draws its rounded border onto a canvas, and
+        # every widget is a round-trip to Tcl -- rebuilding a card costs far
+        # more than rewriting the labels inside it. Destroying and recreating
+        # all five on every click is what made the page feel heavy, so the
+        # shells persist and only their contents are cleared.
+        self._invest_sections: Dict[str, tk.Frame] = {}
+        for name, bg, border in (
+                ("pull", BG_CARD, _blend(ACCENT, BORDER, 0.5)),
+                ("picker", BG_CARD, BORDER)):
+            card = RoundedFrame(body, bg_color=bg, border_color=border,
+                                radius=RAD_MD)
+            card.pack(fill="x", pady=(0, 14))
+            content = tk.Frame(card.inner, bg=bg)
+            content.pack(fill="x", padx=SP_XL, pady=SP_LG)
+            self._invest_sections[name] = content
+
+        # Detail is two cards side by side, and the chart canvas inside it is
+        # the single most expensive widget on the page -- it persists too, and
+        # is only redrawn.
+        det = tk.Frame(body, bg=BG_PRIMARY)
+        det.pack(fill="x", pady=(0, 14))
+        det.columnconfigure(0, weight=3)
+        det.columnconfigure(1, weight=4)
+        self._invest_sections["detail"] = det
+
+        chart_card = RoundedFrame(det, bg_color=BG_CARD, border_color=BORDER,
+                                  radius=RAD_MD)
+        chart_card.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        cbox = tk.Frame(chart_card.inner, bg=BG_CARD)
+        cbox.pack(fill="both", expand=True, padx=SP_LG, pady=SP_LG)
+        self._invest_chart_head = tk.Frame(cbox, bg=BG_CARD)
+        self._invest_chart_head.pack(fill="x")
+        self._etf_chart_canvas = tk.Canvas(cbox, bg=BG_CARD, height=170, bd=0,
+                                           highlightthickness=0)
+        self._etf_chart_canvas.pack(fill="both", expand=True, pady=(SP_MD, 0))
+        self._etf_chart_canvas.bind("<Configure>",
+                                    lambda e: self._queue_etf_chart_redraw())
+        self._invest_chart_foot = tk.Frame(cbox, bg=BG_CARD)
+        self._invest_chart_foot.pack(fill="x", pady=(SP_SM, 0))
+
+        ticket_card = RoundedFrame(det, bg_color=BG_HERO,
+                                   border_color=_blend(ACCENT, BORDER, 0.55),
+                                   radius=RAD_MD)
+        ticket_card.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        self._invest_ticket_box = tk.Frame(ticket_card.inner, bg=BG_HERO)
+        self._invest_ticket_box.pack(fill="both", expand=True,
+                                     padx=SP_LG, pady=SP_LG)
+
+        for name, bg in (("cash", BG_CARD), ("holdings", BG_CARD)):
+            card = RoundedFrame(body, bg_color=bg, border_color=BORDER,
+                                radius=RAD_MD)
+            card.pack(fill="x", pady=(0, 14))
+            content = tk.Frame(card.inner, bg=bg)
+            content.pack(fill="x", padx=SP_XL, pady=SP_LG)
+            self._invest_sections[name] = content
+
+        # Not rendered here. _show_frame calls the renderer on first visit, and
+        # doing it at build time put the whole page on the startup path for a
+        # page most launches never open.
+
+    def _invest_section(self, name: str) -> Optional[tk.Frame]:
+        holder = getattr(self, "_invest_sections", {}).get(name)
+        if holder is None or not holder.winfo_exists():
+            return None
+        for w in holder.winfo_children():
+            w.destroy()
+        return holder
+
+    def _render_invest(self, *sections: str) -> None:
+        """Redraw the named sections, or all of them."""
+        if not getattr(self, "_invest_sections", None):
+            return
+        # Without prices there is no plan and no recommendation, so the page
+        # renders as a row of empty cards and looks broken. Fetch them the
+        # first time it is opened rather than making the user find a button.
+        if not self._etf_quotes and not getattr(self, "_etf_quotes_busy", False):
+            self._invest_refresh_quotes()
+        wanted = sections or self._INVEST_SECTIONS
+        if "detail" in wanted or "picker" in wanted:
+            self._invest_recompute()
+        for name in wanted:
+            getattr(self, f"_render_invest_{name}")()
+
+    # ---- state ----
+
+    def _invest_brokers(self) -> List[str]:
+        return sorted(b for b in BROKER_MODULES if _broker_has_creds(b))
+
+    def _invest_prices(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for sym in etf_plan.catalog_tickers():
+            q = self._etf_quotes.get(sym)
+            if q and q.get("price"):
+                out[sym] = float(q["price"])
+        return out
+
+    def _invest_target(self) -> Optional[float]:
+        if self._etf_mode != "target":
+            return None
+        try:
+            val = float(str(self._etf_target.get()).replace("$", "")
+                        .replace(",", "").strip())
+        except (TypeError, ValueError):
+            return None
+        return val if val > 0 else None
+
+    def _invest_recompute(self) -> None:
+        """Work out the current pick and its plan. One place, so the ticket and
+        the picker can never disagree about what is about to be bought."""
+        prices = self._invest_prices()
+        target = self._invest_target()
+        kw = dict(mode=("target" if target else "max"),
+                  target_per_account=target,
+                  brokers=self._invest_brokers(),
+                  market_open=(_market_status()[0] == "open"))
+        self._etf_reco = None
+        self._etf_plan = None
+        self._etf_fund = None
+        try:
+            books = balances.for_planner(brokers=self._invest_brokers())
+            if self._etf_auto.get():
+                reco = etf_plan.recommend(books, prices, **kw)
+                self._etf_reco = reco
+                self._etf_fund = reco.fund
+                self._etf_plan = reco.plan
+            elif self._etf_symbol:
+                self._etf_fund = etf_plan.fund_by_symbol(self._etf_symbol)
+                if prices.get(self._etf_symbol):
+                    self._etf_plan = etf_plan.plan_ticker(
+                        self._etf_symbol, books, prices, **kw)
+        except Exception as exc:
+            self._log(f"Invest: could not build a plan - {exc}", "warn")
+
+    # ---- 1. pulling cash ----
+
+    def _render_invest_pull(self) -> None:
+        holder = self._invest_section("pull")
+        if holder is None:
+            return
+        box = holder
+
+        t = balances.totals()
+        top = tk.Frame(box, bg=BG_CARD)
+        top.pack(fill="x")
+        left = tk.Frame(top, bg=BG_CARD)
+        left.pack(side="left")
+        tk.Label(left, text="CASH AVAILABLE TO INVEST", bg=BG_CARD,
+                 fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 9, "bold")).pack(anchor="w")
+        tk.Label(left, text=f"${t['total']:,.2f}", bg=BG_CARD,
+                 fg=GREEN if t["total"] > 0 else TEXT_MUTED,
+                 font=(FONT_MONO, 30, "bold")).pack(anchor="w", pady=(2, 0))
+        sub = f"{t['known_accounts']} account(s) reporting"
+        if t["unknown_accounts"]:
+            sub += f"   ·   {t['unknown_accounts']} with no figure"
+        tk.Label(left, text=sub, bg=BG_CARD, fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 10)).pack(anchor="w")
+
+        right = tk.Frame(top, bg=BG_CARD)
+        right.pack(side="right")
+        busy = bool(getattr(self, "_etf_cash_busy", False))
+        PillButton(right,
+                   text="Pulling…" if busy else "Pull balances",
+                   command=self._invest_refresh_balances,
+                   width=150, height=40, font_size=11).pack(anchor="e")
+        PillButton(right, text="Refresh prices",
+                   command=self._invest_refresh_quotes,
+                   width=150, height=26, font_size=8, bg_color=BG_CARD_ALT,
+                   hover_color=ACCENT).pack(anchor="e", pady=(6, 0))
+
+        if not t["known_accounts"] and not busy:
+            tk.Label(box,
+                     text="Press Pull balances to ask every connected broker "
+                          "what each account is holding in cash. Public and "
+                          "Robinhood answer in seconds; the browser brokers "
+                          "take longer and appear as they arrive.",
+                     bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9),
+                     wraplength=820, justify="left").pack(anchor="w",
+                                                          pady=(SP_MD, 0))
+
+        status = getattr(self, "_etf_cash_status", {})
+        if status:
+            grid = tk.Frame(box, bg=BG_CARD)
+            grid.pack(fill="x", pady=(SP_MD, 0))
+            for broker in sorted(status):
+                state, text = status[broker]
+                row = tk.Frame(grid, bg=BG_CARD)
+                row.pack(fill="x", pady=1)
+                colour = {"ok": GREEN, "busy": YELLOW,
+                          "fail": RED}.get(state, TEXT_MUTED)
+                StatusDot(row, color=colour, size=8).pack(side="left",
+                                                          padx=(0, 6))
+                tk.Label(row, text=broker.capitalize(), bg=BG_CARD,
+                         fg=TEXT_SECONDARY, font=(FONT_FAMILY, 9), width=12,
+                         anchor="w").pack(side="left")
+                tk.Label(row, text=text, bg=BG_CARD, fg=colour,
+                         font=(FONT_FAMILY, 9), anchor="w").pack(side="left")
+
+    def _invest_refresh_balances(self) -> None:
+        """Ask every broker what it is holding in cash.
+
+        One thread per broker, and each one saves the moment it lands. The
+        first version walked the brokers in sorted order and saved once at the
+        end, which put `chase` -- a browser broker behind a 30-minute lock --
+        in front of Public and Robinhood, so the total sat at zero for as long
+        as the slowest login took. Nothing about that was visible from the
+        page, which made it look like the pull simply did not work.
+        """
+        if getattr(self, "_etf_cash_busy", False):
+            return
+        brokers = self._invest_brokers()
+        if not brokers:
+            self._push_notification("No brokers are connected yet.", "warning")
+            return
+
+        self._etf_cash_busy = True
+        self._etf_cash_status = {
+            b: ("busy", "browser login — this one is slow"
+                if b in _BROWSER_BROKERS else "asking…")
+            for b in brokers}
+        self._render_invest("pull")
+        self._log(f"Invest: pulling cash from {len(brokers)} broker(s)...")
+
+        remaining = {"n": len(brokers)}
+        lock = threading.Lock()
+
+        def _one(broker: str) -> None:
+            slot = _browser_slot(broker)
+            held = None
+            try:
+                if slot is not None:
+                    if not slot.acquire(timeout=_BROWSER_LOCK_TIMEOUT):
+                        raise RuntimeError(_BROWSER_BUSY_MSG)
+                    held = slot
+                load_dotenv(ENV_FILE, override=True)
+                out = _load_broker(broker).get_holdings()
+                # Saved here rather than at the end, so a broker that answers
+                # in two seconds shows up in two seconds.
+                balances.record_broker_output(broker, out.accounts)
+                got = sum(1 for a in out.accounts
+                          if balances.cash_from_extra(broker, a.extra) is not None)
+                if got:
+                    state, text = "ok", f"{got} of {len(out.accounts)} account(s)"
+                else:
+                    state, text = ("none",
+                                   f"{len(out.accounts)} account(s), no cash "
+                                   f"figure — type one in below")
+            except Exception as exc:
+                state, text = "fail", str(exc)[:70]
+            finally:
+                if held is not None:
+                    try:
+                        held.release()
+                    except RuntimeError:
+                        pass
+
+            def _land() -> None:
+                self._etf_cash_status[broker] = (state, text)
+                with lock:
+                    remaining["n"] -= 1
+                    done = remaining["n"] <= 0
+                if done:
+                    self._etf_cash_busy = False
+                    tot = balances.totals()
+                    self._log(f"Invest: ${tot['total']:,.2f} across "
+                              f"{tot['known_accounts']} account(s)", "success")
+                self._render_invest("pull", "cash", "picker", "detail")
+            self.after(0, _land)
+
+        for broker in brokers:
+            self._run_in_thread(_one, broker)
+
+    def _invest_refresh_quotes(self) -> None:
+        if getattr(self, "_etf_quotes_busy", False):
+            return
+        self._etf_quotes_busy = True
+
+        def _worker() -> None:
+            try:
+                got = self._fetch_quotes_parallel(list(etf_plan.catalog_tickers()))
+            except Exception:
+                got = {}
+
+            def _apply() -> None:
+                self._etf_quotes_busy = False
+                if got:
+                    self._etf_quotes.update(got)
+                self._render_invest("pull", "picker", "detail")
+            self.after(0, _apply)
+
+        self._run_in_thread(_worker)
+
+    # ---- 2. the menu, filed by share price ----
+
+    def _render_invest_picker(self) -> None:
+        holder = self._invest_section("picker")
+        if holder is None:
+            return
+        box = holder
+
+        head = tk.Frame(box, bg=BG_CARD)
+        head.pack(fill="x")
+        tk.Label(head, text=f"{icon('pie')}  WHAT TO BUY", bg=BG_CARD,
+                 fg=ACCENT, font=(ICON_FONT, 10, "bold")).pack(side="left")
+        auto = tk.Checkbutton(
+            head, text="  Recommend one for me", variable=self._etf_auto,
+            command=lambda: self._render_invest("picker", "detail"),
+            bg=BG_CARD, fg=TEXT_SECONDARY, activebackground=BG_CARD,
+            activeforeground=TEXT_PRIMARY, selectcolor=BG_INPUT,
+            highlightthickness=0, bd=0, font=(FONT_FAMILY, 9))
+        auto.pack(side="right")
+
+        if self._etf_auto.get():
+            reco = getattr(self, "_etf_reco", None)
+            tk.Label(box,
+                     text=(reco.reason if reco else
+                           "Pull balances and refresh prices to get a "
+                           "recommendation."),
+                     bg=BG_CARD, fg=TEXT_SECONDARY, font=(FONT_FAMILY, 10),
+                     wraplength=820, justify="left").pack(anchor="w",
+                                                          pady=(SP_SM, 0))
+            if reco and reco.alternatives:
+                alt = "   ".join(f"{f.symbol} would reach {n}"
+                                 for f, n in reco.alternatives)
+                tk.Label(box, text=alt, bg=BG_CARD, fg=TEXT_MUTED,
+                         font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(2, 0))
+            return
+
+        tiers = tk.Frame(box, bg=BG_CARD)
+        tiers.pack(fill="x", pady=(SP_MD, SP_SM))
+        for key, label, _blurb in etf_plan.TIERS:
+            chip = self._make_chip(tiers, label,
+                                   lambda k=key: self._set_invest_tier(k),
+                                   selected=(key == self._etf_tier))
+            chip.pack(side="left", padx=(0, 6))
+
+        blurb = next((b for k, _l, b in etf_plan.TIERS if k == self._etf_tier), "")
+        tk.Label(box, text=blurb, bg=BG_CARD, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 9), wraplength=820,
+                 justify="left").pack(anchor="w", pady=(0, SP_MD))
+
+        cards = tk.Frame(box, bg=BG_CARD)
+        cards.pack(fill="x")
+        for i in range(3):
+            cards.columnconfigure(i, weight=1, uniform="fund")
+        for col, fund in enumerate(etf_plan.funds_in_tier(self._etf_tier)):
+            self._invest_fund_card(cards, fund, col)
+
+    def _set_invest_tier(self, tier: str) -> None:
+        self._etf_tier = tier
+        funds = etf_plan.funds_in_tier(tier)
+        if funds and (self._etf_symbol not in [f.symbol for f in funds]):
+            self._etf_symbol = funds[0].symbol
+        self._render_invest("picker", "detail")
+
+    def _set_invest_symbol(self, symbol: str) -> None:
+        self._etf_symbol = symbol
+        self._etf_auto.set(False)
+        self._render_invest("picker", "detail")
+
+    def _invest_fund_card(self, parent: tk.Frame, fund, col: int) -> None:
+        chosen = (fund.symbol == self._etf_symbol and not self._etf_auto.get())
+        bg = BG_ELEVATED if chosen else BG_CARD_ALT
+        tile = tk.Frame(parent, bg=bg, highlightthickness=1,
+                        highlightbackground=ACCENT if chosen else BORDER)
+        tile.grid(row=0, column=col, sticky="nsew",
+                  padx=(0, SP_SM) if col < 2 else (0, 0))
+        inner = tk.Frame(tile, bg=bg)
+        inner.pack(fill="both", expand=True, padx=SP_MD, pady=SP_MD)
+
+        top = tk.Frame(inner, bg=bg)
+        top.pack(fill="x")
+        tk.Label(top, text=fund.symbol, bg=bg,
+                 fg=ACCENT if chosen else TEXT_PRIMARY,
+                 font=(FONT_MONO, 15, "bold")).pack(side="left")
+        price = self._invest_prices().get(fund.symbol)
+        tk.Label(top, text=f"${price:,.2f}" if price else "no quote", bg=bg,
+                 fg=TEXT_PRIMARY if price else TEXT_MUTED,
+                 font=(FONT_MONO, 12, "bold")).pack(side="right")
+
+        tk.Label(inner, text=fund.name, bg=bg, fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 9), anchor="w").pack(fill="x", pady=(2, 0))
+        tk.Label(inner, text=fund.tracks, bg=bg, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 8), anchor="w", wraplength=200,
+                 justify="left").pack(fill="x", pady=(0, SP_SM))
+
+        # How much of the fleet this one actually reaches -- the thing the
+        # price is a proxy for, said outright.
+        if price:
+            try:
+                p = etf_plan.plan_ticker(
+                    fund.symbol,
+                    balances.for_planner(brokers=self._invest_brokers()),
+                    self._invest_prices(),
+                    mode=("target" if self._invest_target() else "max"),
+                    target_per_account=self._invest_target(),
+                    brokers=self._invest_brokers(),
+                    market_open=(_market_status()[0] == "open"))
+                total = sum(len(b.accounts) for b in p.brokers)
+                tk.Label(inner,
+                         text=f"{p.account_count} of {total} accounts can buy it",
+                         bg=bg,
+                         fg=GREEN if p.account_count else TEXT_MUTED,
+                         font=(FONT_FAMILY, 8, "bold"),
+                         anchor="w").pack(fill="x")
+            except Exception:
+                pass
+
+        # The whole tile is the button. A CustomTkinter button per card is
+        # three more canvas-backed widgets rebuilt on every pick, for an
+        # affordance the tile already provides.
+        pick = tk.Label(inner, text="SELECTED" if chosen else "CHOOSE",
+                        bg=bg, fg=ACCENT if chosen else TEXT_MUTED,
+                        font=(FONT_FAMILY, 8, "bold"), anchor="w")
+        pick.pack(fill="x", pady=(SP_SM, 0))
+        for w in (tile, inner, pick):
+            w.configure(cursor="hand2")
+            w.bind("<Button-1>",
+                   lambda e, sym=fund.symbol: self._set_invest_symbol(sym))
+
+    # ---- 3. chart + ticket ----
+
+    def _render_invest_detail(self) -> None:
+        fund = getattr(self, "_etf_fund", None)
+        if fund is None:
+            return
+        for holder in (self._invest_chart_head, self._invest_chart_foot,
+                       self._invest_ticket_box):
+            for w in holder.winfo_children():
+                w.destroy()
+        self._invest_chart(fund)
+        self._invest_ticket(self._invest_ticket_box, fund)
+
+    def _invest_chart(self, fund) -> None:
+        head = self._invest_chart_head
+        tk.Label(head, text=fund.symbol, bg=BG_CARD, fg=TEXT_PRIMARY,
+                 font=(FONT_MONO, 14, "bold")).pack(side="left")
+        q = self._etf_quotes.get(fund.symbol) or {}
+        if q.get("price"):
+            tk.Label(head, text=f"${q['price']:,.2f}", bg=BG_CARD,
+                     fg=TEXT_PRIMARY,
+                     font=(FONT_MONO, 13, "bold")).pack(side="right")
+            pct = q.get("pct")
+            if pct is not None:
+                tk.Label(head, text=f"{pct:+.2f}%  ", bg=BG_CARD,
+                         fg=GREEN if pct >= 0 else RED,
+                         font=(FONT_MONO, 10, "bold")).pack(side="right")
+        tk.Label(head, text=f"  {fund.name}", bg=BG_CARD, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 9)).pack(side="left")
+
+        series = self._etf_history.get(fund.symbol)
+        if series is None:
+            self._invest_fetch_history(fund.symbol)
+        self._redraw_etf_chart()
+
+        foot = self._invest_chart_foot
+        tk.Label(foot, text="6 months", bg=BG_CARD, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 8)).pack(side="left")
+        if series:
+            change = ((series[-1] - series[0]) / series[0] * 100.0
+                      if series[0] else 0.0)
+            tk.Label(foot, text=f"{change:+.1f}% over the period", bg=BG_CARD,
+                     fg=GREEN if change >= 0 else RED,
+                     font=(FONT_FAMILY, 8, "bold")).pack(side="right")
+
+    def _queue_etf_chart_redraw(self) -> None:
+        """Coalesce resize redraws into one.
+
+        Packing the ticket next to the chart resizes the canvas repeatedly, and
+        redrawing on each of those is work thrown away -- only the last size
+        matters. after_idle runs it once, when the layout has settled.
+        """
+        if getattr(self, "_etf_chart_pending", False):
+            return
+        self._etf_chart_pending = True
+
+        def _go() -> None:
+            self._etf_chart_pending = False
+            self._redraw_etf_chart()
+        self.after_idle(_go)
+
+    def _redraw_etf_chart(self) -> None:
+        """Repaint the persistent canvas for whatever fund is selected."""
+        canvas = getattr(self, "_etf_chart_canvas", None)
+        if canvas is None or not canvas.winfo_exists():
+            return
+        fund = getattr(self, "_etf_fund", None)
+        series = self._etf_history.get(fund.symbol) if fund else None
+        if series is None:
+            canvas.delete("all")
+            canvas.create_text(10, 80, anchor="w",
+                               text="loading price history…",
+                               fill=TEXT_MUTED, font=(FONT_FAMILY, 9))
+            return
+        self._draw_etf_chart(canvas, series)
+
+    def _invest_fetch_history(self, symbol: str) -> None:
+        if symbol in getattr(self, "_etf_history_busy", set()):
+            return
+        self._etf_history_busy.add(symbol)
+
+        def _worker() -> None:
+            series = _fetch_history(symbol)
+
+            def _apply() -> None:
+                self._etf_history_busy.discard(symbol)
+                self._etf_history[symbol] = series or []
+                fund = getattr(self, "_etf_fund", None)
+                if fund is not None and fund.symbol == symbol:
+                    self._render_invest("detail")   # foot line needs the series
+            self.after(0, _apply)
+
+        self._run_in_thread(_worker)
+
+    def _draw_etf_chart(self, canvas: tk.Canvas, series: List[float]) -> None:
+        canvas.delete("all")
+        if not series or len(series) < 2:
+            canvas.create_text(10, 80, anchor="w",
+                               text="no price history available",
+                               fill=TEXT_MUTED, font=(FONT_FAMILY, 9))
+            return
+        # No update_idletasks() here. This runs from a <Configure> handler, and
+        # forcing a synchronous geometry pass from inside a geometry callback
+        # makes Tk re-lay-out the whole page mid-render -- about 100ms a click
+        # on this page. If the canvas has no size yet the Configure that gives
+        # it one will call back in.
+        W = canvas.winfo_width()
+        H = canvas.winfo_height()
+        # Fall back to the requested size when Tk has not laid the canvas out
+        # yet -- asking for it costs nothing, where update_idletasks would
+        # force the whole page through a layout pass to find out.
+        if W <= 1:
+            W = canvas.winfo_reqwidth()
+        if H <= 1:
+            H = canvas.winfo_reqheight()
+        if W <= 1 or H <= 1:
+            return
+        W, H = max(W, 260), max(H, 150)
+        pad_l, pad_r, pad_t, pad_b = 46, 8, 10, 18
+
+        lo, hi = min(series), max(series)
+        if hi - lo < 1e-9:
+            hi = lo + 1.0
+        span = hi - lo
+
+        def x(i: int) -> float:
+            return pad_l + (W - pad_l - pad_r) * i / (len(series) - 1)
+
+        def y(v: float) -> float:
+            return pad_t + (H - pad_t - pad_b) * (1 - (v - lo) / span)
+
+        for frac in (0.0, 0.5, 1.0):
+            gy = pad_t + (H - pad_t - pad_b) * frac
+            canvas.create_line(pad_l, gy, W - pad_r, gy,
+                               fill=_blend(BORDER, BG_CARD, 0.5))
+            canvas.create_text(pad_l - 6, gy, anchor="e",
+                               text=f"${hi - span * frac:,.0f}",
+                               fill=TEXT_MUTED, font=(FONT_FAMILY, 7))
+
+        pts = [(x(i), y(v)) for i, v in enumerate(series)]
+        up = series[-1] >= series[0]
+        line = GREEN if up else RED
+        # Filled area under the line, drawn as one polygon down to the axis.
+        canvas.create_polygon(
+            [pad_l, H - pad_b] + [c for p in pts for c in p] + [W - pad_r, H - pad_b],
+            fill=_blend(line, BG_CARD, 0.85), outline="")
+        canvas.create_line([c for p in pts for c in p], fill=line, width=2,
+                           smooth=True)
+        canvas.create_oval(pts[-1][0] - 3, pts[-1][1] - 3,
+                           pts[-1][0] + 3, pts[-1][1] + 3,
+                           fill=line, outline="")
+
+    def _invest_ticket(self, parent: tk.Frame, fund) -> None:
+        box = tk.Frame(parent, bg=BG_HERO)
+        box.pack(fill="both", expand=True, padx=SP_LG, pady=SP_LG)
+
+        head = tk.Frame(box, bg=BG_HERO)
+        head.pack(fill="x")
+        tk.Label(head, text="ORDER TICKET", bg=BG_HERO, fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 9, "bold")).pack(side="left")
+        tk.Label(head,
+                 text="recommended" if self._etf_auto.get() else "your pick",
+                 bg=BG_HERO, fg=ACCENT,
+                 font=(FONT_FAMILY, 8, "bold")).pack(side="right")
+
+        amt = tk.Frame(box, bg=BG_HERO)
+        amt.pack(fill="x", pady=(SP_MD, 0))
+        tk.Label(amt, text="PER ACCOUNT", bg=BG_HERO, fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 8, "bold")).pack(side="left", padx=(0, 8))
+        ent = ttk.Entry(amt, width=9, font=(FONT_MONO, 10),
+                        textvariable=self._etf_target)
+        ent.pack(side="left")
+        ent.bind("<Return>", lambda e: self._set_invest_mode("target"))
+        PillButton(amt, text="Apply",
+                   command=lambda: self._set_invest_mode("target"),
+                   width=62, height=26, font_size=8).pack(side="left",
+                                                          padx=(6, 10))
+        self._make_chip(amt, "All available cash",
+                        lambda: self._set_invest_mode("max"),
+                        selected=(self._etf_mode == "max")).pack(side="left")
+
+        plan = getattr(self, "_etf_plan", None)
+        if plan is None or not plan.brokers:
+            tk.Label(box,
+                     text="No plan yet — pull balances and refresh prices.",
+                     bg=BG_HERO, fg=TEXT_MUTED,
+                     font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(SP_MD, 0))
+            return
+
+        tk.Frame(box, bg=_blend(BORDER, BG_HERO, 0.4), height=1).pack(
+            fill="x", pady=(SP_MD, SP_SM))
+
+        # Dollars first, shares second.
+        #
+        # The quantity is what execute_trade takes, not what anyone thinks in.
+        # "0.02686 shares into each of 20 accounts" is unreadable; "$20.69 into
+        # each of 20 accounts" is the same order and is immediately obvious.
+        # The share count still appears, in the small line underneath, next to
+        # the reason it is that number -- which is where the fractional rule
+        # gets explained in words rather than left to be inferred.
+        for bp in plan.brokers:
+            row = tk.Frame(box, bg=BG_HERO)
+            row.pack(fill="x", pady=(4, 0))
+            tk.Label(row, text=bp.broker.capitalize(), bg=BG_HERO,
+                     fg=TEXT_PRIMARY, font=(FONT_FAMILY, 10, "bold"),
+                     width=12, anchor="w").pack(side="left")
+            if not bp.actionable:
+                tk.Label(row, text=bp.skipped_reason or "nothing to do",
+                         bg=BG_HERO, fg=TEXT_MUTED,
+                         font=(FONT_FAMILY, 8)).pack(side="left")
+                continue
+
+            n = len(bp.participating)
+            tk.Label(row,
+                     text=f"${bp.per_account:,.2f} into each of {n} account"
+                          + ("s" if n != 1 else ""),
+                     bg=BG_HERO, fg=TEXT_SECONDARY,
+                     font=(FONT_FAMILY, 10), anchor="w").pack(side="left")
+            tk.Label(row, text=f"${bp.deployed:,.2f}", bg=BG_HERO, fg=GREEN,
+                     font=(FONT_MONO, 11, "bold")).pack(side="right")
+
+            if etf_plan.buys_fractional(bp.capability):
+                why = (f"{etf_plan.qty_text(bp.qty)} shares — buys fractions, "
+                       f"so the balance goes in whole")
+            else:
+                why = (f"{etf_plan.qty_text(bp.qty)} × ${bp.price:,.2f} — "
+                       f"whole shares only, "
+                       f"${bp.leftover_each:,.2f} stays in each account")
+            sub = tk.Frame(box, bg=BG_HERO)
+            sub.pack(fill="x")
+            tk.Label(sub, text=f"{'':12}{why}", bg=BG_HERO, fg=TEXT_MUTED,
+                     font=(FONT_FAMILY, 8), anchor="w").pack(side="left")
+            if bp.short:
+                tk.Label(sub, text=f"{len(bp.short)} account(s) short  ",
+                         bg=BG_HERO, fg=YELLOW,
+                         font=(FONT_FAMILY, 8)).pack(side="right")
+
+        for bp in plan.brokers:
+            if bp.advisory:
+                tk.Label(box, text=f"{icon('warning')} {bp.advisory}",
+                         bg=BG_HERO, fg=YELLOW, font=(ICON_FONT, 8),
+                         wraplength=430, justify="left").pack(anchor="w",
+                                                              pady=(4, 0))
+
+        tk.Frame(box, bg=_blend(BORDER, BG_HERO, 0.4), height=1).pack(
+            fill="x", pady=(SP_SM, SP_SM))
+        tot = tk.Frame(box, bg=BG_HERO)
+        tot.pack(fill="x")
+        tk.Label(tot, text="TOTAL", bg=BG_HERO, fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 9, "bold")).pack(side="left")
+        tk.Label(tot, text=f"${plan.deployed:,.2f}", bg=BG_HERO,
+                 fg=GREEN if plan.deployed > 0 else TEXT_MUTED,
+                 font=(FONT_MONO, 22, "bold")).pack(side="right")
+        tk.Label(box,
+                 text=f"{plan.account_count} account(s) · "
+                      f"${plan.idle:,.2f} stays in cash"
+                      + (f" · {plan.short_count} short"
+                         if plan.short_count else ""),
+                 bg=BG_HERO, fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 9)).pack(anchor="e")
+
+        act = tk.Frame(box, bg=BG_HERO)
+        act.pack(fill="x", pady=(SP_MD, 0))
+        tk.Checkbutton(act, text=" Dry run", variable=self._etf_dry,
+                       bg=BG_HERO, fg=TEXT_SECONDARY, activebackground=BG_HERO,
+                       activeforeground=TEXT_PRIMARY, selectcolor=BG_INPUT,
+                       highlightthickness=0, bd=0,
+                       font=(FONT_FAMILY, 9)).pack(side="left")
+        if plan.actionable:
+            PillButton(act, text="Review & Buy", command=self._invest_execute,
+                       width=150, height=36,
+                       font_size=10).pack(side="right")
+
+    def _set_invest_mode(self, mode: str) -> None:
+        self._etf_mode = mode
+        self._render_invest("picker", "detail")
+
+    # ---- 4. cash per account ----
+
+    def _render_invest_cash(self) -> None:
+        """Cash by broker, collapsed.
+
+        One row per account is 62 rows on this fleet, and every widget is a
+        round-trip to Tcl -- 283 of them, about half a second, rebuilt on every
+        balance change. It was also more than anyone needs to see at once: the
+        useful facts are the per-broker total and which accounts have no figure
+        yet. Brokers open on click, so the detail is one tap away and costs
+        nothing until asked for.
+        """
+        holder = self._invest_section("cash")
+        if holder is None:
+            return
+        box = holder
+
+        t = balances.totals()
+        head = tk.Frame(box, bg=BG_CARD)
+        head.pack(fill="x")
+        tk.Label(head, text=f"{icon('brokers')}  CASH BY ACCOUNT", bg=BG_CARD,
+                 fg=ACCENT, font=(ICON_FONT, 10, "bold")).pack(side="left")
+        tk.Label(head, text=f"${t['total']:,.2f}", bg=BG_CARD, fg=TEXT_PRIMARY,
+                 font=(FONT_MONO, 12, "bold")).pack(side="right")
+
+        rows = balances.rows()
+        if not rows:
+            self._empty_state(box, "info", "No accounts on record",
+                              "Pull balances to see what each account holds.",
+                              bg=BG_CARD).pack(fill="x")
+            return
+
+        by_broker: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            by_broker.setdefault(r["broker"], []).append(r)
+
+        for broker in sorted(by_broker):
+            self._invest_broker_row(box, broker, by_broker[broker],
+                                    t["by_broker"].get(broker))
+
+    def _invest_broker_row(self, parent: tk.Frame, broker: str,
+                           accounts: List[Dict[str, Any]],
+                           subtotal: Optional[float]) -> None:
+        open_ = broker in self._invest_expanded
+        head = tk.Frame(parent, bg=BG_CARD, cursor="hand2")
+        head.pack(fill="x", pady=(SP_SM, 0))
+
+        chev = tk.Label(head, text=icon("chevdown" if open_ else "chevright"),
+                        bg=BG_CARD, fg=TEXT_MUTED, font=(ICON_FONT, 9))
+        chev.pack(side="left", padx=(0, 6))
+        name = tk.Label(head, text=broker.capitalize(), bg=BG_CARD,
+                        fg=TEXT_PRIMARY, font=(FONT_FAMILY, 10, "bold"),
+                        width=12, anchor="w")
+        name.pack(side="left")
+
+        cap = etf_plan.capability_for(broker)
+        kind = tk.Label(head,
+                        text=("buys fractions" if etf_plan.buys_fractional(cap)
+                              else "whole shares only"),
+                        bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
+                        width=18, anchor="w")
+        kind.pack(side="left")
+
+        missing = sum(1 for a in accounts if a["cash"] is None)
+        note = tk.Label(
+            head,
+            text=(f"{len(accounts)} account" + ("s" if len(accounts) != 1 else "")
+                  + (f"   ·   {missing} need a figure" if missing else "")),
+            bg=BG_CARD, fg=YELLOW if missing else TEXT_SECONDARY,
+            font=(FONT_FAMILY, 9), anchor="w")
+        note.pack(side="left")
+        total = tk.Label(head,
+                         text=f"${subtotal:,.2f}" if subtotal is not None else "—",
+                         bg=BG_CARD,
+                         fg=TEXT_PRIMARY if subtotal else TEXT_MUTED,
+                         font=(FONT_MONO, 10, "bold"))
+        total.pack(side="right")
+
+        for w in (head, chev, name, kind, note, total):
+            w.bind("<Button-1>", lambda e, b=broker: self._invest_toggle_broker(b))
+
+        if not open_:
+            return
+        for r in accounts:
+            self._invest_cash_row(parent, r)
+
+    def _invest_toggle_broker(self, broker: str) -> None:
+        if broker in self._invest_expanded:
+            self._invest_expanded.discard(broker)
+        else:
+            self._invest_expanded.add(broker)
+        self._render_invest("cash")
+
+    def _invest_cash_row(self, parent: tk.Frame, r: Dict[str, Any]) -> None:
+        """One account, as flat labels.
+
+        Deliberately not an Entry per row -- a live entry widget for every
+        account was 62 of them, and every widget is a Tcl round-trip. Click a
+        row to edit it and exactly one Entry exists, for as long as you are
+        typing in it.
+        """
+        row = tk.Frame(parent, bg=BG_CARD, cursor="hand2")
+        row.pack(fill="x", pady=1)
+        who = tk.Label(row, text=f"      {r['account_id']}", bg=BG_CARD,
+                       fg=TEXT_SECONDARY, font=(FONT_FAMILY, 9), anchor="w",
+                       width=42)
+        who.pack(side="left")
+
+        amount = tk.Label(
+            row, text=("tap to enter" if r["cash"] is None
+                       else f"${r['cash']:,.2f}"),
+            bg=BG_CARD,
+            fg=YELLOW if r["cash"] is None else (
+                ACCENT if r["source"] == balances.SOURCE_MANUAL
+                else TEXT_PRIMARY),
+            font=(FONT_MONO, 9), width=13, anchor="w")
+        amount.pack(side="left")
+
+        if r["source"] == balances.SOURCE_MANUAL and r["live_cash"] is not None:
+            tk.Label(row, text=f"you entered · live ${r['live_cash']:,.2f}",
+                     bg=BG_CARD, fg=TEXT_MUTED,
+                     font=(FONT_FAMILY, 8)).pack(side="left")
+
+        for w in (row, who, amount):
+            w.bind("<Button-1>",
+                   lambda e, b=r["broker"], a=r["account_id"], amt=amount,
+                   cur=r["cash"]: self._invest_edit_cash(amt, b, a, cur))
+
+    def _invest_edit_cash(self, label: tk.Label, broker: str, account_id: str,
+                          current: Optional[float]) -> None:
+        """Swap one label for an entry, in place, until it loses focus."""
+        if getattr(self, "_invest_editing", None) is not None:
+            try:
+                self._invest_editing.destroy()
+            except Exception:
+                pass
+        var = tk.StringVar(value="" if current is None else f"{current:.2f}")
+        ent = ttk.Entry(label.master, width=12, font=(FONT_MONO, 9),
+                        textvariable=var)
+        label.pack_forget()
+        ent.pack(side="left")
+        ent.focus_set()
+        ent.select_range(0, "end")
+        self._invest_editing = ent
+
+        def _commit(_e=None, quiet: bool = False) -> None:
+            if getattr(self, "_invest_editing", None) is not ent:
+                return
+            self._invest_editing = None
+            text = var.get()
+            try:
+                ent.destroy()
+            except Exception:
+                pass
+            self._invest_set_cash(broker, account_id, text, quiet=quiet)
+
+        def _cancel(_e=None) -> None:
+            self._invest_editing = None
+            try:
+                ent.destroy()
+            except Exception:
+                pass
+            self._render_invest("cash")
+
+        ent.bind("<Return>", _commit)
+        ent.bind("<FocusOut>", lambda e: _commit(quiet=True))
+        ent.bind("<Escape>", _cancel)
+
+    def _invest_set_cash(self, broker: str, account_id: str, raw: str,
+                         quiet: bool = False) -> None:
+        text = str(raw).replace("$", "").replace(",", "").strip()
+        if not text:
+            return
+        try:
+            val = float(text)
+            if val < 0:
+                raise ValueError
+        except ValueError:
+            if not quiet:
+                self._push_notification(f"'{raw}' is not an amount", "warning")
+            return
+        cur = next((r for r in balances.rows()
+                    if r["broker"] == broker and r["account_id"] == account_id),
+                   None)
+        if cur and cur["cash"] is not None and abs(cur["cash"] - val) < 0.005:
+            return                      # unchanged; don't stamp it as manual
+        balances.set_manual(broker, account_id, val)
+        self._render_invest("pull", "cash", "picker", "detail")
+
+    def _invest_clear_cash(self, broker: str, account_id: str) -> None:
+        balances.clear_manual(broker, account_id)
+        self._render_invest("pull", "cash", "picker", "detail")
+
+    # ---- 5. what you already own ----
+
+    def _render_invest_holdings(self) -> None:
+        holder = self._invest_section("holdings")
+        if holder is None:
+            return
+        box = holder
+
+        s = etf_journal.summary(self._etf_quotes)
+        head = tk.Frame(box, bg=BG_CARD)
+        head.pack(fill="x")
+        tk.Label(head, text=f"{icon('positions')}  YOUR INVESTMENTS",
+                 bg=BG_CARD, fg=ACCENT,
+                 font=(ICON_FONT, 10, "bold")).pack(side="left")
+        if s["symbols"]:
+            pl = s["pl"]
+            tk.Label(head,
+                     text=f"${s['market_value']:,.2f}   ({pl:+,.2f}"
+                          + (f" · {s['pl_pct']:+.2f}%"
+                             if s["pl_pct"] is not None else "") + ")",
+                     bg=BG_CARD, fg=GREEN if pl >= 0 else RED,
+                     font=(FONT_MONO, 12, "bold")).pack(side="right")
+
+        if not s["symbols"]:
+            self._empty_state(
+                box, "pie", "Nothing invested yet",
+                "Anything you buy here is tracked separately from the "
+                "reverse-split journal.", bg=BG_CARD).pack(fill="x")
+            return
+
+        # Unrealized, and that is the correct measure HERE -- the opposite of
+        # the rule two pages over. A held ETF is worth its market value; an RSA
+        # play is worth nothing until it is sold. The two are never added.
+        tk.Label(box, text="Market value against cost — unrealized.",
+                 bg=BG_CARD, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(2, SP_SM))
+
+        hdr = tk.Frame(box, bg=BG_CARD)
+        hdr.pack(fill="x")
+        for text, w in (("SYMBOL", 10), ("SHARES", 12), ("AVG COST", 12),
+                        ("PRICE", 12), ("VALUE", 14), ("P/L", 18)):
+            tk.Label(hdr, text=text, bg=BG_CARD, fg=TEXT_MUTED,
+                     font=(FONT_FAMILY, 8, "bold"), width=w,
+                     anchor="w").pack(side="left")
+        tk.Frame(box, bg=BORDER, height=1).pack(fill="x", pady=(3, 4))
+
+        for r in s["positions"]:
+            row = tk.Frame(box, bg=BG_CARD)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=r["symbol"], bg=BG_CARD, fg=TEXT_PRIMARY,
+                     font=(FONT_MONO, 10, "bold"), width=10,
+                     anchor="w").pack(side="left")
+            tk.Label(row, text=f"{r['qty']:,.5f}".rstrip("0").rstrip("."),
+                     bg=BG_CARD, fg=TEXT_SECONDARY, font=(FONT_MONO, 10),
+                     width=12, anchor="w").pack(side="left")
+            tk.Label(row, text=f"${r['avg_cost']:,.2f}", bg=BG_CARD,
+                     fg=TEXT_SECONDARY, font=(FONT_MONO, 10), width=12,
+                     anchor="w").pack(side="left")
+            if r["price"] is None:
+                tk.Label(row, text="no quote", bg=BG_CARD, fg=TEXT_MUTED,
+                         font=(FONT_FAMILY, 9), width=12,
+                         anchor="w").pack(side="left")
+                tk.Label(row, text="—", bg=BG_CARD, fg=TEXT_MUTED,
+                         font=(FONT_MONO, 10), width=14,
+                         anchor="w").pack(side="left")
+            else:
+                tk.Label(row, text=f"${r['price']:,.2f}", bg=BG_CARD,
+                         fg=TEXT_SECONDARY, font=(FONT_MONO, 10), width=12,
+                         anchor="w").pack(side="left")
+                tk.Label(row, text=f"${r['market_value']:,.2f}", bg=BG_CARD,
+                         fg=TEXT_PRIMARY, font=(FONT_MONO, 10), width=14,
+                         anchor="w").pack(side="left")
+                tk.Label(row,
+                         text=f"{r['pl']:+,.2f}"
+                              + (f"  ({r['pl_pct']:+.2f}%)"
+                                 if r["pl_pct"] is not None else ""),
+                         bg=BG_CARD, fg=GREEN if r["pl"] >= 0 else RED,
+                         font=(FONT_MONO, 10, "bold"),
+                         anchor="w").pack(side="left")
+            tk.Label(row, text=f"  {r['accounts']} acct(s)", bg=BG_CARD,
+                     fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).pack(side="right")
+
+        if s["unquoted"]:
+            tk.Label(box,
+                     text=f"No quote for {', '.join(s['unquoted'])} — their "
+                          f"cost is counted but their value is not, so the "
+                          f"total above is partial.",
+                     bg=BG_CARD, fg=YELLOW, font=(FONT_FAMILY, 8),
+                     wraplength=820, justify="left").pack(anchor="w",
+                                                          pady=(SP_SM, 0))
+        if s["unpriced_buys"]:
+            tk.Label(box,
+                     text=f"{s['unpriced_buys']} buy(s) recorded with no fill "
+                          f"price contribute no cost basis, so the profit "
+                          f"above is overstated by whatever they cost.",
+                     bg=BG_CARD, fg=YELLOW, font=(FONT_FAMILY, 8),
+                     wraplength=820, justify="left").pack(anchor="w",
+                                                          pady=(4, 0))
+
+    # ---- execution ----
+
+    def _invest_execute(self) -> None:
+        plan = getattr(self, "_etf_plan", None)
+        fund = getattr(self, "_etf_fund", None)
+        if plan is None or fund is None or not plan.actionable:
+            return
+        if getattr(self, "_invest_in_flight", 0):
+            self._push_notification("An invest run is already going.", "warning")
+            return
+        dry = bool(self._etf_dry.get())
+
+        legs = plan.actionable
+        body = "\n".join(
+            f"{bp.broker.capitalize()}: BUY {etf_plan.qty_text(bp.qty)} "
+            f"{bp.ticker} on {len(bp.participating)} account(s) "
+            f"— ${bp.deployed:,.2f}" for bp in legs)
+        if not messagebox.askyesno(
+                "Dry run" if dry else "Invest",
+                f"{fund.symbol} — {fund.name}\n\n{body}\n\n"
+                f"Total: ${plan.deployed:,.2f} across "
+                f"{plan.account_count} account(s)."
+                + ("\n\nDry run — no order will be placed."
+                   if dry else "\n\nThis places real orders."),
+                parent=self):
+            return
+
+        # One batch per distinct (ticker, qty): every broker in a group takes
+        # the same order, and execute_trade fans it out to that broker's
+        # accounts itself.
+        groups: Dict[tuple, List] = {}
+        for bp in legs:
+            groups.setdefault((bp.ticker, etf_plan.qty_text(bp.qty)), []).append(bp)
+
+        plan_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+        self._invest_in_flight = len(groups)
+
+        for (ticker, qty), members in groups.items():
+            brokers = sorted(bp.broker for bp in members)
+            batch = {
+                "pending": set(brokers),
+                "all_brokers": brokers,
+                "results": [],
+                "side": "buy",
+                "symbol": ticker,
+                "qty": qty,
+                "dry_run": dry,
+                "origin": "etf",
+                "exposure": fund.exposure,
+                "plan_id": plan_id,
+                "finished": False,
+                "started": datetime.now(),
+            }
+            self._live_start(batch)
+            self._log(f"Invest: BUY {qty} {ticker} on {', '.join(brokers)}"
+                      + (" (dry run)" if dry else ""))
+            for broker in brokers:
+                self._run_in_thread(self._trade_worker, broker, "buy", ticker,
+                                    qty, dry, batch)
+
+    def _invest_batch_done(self) -> None:
+        """One ETF batch landed. See the comment in _trade_batch_finish for
+        why this does not borrow the desk's _trade_in_flight flag."""
+        self._invest_in_flight = max(0, getattr(self, "_invest_in_flight", 0) - 1)
+        if self._invest_in_flight == 0:
+            self._invalidate_page("invest")
+            if self._frames.get("invest") is not None:
+                self._render_invest("holdings", "detail")
 
     # ---- Holdings ---------------------------------------------------------
 
@@ -4766,7 +6092,8 @@ class App(ctk.CTk):
         if c is None:
             return
         c.delete("all")
-        c.update_idletasks()
+        # No update_idletasks(): see _draw_equity_curve. The `or 320` below
+        # already covers a canvas that has not been sized yet.
         w = c.winfo_width() or 320
         h = c.winfo_height() or 320
         positions = getattr(self, "_alloc_positions", [])
@@ -4967,6 +6294,14 @@ class App(ctk.CTk):
             width=140, height=36, font_size=10)
         self._trade_execute_btn.pack(side="left")
 
+        # Which brokers are mid-order. Orders now overlap — one ticket per
+        # broker, several tickets at once — so the desk has to say which chips
+        # are already spoken for instead of just greying out Execute.
+        self._trade_busy_lbl = tk.Label(action_frame, text="", bg=BG_CARD,
+                                        fg=YELLOW, font=(FONT_FAMILY, 9),
+                                        justify="left", wraplength=420)
+        self._trade_busy_lbl.pack(side="left", padx=(14, 0))
+
         # result area
         result_card = RoundedFrame(frame, bg_color=BG_CARD, border_color=BORDER, radius=14)
         result_card.pack(fill="both", expand=True)
@@ -4992,6 +6327,24 @@ class App(ctk.CTk):
             "banner_ok", foreground=GREEN, font=(FONT_MONO, 13, "bold"))
         self._trade_result.tag_configure(
             "banner_err", foreground=RED, font=(FONT_MONO, 13, "bold"))
+
+    def _refresh_trade_busy(self) -> None:
+        """Say which brokers are mid-order, and how many tickets are in the air.
+
+        Cheap and idempotent — called on every launch and on every broker that
+        lands, from the Tk thread only.
+        """
+        lbl = getattr(self, "_trade_busy_lbl", None)
+        if lbl is None:
+            return
+        busy = sorted(getattr(self, "_brokers_in_flight", set()))
+        if not busy:
+            lbl.configure(text="")
+            return
+        names = ", ".join(rsa_feed.normalize_broker(b) for b in busy)
+        n_ops = len(getattr(self, "_live_batches", []))
+        ops = f"{n_ops} orders running" if n_ops > 1 else "order running"
+        lbl.configure(text=f"{ops} · {names} busy — any other broker is free")
 
     def _toggle_broker_chip(self, broker: str) -> None:
         chip = self._trade_broker_chips[broker]
@@ -5033,16 +6386,6 @@ class App(ctk.CTk):
                 text=f"{n_accts} account{plural} × {qty:g} sh — no public quote")
 
     def _trade_execute(self) -> None:
-        # --- Double-submit guard -------------------------------------------
-        # Every click used to fire a brand-new order batch, so an impatient
-        # second click = a duplicate BUY/SELL (this is what double-sold AIFA on
-        # Robinhood). Refuse a new batch while one is still running.
-        if getattr(self, "_trade_in_flight", False):
-            self._push_notification(
-                "A trade is already running — wait for it to finish.", "warning")
-            self._log("Trade: ignored — a batch is already in flight", "warn")
-            return
-
         selected = list(self._trade_selected_brokers)
         side = self._trade_side.get()
         symbol = self._trade_symbol.get().strip().upper()
@@ -5051,6 +6394,23 @@ class App(ctk.CTk):
 
         if not selected:
             messagebox.showwarning("No broker", "Select at least one broker.")
+            return
+
+        # --- Duplicate-order guard, per broker ------------------------------
+        # Every click used to fire a brand-new batch, so an impatient second
+        # click = a duplicate BUY/SELL (this is what double-sold AIFA on
+        # Robinhood). Refusing *any* second order was too blunt, though: a sell
+        # at Fidelity and a different sell at Robinhood are two unrelated
+        # sessions and can run side by side. So only the overlap is refused —
+        # which still catches the double-click, because the same ticket names
+        # the same brokers.
+        busy = sorted(set(selected) & getattr(self, "_brokers_in_flight", set()))
+        if busy:
+            names = ", ".join(rsa_feed.normalize_broker(b) for b in busy)
+            self._push_notification(
+                f"{names} {'is' if len(busy) == 1 else 'are'} already running an "
+                f"order — wait, or deselect and send the rest.", "warning")
+            self._log(f"Trade: ignored — {names} mid-order", "warn")
             return
         if not symbol:
             messagebox.showwarning("Missing field", "Enter a symbol.")
@@ -5095,13 +6455,14 @@ class App(ctk.CTk):
         }
         self._trade_batch = batch
 
-        # Lock the button + flag so a second click can't fire a duplicate order.
+        # Flag stays for the automation schedulers (mirror / auto-sell wait for a
+        # fully idle app). The button is NOT disabled any more — the per-broker
+        # guard above is what stops a duplicate, and disabling it would also stop
+        # the legitimate second ticket at a different broker.
         self._trade_in_flight = True
-        if hasattr(self, "_trade_execute_btn"):
-            self._trade_execute_btn.configure(state="disabled")
-            self._trade_execute_btn.configure_text("Executing…")
 
-        # Live "operation in progress" strip on the Activity page.
+        # Live "operation in progress" strip on the Activity page. Also claims
+        # these brokers, so the next click can only use the others.
         self._live_start(batch)
 
         # launch one thread per broker in parallel
@@ -5291,13 +6652,30 @@ class App(ctk.CTk):
                     # account -- not an execution. Recording that honestly is
                     # what stops nine orders spread over seven minutes reading
                     # as nine fills at an identical price.
-                    trade_journal.record_trade(
-                        broker=broker, account_id=acct.account_id,
-                        side=side, symbol=symbol, qty=float(qty),
-                        fill_price=fill_price,
-                        order_id=getattr(acct, "order_id", None),
-                        price_source=trade_journal.PRICE_QUOTE,
-                    )
+                    #
+                    # An ETF buy goes to its own journal. This one branch is
+                    # the only thing keeping investment rows out of
+                    # trades.json, and trades.json is what cloud_sync uploads
+                    # to the public Plays board -- see etf_journal's module
+                    # docstring. Tested in tests/test_etf_journal.py.
+                    if batch.get("origin") == "etf":
+                        etf_journal.record_trade(
+                            broker=broker, account_id=acct.account_id,
+                            side=side, symbol=symbol, qty=float(qty),
+                            fill_price=fill_price,
+                            order_id=getattr(acct, "order_id", None),
+                            price_source=etf_journal.PRICE_QUOTE,
+                            exposure=str(batch.get("exposure") or ""),
+                            plan_id=str(batch.get("plan_id") or ""),
+                        )
+                    else:
+                        trade_journal.record_trade(
+                            broker=broker, account_id=acct.account_id,
+                            side=side, symbol=symbol, qty=float(qty),
+                            fill_price=fill_price,
+                            order_id=getattr(acct, "order_id", None),
+                            price_source=trade_journal.PRICE_QUOTE,
+                        )
 
             if fill_price is not None:
                 lines.append(f"  Quoted price: ${fill_price:.2f}")
@@ -5339,8 +6717,12 @@ class App(ctk.CTk):
             else:
                 self.after(0, lambda b=broker, s=output.state, n=ok_accounts: self._log(f"Trade: {b} -> {s} ({n} account{'s' if n != 1 else ''})", "success"))
 
-            # Refresh Quick Picks to move purchased picks to the Purchased section
-            if any(acct.ok for acct in output.accounts) and not dry_run:
+            # Refresh Quick Picks to move purchased picks to the Purchased
+            # section. An ETF buy has nothing to do with the RSA pick list and
+            # is not in the journal it reads, so redrawing it there would be
+            # churn on a page the user is not even looking at.
+            if (any(acct.ok for acct in output.accounts) and not dry_run
+                    and batch.get("origin") != "etf"):
                 self.after(0, lambda: self._render_quick_picks(self._quick_picks))
         except Exception as e:
             summary["errors"].append(str(e))
@@ -5365,6 +6747,11 @@ class App(ctk.CTk):
             return
         batch["results"].append(summary)
         batch["pending"].discard(summary["broker"])
+        # Free this broker the moment IT lands, not when the slowest one does:
+        # Robinhood taking 4s shouldn't wait on Fidelity's browser to finish
+        # before it can take the next ticket.
+        self._brokers_in_flight.discard(summary["broker"])
+        self._refresh_trade_busy()
         # Persist the leg as it lands, not at the end: a crash or a force-quit
         # mid-fan-out then still leaves the brokers that did report on disk.
         if batch.get("mirror_run"):
@@ -5502,11 +6889,28 @@ class App(ctk.CTk):
         # Every origin that SET the flag must clear it. An exit batch takes the
         # same guard as a desk order, so missing it here would leave the app
         # unable to trade at all until restart.
-        if batch.get("origin") in ("desk", "exit"):
-            self._trade_in_flight = False
-            if hasattr(self, "_trade_execute_btn"):
-                self._trade_execute_btn.configure(state="normal")
-                self._trade_execute_btn.configure_text("Execute Trade")
+        # Belt and braces: a broker that somehow never reported still gets
+        # released here, so one lost thread can't wedge its chip forever.
+        for b in batch.get("all_brokers") or []:
+            self._brokers_in_flight.discard(b)
+        self._refresh_trade_busy()
+
+        # The flag means "some broker is mid-order", so it is recomputed for
+        # EVERY origin rather than cleared by the desk alone. Batches overlap
+        # now: the first to land must not report an idle app to the mirror /
+        # auto-sell schedulers while the second is still executing, and a mirror
+        # leg landing last must still be able to clear it — a flag only one
+        # origin can reset is a flag that eventually sticks True until restart.
+        self._trade_in_flight = bool(self._brokers_in_flight)
+        if hasattr(self, "_trade_execute_btn") and not self._trade_in_flight:
+            self._trade_execute_btn.configure(state="normal")
+            self._trade_execute_btn.configure_text("Execute Trade")
+
+        if batch.get("origin") == "etf":
+            # An invest run is more than one batch -- the fractional brokers buy
+            # SPY while the whole-share ones buy SCHX -- and the invest page has
+            # its own counter so it only re-renders when the LAST one lands.
+            self._invest_batch_done()
 
     # ---- Stats ------------------------------------------------------------
 
@@ -5522,18 +6926,7 @@ class App(ctk.CTk):
         cw = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(cw, width=e.width))
         canvas.pack(fill="both", expand=True)
-
-        def _stats_mousewheel(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-
-        def _stats_enter(e):
-            canvas.bind_all("<MouseWheel>", _stats_mousewheel)
-
-        def _stats_leave(e):
-            canvas.unbind_all("<MouseWheel>")
-
-        frame.bind("<Enter>", _stats_enter)
-        frame.bind("<Leave>", _stats_leave)
+        self._attach_wheel(canvas, frame)
 
         self._stats_scroll_frame = scroll_frame
 
@@ -5566,13 +6959,55 @@ class App(ctk.CTk):
         for period_val, period_label in [
             ("week", "This Week"), ("month", "This Month"),
             ("last_month", "Last Month"), ("year", "This Year"),
-            ("all", "All Time"),
+            ("all", "All Time"), ("custom", "Custom Range"),
         ]:
             chip = self._make_chip(top_bar, period_label,
                                    lambda pv=period_val: self._set_stats_period(pv),
                                    selected=(period_val == "all"))
             chip.pack(side="left", padx=(0, 6))
             self._stats_period_chips[period_val] = chip
+
+        # ---- Custom date range -----------------------------------------
+        # The fixed chips answer "how are we doing lately"; this answers the
+        # other question that keeps getting asked — what a *particular* run
+        # made, which is a handful of days somewhere in the past and never
+        # a calendar month. Packed only while Custom Range is the live
+        # selection, so it is not a permanent row of empty boxes.
+        self._range_row = RoundedFrame(scroll_frame, bg_color=BG_CARD,
+                                       border_color=_blend(ACCENT, BORDER, 0.5),
+                                       radius=RAD_MD)
+        rr = tk.Frame(self._range_row.inner, bg=BG_CARD)
+        rr.pack(fill="x", padx=SP_XL, pady=SP_MD)
+
+        tk.Label(rr, text=f"{icon('calendar')}  PROFIT BETWEEN", bg=BG_CARD,
+                 fg=ACCENT, font=(ICON_FONT, 9, "bold")).pack(side="left",
+                                                              padx=(0, 12))
+        today = date.today()
+        self._range_from = ttk.Entry(rr, width=12, font=(FONT_MONO, 10))
+        self._range_from.insert(0, (today - timedelta(days=30)).isoformat())
+        self._range_from.pack(side="left")
+        tk.Label(rr, text="to", bg=BG_CARD, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 9)).pack(side="left", padx=8)
+        self._range_to = ttk.Entry(rr, width=12, font=(FONT_MONO, 10))
+        self._range_to.insert(0, today.isoformat())
+        self._range_to.pack(side="left", padx=(0, 10))
+        for ent in (self._range_from, self._range_to):
+            ent.bind("<Return>", lambda e: self._apply_stats_range())
+        PillButton(rr, text="Apply", command=self._apply_stats_range,
+                   width=72, height=28, font_size=9).pack(side="left",
+                                                          padx=(0, 14))
+
+        # Shortcuts for the ranges actually asked for, so the common cases
+        # do not need two dates typed by hand.
+        for label, days in [("Today", 0), ("7d", 6), ("30d", 29), ("90d", 89)]:
+            PillButton(rr, text=label,
+                       command=lambda d=days: self._set_stats_range_days(d),
+                       width=52, height=26, font_size=8, bg_color=BG_CARD_ALT,
+                       hover_color=ACCENT).pack(side="left", padx=(0, 5))
+
+        self._range_note = tk.Label(rr, text="", bg=BG_CARD, fg=TEXT_MUTED,
+                                    font=(FONT_FAMILY, 9))
+        self._range_note.pack(side="right")
 
         # ================================================================
         # HERO P/L CARD — big prominent realized profit number
@@ -5581,6 +7016,10 @@ class App(ctk.CTk):
                                  border_color=_blend(ACCENT, BORDER, 0.55),
                                  radius=16)
         hero_card.pack(fill="x", pady=(0, 14))
+        # The range row slots in above this one when Custom Range is picked,
+        # so it reads as a filter on the number below rather than a footnote
+        # at the bottom of the page.
+        self._range_before = hero_card
         for t in (0.45, 0.62, 0.75, 0.85, 0.93, 0.98):
             tk.Frame(hero_card.inner, bg=_blend(ACCENT, BG_HERO, t),
                      height=2).pack(fill="x")
@@ -5640,6 +7079,40 @@ class App(ctk.CTk):
         self._cov_lines.pack(fill="x", pady=(8, 0))
 
         # ================================================================
+        # INVESTMENTS — the ETF side, kept apart on purpose
+        # ================================================================
+        # Deliberately its own card, below the hero and never inside it. The
+        # number above is REALIZED profit on reverse-split plays; the number
+        # here is UNREALIZED market value on long-held ETFs. Both are correct
+        # measures of different things, and adding them would produce a figure
+        # that is true of nothing -- which is the mistake the rest of this page
+        # is built to avoid. Packed only when there is something invested, so
+        # it is not permanent furniture for a user who never opens Invest.
+        self._inv_card = RoundedFrame(scroll_frame, bg_color=BG_CARD,
+                                      border_color=BORDER, radius=RAD_MD)
+        inv_body = tk.Frame(self._inv_card.inner, bg=BG_CARD)
+        inv_body.pack(fill="x", padx=SP_XL, pady=SP_LG)
+        inv_head = tk.Frame(inv_body, bg=BG_CARD)
+        inv_head.pack(fill="x")
+        tk.Label(inv_head, text=f"{icon('pie')}  INVESTMENTS", bg=BG_CARD,
+                 fg=ACCENT, font=(ICON_FONT, 10, "bold")).pack(side="left")
+        tk.Label(inv_head, text="Unrealized — separate from the figure above",
+                 bg=BG_CARD, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, FS_MICRO)).pack(side="right")
+        inv_grid = tk.Frame(inv_body, bg=BG_CARD)
+        inv_grid.pack(fill="x", pady=(SP_MD, 0))
+        for i in range(4):
+            inv_grid.columnconfigure(i, weight=1, uniform="inv")
+        self._inv_cost = self._make_kpi_tile(inv_grid, "INVESTED", "what it cost", 0, 0)
+        self._inv_value = self._make_kpi_tile(inv_grid, "MARKET VALUE", "what it is worth now", 0, 1)
+        self._inv_pl = self._make_kpi_tile(inv_grid, "UNREALIZED P/L", "value minus cost", 0, 2)
+        self._inv_holdings = self._make_kpi_tile(inv_grid, "HOLDINGS", "ETFs held", 0, 3)
+        self._inv_note = tk.Label(inv_body, text="", bg=BG_CARD, fg=TEXT_MUTED,
+                                  font=(FONT_FAMILY, 8), justify="left",
+                                  wraplength=820)
+        self._inv_note.pack(anchor="w", pady=(SP_SM, 0))
+
+        # ================================================================
         # RISK & PERFORMANCE METRICS — quant KPI tiles
         # ================================================================
         adv_card = RoundedFrame(scroll_frame, bg_color=BG_CARD, border_color=BORDER, radius=RAD_MD)
@@ -5648,6 +7121,7 @@ class App(ctk.CTk):
         # report. Held as a reference so it lands under the hero rather than at
         # the foot of the page.
         self._cov_before = adv_card
+        self._inv_before = adv_card
 
         adv_head = tk.Frame(adv_card.inner, bg=BG_CARD)
         adv_head.pack(fill="x", padx=SP_XL, pady=(SP_LG, SP_SM))
@@ -6016,6 +7490,10 @@ class App(ctk.CTk):
         self._daily_pl_canvas.bind("<Configure>", _on_chart_resize)
         self._dist_canvas.bind("<Configure>", _on_chart_resize)
 
+        # Every table on this page scrolls itself first and only hands the
+        # wheel back to the page once it has run out of rows.
+        self._claim_wheel_below(scroll_frame, canvas)
+
         # Initial load
         self.after(200, self._refresh_stats)
 
@@ -6056,7 +7534,68 @@ class App(ctk.CTk):
         self._stats_period.set(period)
         for pv, chip in self._stats_period_chips.items():
             self._style_chip(chip, pv == period)
+        if period == "custom":
+            self._range_row.pack(fill="x", pady=(0, 14),
+                                 before=self._range_before)
+        else:
+            self._range_row.pack_forget()
         self._refresh_stats()
+
+    # ---- Custom analytics date range ---------------------------------------
+
+    @staticmethod
+    def _parse_date_input(text: str):
+        """Read a typed day. Accepts the ISO the boxes are seeded with, plus
+        the shapes people actually type (6/18/26, 06-18-2026)."""
+        text = (text or "").strip()
+        if not text:
+            return None
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
+                    "%Y/%m/%d", "%b %d %Y", "%d %b %Y"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    def _stats_range(self):
+        """The selected custom range as (from_date, to_date), or None if what
+        is in the boxes cannot be read as two days."""
+        if not hasattr(self, "_range_from"):
+            return None
+        lo = self._parse_date_input(self._range_from.get())
+        hi = self._parse_date_input(self._range_to.get())
+        if not lo or not hi:
+            return None
+        return (hi, lo) if lo > hi else (lo, hi)
+
+    def _set_stats_range_days(self, days: int) -> None:
+        """Fill the boxes with the last N days, ending today, and apply."""
+        today = date.today()
+        self._range_from.delete(0, tk.END)
+        self._range_from.insert(0, (today - timedelta(days=days)).isoformat())
+        self._range_to.delete(0, tk.END)
+        self._range_to.insert(0, today.isoformat())
+        self._apply_stats_range()
+
+    def _apply_stats_range(self) -> None:
+        rng = self._stats_range()
+        if rng is None:
+            self._range_note.configure(
+                text="Enter two dates as YYYY-MM-DD", fg=RED)
+            return
+        lo, hi = rng
+        # Write the pair back normalised, so a swapped or loosely typed range
+        # shows what actually got applied instead of leaving the boxes
+        # disagreeing with the number above them.
+        for ent, d in ((self._range_from, lo), (self._range_to, hi)):
+            ent.delete(0, tk.END)
+            ent.insert(0, d.isoformat())
+        self._range_note.configure(text="", fg=TEXT_MUTED)
+        if self._stats_period.get() != "custom":
+            self._set_stats_period("custom")
+        else:
+            self._refresh_stats()
 
     def _make_hero_mini(self, parent, title: str, value: str, row: int, col: int) -> tk.Label:
         cell = tk.Frame(parent, bg=BG_HERO)
@@ -6097,7 +7636,10 @@ class App(ctk.CTk):
         """Draw cumulative P/L line chart on the equity canvas."""
         c = self._equity_canvas
         c.delete("all")
-        c.update_idletasks()
+        # No update_idletasks(): these run from <Configure> handlers, and a
+        # synchronous geometry pass from inside a geometry callback makes Tk
+        # re-lay-out the page mid-draw. The max() below already covers a
+        # canvas that has not been sized yet -- the resize redraws it.
         W = max(c.winfo_width(), 300)
         H = max(c.winfo_height(), 180)
         pad_l, pad_r, pad_t, pad_b = 60, 20, 10, 30
@@ -6217,7 +7759,10 @@ class App(ctk.CTk):
         """Draw horizontal bar chart of profit per symbol."""
         c = self._sym_bar_canvas
         c.delete("all")
-        c.update_idletasks()
+        # No update_idletasks(): these run from <Configure> handlers, and a
+        # synchronous geometry pass from inside a geometry callback makes Tk
+        # re-lay-out the page mid-draw. The max() below already covers a
+        # canvas that has not been sized yet -- the resize redraws it.
         W = max(c.winfo_width(), 300)
         H = max(c.winfo_height(), 180)
 
@@ -6275,7 +7820,10 @@ class App(ctk.CTk):
         import math
         c = self._donut_canvas
         c.delete("all")
-        c.update_idletasks()
+        # No update_idletasks(): these run from <Configure> handlers, and a
+        # synchronous geometry pass from inside a geometry callback makes Tk
+        # re-lay-out the page mid-draw. The max() below already covers a
+        # canvas that has not been sized yet -- the resize redraws it.
         W = max(c.winfo_width(), 300)
         H = max(c.winfo_height(), 180)
 
@@ -6330,7 +7878,10 @@ class App(ctk.CTk):
         """Draw daily trade count bar chart."""
         c = self._daily_canvas
         c.delete("all")
-        c.update_idletasks()
+        # No update_idletasks(): these run from <Configure> handlers, and a
+        # synchronous geometry pass from inside a geometry callback makes Tk
+        # re-lay-out the page mid-draw. The max() below already covers a
+        # canvas that has not been sized yet -- the resize redraws it.
         W = max(c.winfo_width(), 300)
         H = max(c.winfo_height(), 180)
 
@@ -6406,7 +7957,10 @@ class App(ctk.CTk):
         """
         c = self._daily_pl_canvas
         c.delete("all")
-        c.update_idletasks()
+        # No update_idletasks(): these run from <Configure> handlers, and a
+        # synchronous geometry pass from inside a geometry callback makes Tk
+        # re-lay-out the page mid-draw. The max() below already covers a
+        # canvas that has not been sized yet -- the resize redraws it.
         W = max(c.winfo_width(), 300)
         H = max(c.winfo_height(), 170)
 
@@ -6477,7 +8031,10 @@ class App(ctk.CTk):
         """Vertical bar chart of realized P/L grouped by month."""
         c = self._monthly_canvas
         c.delete("all")
-        c.update_idletasks()
+        # No update_idletasks(): these run from <Configure> handlers, and a
+        # synchronous geometry pass from inside a geometry callback makes Tk
+        # re-lay-out the page mid-draw. The max() below already covers a
+        # canvas that has not been sized yet -- the resize redraws it.
         W = max(c.winfo_width(), 300)
         H = max(c.winfo_height(), 180)
 
@@ -6532,7 +8089,10 @@ class App(ctk.CTk):
         """Histogram of per-trade % returns, colored by sign."""
         c = self._dist_canvas
         c.delete("all")
-        c.update_idletasks()
+        # No update_idletasks(): these run from <Configure> handlers, and a
+        # synchronous geometry pass from inside a geometry callback makes Tk
+        # re-lay-out the page mid-draw. The max() below already covers a
+        # canvas that has not been sized yet -- the resize redraws it.
         W = max(c.winfo_width(), 300)
         H = max(c.winfo_height(), 180)
 
@@ -6611,6 +8171,45 @@ class App(ctk.CTk):
 
     # ---- Stats refresh ---------------------------------------------------
 
+    def _render_investments(self) -> None:
+        """Fill the Investments card, or take it off the page.
+
+        Uses the Invest page's quote cache rather than self._quotes: that one
+        is driven by the RSA pick list and is rewritten every 45 seconds, so
+        SPY would vanish from it as soon as the picks changed. A holding with
+        no quote contributes its cost and no value, and the note says so --
+        otherwise a missing price reads as a loss.
+        """
+        try:
+            s = etf_journal.summary(getattr(self, "_etf_quotes", {}))
+        except Exception:
+            s = None
+        if not s or not s["symbols"]:
+            self._inv_card.pack_forget()
+            return
+
+        self._inv_card.pack(fill="x", pady=(0, SP_LG), before=self._inv_before)
+        self._inv_cost.configure(text=f"${s['cost']:,.2f}", fg=TEXT_PRIMARY)
+        self._inv_value.configure(text=f"${s['market_value']:,.2f}",
+                                  fg=TEXT_PRIMARY)
+        pl = s["pl"]
+        self._inv_pl.configure(
+            text=f"${pl:+,.2f}" + (f"  ({s['pl_pct']:+.1f}%)"
+                                   if s["pl_pct"] is not None else ""),
+            fg=GREEN if pl > 0 else RED if pl < 0 else TEXT_PRIMARY)
+        self._inv_holdings.configure(
+            text=str(s["symbols"]),
+            fg=TEXT_PRIMARY)
+
+        notes = []
+        if s["unquoted"]:
+            notes.append(f"No quote for {', '.join(s['unquoted'])} — counted "
+                         f"at cost, not at value.")
+        if s["unpriced_buys"]:
+            notes.append(f"{s['unpriced_buys']} buy(s) have no recorded fill "
+                         f"price and contribute no cost basis.")
+        self._inv_note.configure(text="  ".join(notes))
+
     def _refresh_stats(self) -> None:
         # Split-adjusted, for the same reason as the Command Center hero: every
         # figure below subtracts a buy price from a sell price, and a reverse
@@ -6629,9 +8228,35 @@ class App(ctk.CTk):
         # Filter by selected period
         period = self._stats_period.get() if hasattr(self, "_stats_period") else "all"
         now = datetime.now()
-        if period == "week":
+        period_label = ""
+        range_ok = False
+        if period == "custom":
+            rng = self._stats_range()
+            if rng is None:
+                trades = all_trades
+                period_label = "all time — range not set"
+            else:
+                range_ok = True
+                lo, hi = rng
+                # Half-open on the upper end: timestamps carry a time of day,
+                # so comparing against the end date alone would drop every
+                # trade made on the last day of the range.
+                start = datetime.combine(lo, datetime.min.time()).isoformat()
+                end = datetime.combine(hi + timedelta(days=1),
+                                       datetime.min.time()).isoformat()
+                trades = [t for t in all_trades
+                          if start <= t.get("timestamp", "") < end]
+                span = (hi - lo).days + 1
+                # Built by hand rather than with %-d: that flag is POSIX-only
+                # and raises on Windows, which is the only platform this runs on.
+                def _day(d) -> str:
+                    return f"{d:%b} {d.day}, {d.year}"
+                period_label = (_day(lo) if lo == hi
+                                else f"{_day(lo)} – {_day(hi)}")
+                period_label += f"  ({span} day{'s' if span != 1 else ''})"
+        elif period == "week":
             # Monday of this week
-            start = now - __import__("datetime").timedelta(days=now.weekday())
+            start = now - timedelta(days=now.weekday())
             start = start.replace(hour=0, minute=0, second=0, microsecond=0)
             trades = [t for t in all_trades if t.get("timestamp", "") >= start.isoformat()]
         elif period == "month":
@@ -6869,6 +8494,14 @@ class App(ctk.CTk):
         pl_color = GREEN if realized_pl >= 0 else RED
         self._hero_pl.configure(text=f"${realized_pl:+,.2f}", fg=pl_color)
         sub_parts = []
+        if period_label:
+            # Named first, because a hero number that has been narrowed to a
+            # window has to say so — otherwise it reads as the all-time total.
+            sub_parts.append(period_label)
+        if range_ok:
+            self._range_note.configure(
+                text=f"{len(trades)} trade{'s' if len(trades) != 1 else ''} "
+                     f"in range", fg=TEXT_MUTED)
         if grand_ret:
             sub_parts.append(f"{grand_ret:+,.1f}% return")
         sub_parts.append(f"{closed_count} closed trade{'s' if closed_count != 1 else ''}")
@@ -6888,6 +8521,11 @@ class App(ctk.CTk):
         self._hero_avg_return.configure(
             text=f"{avg_ret_per:+,.1f}%" if closed_count else "—",
             fg=GREEN if avg_ret_per > 0 else RED if avg_ret_per < 0 else TEXT_PRIMARY)
+
+        # ================================================================
+        # INVESTMENTS
+        # ================================================================
+        self._render_investments()
 
         # ================================================================
         # RISK & PERFORMANCE METRIC TILES
@@ -7295,10 +8933,7 @@ class App(ctk.CTk):
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(cw, width=e.width))
         canvas.pack(fill="both", expand=True)
 
-        def _settings_mw(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        frame.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _settings_mw))
-        frame.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        self._attach_wheel(canvas, frame)
 
         # ---- Mirror Trading Card ----
         mirror_card = RoundedFrame(scroll_frame, bg_color=BG_CARD, border_color=BORDER, radius=14)
@@ -10097,17 +11732,7 @@ class App(ctk.CTk):
                     lambda e: canvas.itemconfigure(canvas_window, width=e.width))
         canvas.pack(fill="both", expand=True)
 
-        def _acct_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        def _acct_enter(e):
-            canvas.bind_all("<MouseWheel>", _acct_mousewheel)
-
-        def _acct_leave(e):
-            canvas.unbind_all("<MouseWheel>")
-
-        frame.bind("<Enter>", _acct_enter)
-        frame.bind("<Leave>", _acct_leave)
+        self._attach_wheel(canvas, frame)
 
         # Account linking sits ABOVE the brokers, on this page, because this is
         # where every doc sends people and where anyone looks for "connect my
@@ -10447,10 +12072,19 @@ class App(ctk.CTk):
             self._done_card.pack_forget()
 
     def _live_start(self, batch: dict) -> None:
-        """Show the live strip for a batch and (re)start the pulse loop."""
+        """Show the live strip for a batch and (re)start the pulse loop.
+
+        Every launcher — desk, exits, mirror, ETF invest, retry — calls this
+        immediately before spawning its workers, which makes it the one place
+        that can claim the batch's brokers. Claim them before the early return
+        so the guard holds even on a build where the strip is missing.
+        """
+        self._brokers_in_flight.update(batch.get("all_brokers") or [])
         if not hasattr(self, "_live_card"):
+            self._refresh_trade_busy()
             return
         self._live_batches.append(batch)
+        self._refresh_trade_busy()
         self._done_hide()          # a new op supersedes the last receipt
         self._live_show()
         if self._live_anim_id is None:
