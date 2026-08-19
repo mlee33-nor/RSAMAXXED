@@ -17,6 +17,7 @@ from __future__ import annotations
 import sys
 import threading
 import types
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -196,16 +197,85 @@ def test_the_batch_is_reported_back_so_the_guard_can_release(wired):
     assert summary["ok_accounts"] == 2
 
 
+class Finisher:
+    """Just enough App for _trade_batch_finish to run to completion.
+
+    Nothing here is a widget: no _live_card and no _trade_execute_btn, so the
+    strip and the button are skipped and what is left is the bookkeeping.
+    """
+
+    def __init__(self, in_flight):
+        self._brokers_in_flight = set(in_flight)
+        self._trade_in_flight = True
+        self._live_batches = []
+        self.invest_done = 0
+        self.notes = []
+
+    def _invest_batch_done(self):
+        self.invest_done += 1
+
+    def _log(self, *_a, **_k):
+        pass
+
+    def _push_notification(self, msg, kind="info"):
+        self.notes.append((msg, kind))
+
+    def _render_done_receipt(self, **_k):
+        pass
+
+    def _trade_result_write(self, *_a, **_k):
+        pass
+
+    def _refresh_trade_busy(self):
+        pass
+
+    def _live_hide(self):
+        pass
+
+
+def etf_batch(brokers, symbol):
+    return {"results": [{"broker": b, "ok_accounts": 1, "fail_accounts": 0,
+                         "shares": 1.0, "errors": [], "state": "success",
+                         "accounts": [], "fill_price": None} for b in brokers],
+            "side": "buy", "symbol": symbol, "qty": "1", "dry_run": True,
+            "origin": "etf", "all_brokers": sorted(brokers),
+            "pending": set(), "finished": False, "started": datetime.now()}
+
+
 def test_an_etf_batch_does_not_borrow_the_desk_guard():
     """An invest run can be several batches — the fractional brokers buy SPY
     while the whole-share ones buy SCHX. Borrowing _trade_in_flight would let
     the first batch to land re-arm the button while the second was still
     running, and the next click would buy the rest of the plan a second time.
-    Read off the source because the failure is silent either way."""
-    src = Path(A.__file__).read_text(encoding="utf-8")
-    assert 'if batch.get("origin") in ("desk", "exit"):' in src
-    assert 'elif batch.get("origin") == "etf":' in src
-    assert "self._invest_batch_done()" in src
+
+    The flag is derived from _brokers_in_flight rather than cleared by whichever
+    batch lands first, so this asks the behaviour directly. It used to grep the
+    source for the origin branch that derivation replaced, which made it fail
+    against the very rewrite that fixed the bug it describes.
+    """
+    f = Finisher(["public", "robinhood", "fidelity"])
+
+    A.App._trade_batch_finish(f, etf_batch(["public", "robinhood"], "SPY"))
+    assert f._brokers_in_flight == {"fidelity"}
+    assert f._trade_in_flight is True       # the SCHX leg is still out
+    assert f.invest_done == 1
+
+    A.App._trade_batch_finish(f, etf_batch(["fidelity"], "SCHX"))
+    assert f._brokers_in_flight == set()
+    assert f._trade_in_flight is False
+    assert f.invest_done == 2
+
+
+def test_only_an_etf_batch_touches_the_invest_counter():
+    """The desk shares _trade_batch_finish. If origin stopped being checked, a
+    plain sell would decrement a counter no invest run is waiting on."""
+    f = Finisher(["public"])
+    desk = etf_batch(["public"], "AIFA")
+    desk["origin"] = "desk"
+
+    A.App._trade_batch_finish(f, desk)
+    assert f._trade_in_flight is False
+    assert f.invest_done == 0
 
 
 def test_the_invest_counter_only_releases_once_every_batch_has_landed():
