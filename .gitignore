@@ -58,3 +58,16 @@ feed_archive.corrupt.json
 # too — one of them was committed to a PUBLIC repo on 2026-08-07.
 trades.*.bak.json
 autosell_state.json
+
+# Cash per account, and the ETF investment log. Both carry real account
+# labels; balances.json carries the amount sitting in each one. Same hazard as
+# the trade journal above, and neither was covered by any pattern here.
+balances.json
+balances.tmp
+etf_trades.json
+etf_trades.tmp
+
+# Hand-made journal backups. The pattern above only matches the name
+# backfill_basis.py generates (trades.<stamp>.bak.json); a copy named by hand
+# as trades.json.bak-<stamp> slipped through it and sat untracked in the repo.
+trades.json.bak*
