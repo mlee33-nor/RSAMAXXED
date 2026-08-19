@@ -617,6 +617,19 @@ class Board:
         return sorted(rows, key=lambda r: r["on"])
 
     @property
+    def payout_months(self) -> list[str]:
+        """Every month that paid SOMETHING, independent of who is reading.
+
+        The period chips used to come from `totals().months`, which is computed
+        against an account profile — so a reader holding nothing got no chips at
+        all, and setting a profile could not bring them back without a reload
+        (the chart is rebuilt in the browser; these chips are not). Which months
+        have payouts is a fact about the feed, not about the reader, so it is
+        answered here and the chips never depend on the profile.
+        """
+        return sorted({(r["on"] or "")[:7] for r in self.payout_rows if r["on"]})
+
+    @property
     def payout_json(self) -> str:
         return json.dumps(self.payout_rows, separators=(",", ":"))
 
@@ -709,9 +722,14 @@ class Board:
         """Money, against an account profile. Same rule the browser applies.
 
         `accounts` maps broker key -> how many accounts you hold there. Default
-        is one at each broker, which is what the page renders before anyone has
-        opened the settings panel — a real figure with a stated basis beats a
-        blank, and beats a made-up ten.
+        is one at each broker.
+
+        That default is NO LONGER what the page renders for a reader who has not
+        opened the settings panel — see `routes/plays.py`, which now passes an
+        explicit empty profile. It stays the default here because it is the
+        honest answer to "what did one account at each broker make", which is
+        what a caller asking for no profile in particular means; the page needed
+        something else, and now says so instead of leaning on this.
         """
         # `is None` and not a truthiness test: an empty map, or one with every
         # broker set to zero, is a REAL answer — "I hold nothing anywhere" —
