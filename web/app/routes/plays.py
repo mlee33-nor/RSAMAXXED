@@ -142,9 +142,23 @@ def _board_page(request: Request, user: User | None, db: Session):
         request, "plays.html",
         user=user,
         board=board,
-        # Rendered against one account per broker. The browser rewrites these
-        # from the reader's own profile — see the note in plays.html.
-        totals=board.totals(),
+        # Rendered against NO accounts, because we have not been told any yet.
+        #
+        # This used to render one account per broker, on the reasoning that a
+        # real figure with a stated basis beats a blank. The cost was invisible
+        # and worse than the blank: an exit leg reading "Chase x4" is the
+        # ALERTER's account count, and the only thing marking it as such is the
+        # strike-through the browser applies to brokers the reader holds nothing
+        # at. A default of one-at-every-broker meant that marking never fired
+        # for anyone who had not opened the settings panel — so every new reader
+        # saw someone else's positions rendered as their own, unmarked. Readers
+        # reported it as holding shares at brokers they had never traded.
+        #
+        # An empty profile is the truth ("you have not told us what you hold"),
+        # it makes every leg strike through until the reader says otherwise, and
+        # it matches what the browser computes from empty localStorage — so the
+        # first paint and the rewrite agree instead of flashing.
+        totals=board.totals({}),
         # The vocabulary for TRACK statuses lives with the feed, not in the
         # template — the page renders rows the board didn't get to wrap.
         status_labels=playsfeed.STATUS_LABELS,

@@ -158,13 +158,18 @@
             {% for name, key, fractional in board.broker_slots %}
               <label class="bslot">
                 <span class="bn">{{ name }}{% if fractional %}<i title="Holds fractions">◆</i>{% endif %}</span>
-                <input type="number" min="0" max="99" step="1" value="1"
+                {# Zero, not one. A default of one-at-every-broker is a guess
+                   about the reader that reads as a fact, and it silently
+                   disabled the strike-through on exit legs (see the note by
+                   the legs below) for exactly the readers who had never set a
+                   profile. Nobody holds an account because we assumed it. #}
+                <input type="number" min="0" max="99" step="1" value="0"
                        data-broker="{{ key }}" id="acct-{{ key }}" inputmode="numeric">
               </label>
             {% endfor %}
           </div>
           <div class="bfoot">
-            <span><b id="acct-total">10</b> accounts · <b id="acct-frac">3</b> hold fractions <i>◆</i></span>
+            <span><b id="acct-total">0</b> accounts · <b id="acct-frac">0</b> hold fractions <i>◆</i></span>
             <label class="btn btn-ghost btn-sm" for="settings-open">Done</label>
           </div>
         </section>
@@ -225,11 +230,16 @@
              belongs to. These two are the same basis at day resolution. #}
           <button type="button" class="chip" data-month="sold:today">Sold today</button>
           <button type="button" class="chip" data-month="sold:7d">Sold this week</button>
-          {% for m in totals.months %}
-            <button type="button" class="chip" data-month="{{ m.key }}">{{ m.key }}</button>
+          {# From the feed, not from `totals` — a month that paid is a fact
+             about the board, and a reader who holds nothing still gets the
+             chips. Sourcing these from the profile meant an empty one erased
+             them, and setting accounts could not bring them back without a
+             reload: the chart is rebuilt in the browser, these are not. #}
+          {% for key in board.payout_months %}
+            <button type="button" class="chip" data-month="{{ key }}">{{ key }}</button>
           {% endfor %}
         </div>
-        <span class="basis" id="basis-note">1 account at each broker · <label for="settings-open">change</label></span>
+        <span class="basis" id="basis-note">No accounts set · <label for="settings-open">tell us what you hold</label></span>
       </div>
 
       <div class="hero-row">
