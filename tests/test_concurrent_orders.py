@@ -102,7 +102,27 @@ class Desk:
     def _run_in_thread(self, _target, broker, side, symbol, *_rest):
         self.launched.append((broker, side, symbol))
 
+    def _trade_worker(self, *_a, **_k):
+        """Only ever passed to _run_in_thread as the target, never called.
+
+        It has to exist because _trade_execute reads self._trade_worker to hand
+        it over, and it raises rather than passing quietly: if a change ever
+        makes the desk invoke the worker inline, that is a real broker call and
+        the test should say so instead of going to the network.
+        """
+        raise AssertionError("the worker must not run inline in these tests")
+
+    def retype(self, symbol):
+        """A second ticket for a different name — typing over the symbol field.
+
+        Assigning `self.symbol` does nothing but add an unused attribute, so a
+        test that did that sent the same symbol out twice and read as a pass on
+        the way to the assertion that mattered.
+        """
+        self._trade_symbol = Entry(symbol)
+
     # real methods under test, bound in
+    _prefill_trade = A.App._prefill_trade
     _select_only_brokers = A.App._select_only_brokers
     _toggle_broker_chip = A.App._toggle_broker_chip
     _trade_execute = A.App._trade_execute
@@ -195,7 +215,7 @@ def test_two_orders_at_different_brokers_both_go_out():
     d = Desk()
     d._select_only_brokers(["fidelity"])
     d._trade_execute()
-    d.symbol = "BBBB"
+    d.retype("BBBB")
     d._select_only_brokers(["robinhood"])
     d._trade_execute()
     assert d.launched == [("fidelity", "sell", "AIFA"),
@@ -227,7 +247,7 @@ def test_an_order_overlapping_a_busy_broker_is_refused_whole():
     d = Desk()
     d._select_only_brokers(["fidelity"])
     d._trade_execute()
-    d.symbol = "BBBB"
+    d.retype("BBBB")
     d._select_only_brokers(["fidelity", "public"])
     d._trade_execute()
     assert [b for b, _s, _y in d.launched] == ["fidelity"]
@@ -252,16 +272,24 @@ def test_the_first_batch_to_land_does_not_report_an_idle_app():
     d = Desk()
     d._select_only_brokers(["fidelity"])
     d._trade_execute()
-    d.symbol = "BBBB"
+    first = d._trade_batch
+    d.retype("BBBB")
     d._select_only_brokers(["robinhood"])
     d._trade_execute()
+    second = d._trade_batch
 
-    first = d._live_batches[0]
+    # Read off _trade_batch, not _live_batches. This stub has no _live_card, so
+    # _live_start claims the brokers and returns before appending — which is the
+    # "build where the strip is missing" path its docstring promises to hold on,
+    # and the reason the guard is claimed ahead of that early return. Reaching
+    # for _live_batches here tested the widget, not the flag.
+    assert d._live_batches == []
+    assert first is not second
+
     d._trade_broker_complete(first, fills("fidelity"))
     assert first["finished"]
     assert d._trade_in_flight is True          # robinhood still working
 
-    second = d._live_batches[0]
     d._trade_broker_complete(second, fills("robinhood"))
     assert d._trade_in_flight is False
     assert d._brokers_in_flight == set()
