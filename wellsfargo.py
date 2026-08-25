@@ -1679,12 +1679,26 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                     try:
                         owned_el = await page.select("#currentSharesOwned .numshares", timeout=10)
                         owned_txt = (getattr(owned_el, "text_all", "") or "").strip()
-                        owned = int(re.sub(r"[^0-9]", "", owned_txt) or "0")
-                        if owned <= 0:
+                        # Read the number as a NUMBER. Deleting every non-digit
+                        # broke this twice over: '0.05' lost its decimal point
+                        # and became five whole shares, and an empty or not-yet-
+                        # rendered field became a confident 0 -- which is how an
+                        # account that is holding the stock gets told it owns
+                        # none of it and has its sell skipped.
+                        m = re.search(r"-?\d[\d,]*(?:\.\d+)?", owned_txt)
+                        owned = _to_float_any(m.group(0)) if m else None
+                        if owned is None:
+                            # Unknown is not zero. The guard exists to spare a
+                            # doomed order, not to invent a position count, so
+                            # say so and let Wells Fargo reject it if it must.
+                            _trace(f"TRADE | Wells Fargo | {acct_label}: shares owned "
+                                   f"unreadable ({owned_txt!r}) — proceeding rather "
+                                   f"than calling it 0", notify=notify)
+                        elif owned <= 0:
                             outputs.append(AccountOutput(account_id=acct_label, ok=False, message=f"Skipped sell: own 0 shares of {symbol}"))
                             continue
-                        if qty_int > owned:
-                            outputs.append(AccountOutput(account_id=acct_label, ok=False, message=f"Skipped sell: qty {qty_int} exceeds owned {owned} for {symbol}"))
+                        elif qty_int > owned:
+                            outputs.append(AccountOutput(account_id=acct_label, ok=False, message=f"Skipped sell: qty {qty_int} exceeds owned {owned:g} for {symbol}"))
                             continue
                     except Exception:
                         pass
