@@ -10837,10 +10837,28 @@ class App(ctk.CTk):
         self._update_exits_summary(tasks)
 
         if not tasks:
-            self._empty_state(
-                self._exits_list, "check", "Nothing to sell",
-                f"{len(self._track_rows)} plays on the board, none of them "
-                "resolved into a position you still hold.").pack(fill="x")
+            # "Nothing to sell" has two completely different causes and an empty
+            # list looks identical either way — which is how someone who IS
+            # holding the stock reads this page as the app telling him he isn't.
+            # Name both.
+            board = lifecycle.sell_worklist(self._track_rows, include_unheld=True)
+            cash_only = [t for t in board if not t.brokers and t.skipped_brokers]
+            why = [f"{len(self._track_rows)} plays on the board, none of them "
+                   f"resolved into a position this app has a record of."]
+            if cash_only:
+                syms = ", ".join(sorted({t.symbol for t in cash_only})[:6])
+                why.append(
+                    f"{len(cash_only)} of them ({syms}) you do hold — but only at "
+                    f"brokers that settle a fraction to cash, so there is no share "
+                    f"in the account to sell.")
+            if len(board) - len(cash_only) > 0:
+                why.append(
+                    "This list is built from trades placed through this app. "
+                    "Shares bought by hand, bought before you installed it, or "
+                    "bought on another machine are not in it — sell those from "
+                    "the Trade Desk, which does not check.")
+            self._empty_state(self._exits_list, "check", "Nothing to sell",
+                              "  ".join(why)).pack(fill="x")
             return
 
         if frac:
@@ -11055,6 +11073,14 @@ class App(ctk.CTk):
                 # smallest — but that leaves shares behind and you should know.
                 tk.Label(row, text=f"  accounts differ ({leg.low:g}–{leg.high:g}) — "
                                    f"{leg.stranded:g} left behind",
+                         bg=BG_CARD_ALT, fg=YELLOW,
+                         font=(FONT_FAMILY, 8)).pack(side="left", padx=(10, 0))
+            if leg.unread:
+                # The count above is a floor, not a total: these accounts did
+                # not read, so whether they hold it is unknown. Saying so is
+                # the difference between "you own none" and "we could not look".
+                tk.Label(row, text=f"  {leg.unread} more acct(s) wouldn't read — "
+                                   f"not included",
                          bg=BG_CARD_ALT, fg=YELLOW,
                          font=(FONT_FAMILY, 8)).pack(side="left", padx=(10, 0))
 

@@ -408,6 +408,7 @@ class BrokerLeg:
     accounts: int = 0            # accounts holding a positive balance
     low: float = 0.0             # smallest balance seen
     high: float = 0.0            # largest
+    unread: int = 0              # accounts at this broker we could not read
 
     @property
     def uniform(self) -> bool:
@@ -418,6 +419,12 @@ class BrokerLeg:
     def stranded(self) -> float:
         """Shares left behind by sending the minimum. 0 when uniform."""
         return max(0.0, self.high - self.low)
+
+    @property
+    def complete(self) -> bool:
+        """Every account at this broker was read. False means `accounts` is a
+        floor, not a count — there may be more of this position than we saw."""
+        return not self.unread
 
 
 @dataclass(frozen=True)
@@ -475,6 +482,27 @@ def resolve(task: "SellTask", outputs: dict[str, Any]) -> ResolvedExit:
     A broker that reports no position is dropped into `missing` rather than
     sent an order for shares it does not have. That is not an error — a fraction
     can be swept to cash between the board updating and us looking.
+
+    SILENCE IS NOT ABSENCE, AND IT IS NOT ONLY A WHOLE-BROKER QUESTION
+
+    `state` is "partial" whenever SOME of a broker's accounts read and some did
+    not, and the ones that did not are the ones we know nothing about. Skipping
+    them and then reporting "no position at Fidelity" states as fact the one
+    thing the read could not establish — and it is the account with the dead
+    session that is most likely to be holding the shares, because nothing about
+    it was refreshed. A customer who owns the stock is told he does not.
+
+    So a broker only lands in `missing` when every one of its accounts was read
+    and none of them had it. If any account could not be read it goes to
+    `errors` instead, which is the bucket that says "we did not find out" — and
+    which auto-sell hands back for a retry rather than marking sold. A broker
+    that hands back no readable account at all has told us nothing either,
+    whatever its state field says.
+
+    Unreadable accounts at a broker that DOES report the position are recorded
+    on the leg as `unread`: the order still goes, sized off what we could see,
+    but shares may be left behind and the dialog says so rather than quietly
+    dropping them.
     """
     symbols = tuple({task.symbol.upper(), task.alert_symbol.upper()})
     legs: list[BrokerLeg] = []
@@ -491,22 +519,33 @@ def resolve(task: "SellTask", outputs: dict[str, Any]) -> ResolvedExit:
             errors.append(broker)
             continue
 
+        accounts = list(getattr(out, "accounts", None) or [])
+        readable = [a for a in accounts if bool(getattr(a, "ok", False))]
+        unread = len(accounts) - len(readable)
+
+        # No readable account — including the "success with zero accounts" a
+        # broker returns when a session is dead but nothing raised.
+        if not readable:
+            errors.append(broker)
+            continue
+
         found: list[Decimal] = []
-        for account in (getattr(out, "accounts", None) or []):
-            if not bool(getattr(account, "ok", False)):
-                continue
+        for account in readable:
             qty = _account_qty(account, symbols)
             if qty is not None and qty > 0:
                 found.append(qty)
 
         if not found:
-            missing.append(broker)
+            # Read every account and none had it: a real answer. Read only
+            # some of them: not an answer at all.
+            (errors if unread else missing).append(broker)
             continue
 
         legs.append(BrokerLeg(
             broker=broker, key=key,
             qty=qty_text(min(found)), accounts=len(found),
             low=float(min(found)), high=float(max(found)),
+            unread=unread,
         ))
 
     return ResolvedExit(task=task, legs=tuple(legs),
