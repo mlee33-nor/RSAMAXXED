@@ -211,6 +211,9 @@ class Finisher:
         self.invest_done = 0
         self.notes = []
 
+    # Real, not stubbed — releasing a broker is bookkeeping this test asserts.
+    _release_broker = A.App._release_broker
+
     def _invest_batch_done(self):
         self.invest_done += 1
 

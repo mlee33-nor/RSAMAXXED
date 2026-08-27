@@ -67,6 +67,11 @@ class Desk:
         self.logs: list = []
         self.shown_frame = None
 
+    # The real thing, not a stub: deciding whether a broker may be handed back
+    # to the guard IS the behaviour under test here, and a no-op version would
+    # quietly assert nothing.
+    _release_broker = A.App._release_broker
+
     # -- widget-level no-ops -------------------------------------------------
     def _style_chip(self, *_a, **_k):
         pass
