@@ -19,6 +19,7 @@ import re
 import threading
 import tkinter as tk
 import winsound
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import ttk, messagebox
@@ -848,63 +849,6 @@ def _parse_iso_utc(value: Any) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def _sell_legs_text(sell: Dict[str, Any]) -> str:
-    """'Robinhood · Fidelity' — which brokerage the alert says to sell on.
-
-    This is the whole point of the SELL card: the Discord text names the
-    brokerages, and that detail was previously parsed and thrown away.
-
-    The account counts that used to trail each name ('Public x21') are the
-    ALERTER's account spread, not ours, and printing them next to our own
-    coverage numbers invited reading one as the other. Brokerage only.
-    """
-    parts = []
-    seen = set()
-    for leg in sell.get("legs") or []:
-        if not isinstance(leg, dict):
-            continue
-        broker = str(leg.get("broker") or "").strip()
-        if not broker or broker in seen:
-            continue
-        seen.add(broker)
-        parts.append(broker)
-    return "  ·  ".join(parts)
-
-
-def _sell_accounts_label(sell: Dict[str, Any]) -> str:
-    """'21 accounts' / '21+ accounts' — what the alert's dollar figure assumes.
-
-    The counts came off the broker names ('Public x21') because there they sat
-    beside OUR coverage and invited being read as ours. They belong here
-    instead: the proceeds figure is exactly the alerter's account spread times
-    their exit price, so naming it turns an unqualified dollar amount into an
-    estimate with its basis attached.
-
-    A leg quoted as a range ('21-23') makes the whole figure a floor, so the
-    total is written with a '+'.
-    """
-    low = high = 0
-    for leg in sell.get("legs") or []:
-        if not isinstance(leg, dict):
-            continue
-        try:
-            leg_low = int(leg.get("accounts_low") or 0)
-            leg_high = int(leg.get("accounts_high") or leg_low)
-        except (TypeError, ValueError):
-            continue
-        low += leg_low
-        high += max(leg_high, leg_low)
-    if not low:
-        # Older records carry a single total rather than per-broker legs.
-        try:
-            low = high = int(sell.get("accounts") or 0)
-        except (TypeError, ValueError):
-            return ""
-    if not low:
-        return ""
-    return f"{low}{'+' if high > low else ''} account{'s' if low != 1 else ''}"
-
-
 def _sell_leg_broker_keys(sell: Dict[str, Any]) -> List[str]:
     """App broker keys a sell alert names, in the order it wrote them.
 
@@ -920,6 +864,184 @@ def _sell_leg_broker_keys(sell: Dict[str, Any]) -> List[str]:
         if key in BROKER_MODULES and key not in keys:
             keys.append(key)
     return keys
+
+
+def _qty_text(qty: float) -> str:
+    """Shares, without a trailing ".0" on the whole numbers that are the norm.
+
+    RSA positions are whole shares almost everywhere, but a reverse split
+    leaves real fractions behind, so this can't just be an int().
+    """
+    try:
+        q = float(qty)
+    except (TypeError, ValueError):
+        return "0"
+    if abs(q - round(q)) < 1e-9:
+        return str(int(round(q)))
+    return f"{q:.4f}".rstrip("0").rstrip(".")
+
+
+#: What one brokerage's share of a play is doing.
+SELL_NOW = "sell_now"     # we hold it there AND an exit has been called there
+SELL_WAIT = "waiting"     # we hold it there, no exit called there yet
+SELL_DONE = "done"        # we are out of it there
+
+
+@dataclass(frozen=True)
+class SellLeg:
+    """One brokerage's share of one play."""
+
+    broker: str
+    bought: float
+    sold: float
+    left: float
+    state: str
+    alert_date: str = ""
+    failed_accounts: int = 0
+    fail_reason: str = ""
+
+    @property
+    def label(self) -> str:
+        return rsa_feed.normalize_broker(self.broker)
+
+
+@dataclass(frozen=True)
+class SellPlay:
+    """One ticker, and where it stands at every brokerage that ever held it.
+
+    The card used to be a list of ALERTS, but an exit is called per brokerage
+    and they arrive days apart, so one ticker became four rows scattered across
+    three tabs — BYAH was simultaneously under Sell Alerts, Partial and Sold.
+    Nothing on screen answered the only question actually being asked, which is
+    "where do I stand on this play". A play is the unit; a brokerage is a row
+    inside it.
+    """
+
+    symbol: str
+    exit_price: Optional[float]
+    legs: tuple
+    last_alert: str = ""
+
+    @property
+    def bought(self) -> float:
+        return sum(l.bought for l in self.legs)
+
+    @property
+    def left(self) -> float:
+        return sum(l.left for l in self.legs)
+
+    @property
+    def sold(self) -> float:
+        return sum(l.sold for l in self.legs)
+
+    def of(self, state: str) -> tuple:
+        return tuple(l for l in self.legs if l.state == state)
+
+    @property
+    def bucket(self) -> str:
+        """Which tab. Actionable beats everything: a play with one broker ready
+        to sell belongs under Sell now even if four others are still waiting."""
+        if self.of(SELL_NOW):
+            return "now"
+        return "holding" if self.left > 1e-9 else "closed"
+
+    @property
+    def ready_value(self) -> float:
+        """Roughly what the sellable legs are worth, for ordering the worklist."""
+        if not self.exit_price:
+            return 0.0
+        return sum(l.left for l in self.of(SELL_NOW)) * float(self.exit_price)
+
+
+def _sell_share_ledger() -> Dict[tuple, List[float]]:
+    """(broker, SYMBOL) -> [bought, sold] in SHARES.
+
+    Shares, not accounts. Counting accounts is what made LBGJ at Robinhood read
+    "3/3 sold" while three shares were still open there — six were bought across
+    three accounts and three were sold, so the account sets matched exactly and
+    the arithmetic looked complete. Split-adjusted for the same reason every
+    other position figure is.
+    """
+    out: Dict[tuple, List[float]] = {}
+    try:
+        rows = trade_journal.split_adjusted()
+    except Exception:
+        return out
+    for t in rows:
+        sym = str(t.get("symbol") or "").upper()
+        if not sym:
+            continue
+        try:
+            qty = float(t.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        rec = out.setdefault((str(t.get("broker") or ""), sym), [0.0, 0.0])
+        rec[0 if t.get("side") == "buy" else 1] += qty
+    return out
+
+
+def _sell_plays(sells: List[Dict[str, Any]]) -> List[SellPlay]:
+    """Fold the exit feed and the journal into one row per ticker.
+
+    A brokerage appears on a play if we ever bought there OR an exit named it,
+    so "you hold this at four more brokers and nobody has called them yet" is
+    visible instead of implied by absence.
+    """
+    ledger = _sell_share_ledger()
+    attempts = _load_trade_attempts()
+
+    called: Dict[str, Dict[str, str]] = {}      # SYM -> broker -> newest date
+    price: Dict[str, Any] = {}
+    newest: Dict[str, str] = {}
+    for sl in sells:
+        sym = str(sl.get("symbol") or "").upper()
+        if not sym:
+            continue
+        when = str(sl.get("sell_date") or "")
+        posted = str(sl.get("posted_at") or "")
+        if posted >= newest.get(sym, ""):
+            newest[sym] = posted
+            price[sym] = sl.get("exit_price")
+        for key in _sell_leg_broker_keys(sl):
+            if when >= called.setdefault(sym, {}).get(key, ""):
+                called[sym][key] = when
+
+    plays: List[SellPlay] = []
+    for sym in sorted({str(s.get("symbol") or "").upper() for s in sells} - {""}):
+        brokers = sorted({b for (b, s) in ledger if s == sym} | set(called.get(sym, {})))
+        legs = []
+        for b in brokers:
+            bought, sold = ledger.get((b, sym), [0.0, 0.0])
+            if bought <= 1e-9 and sold <= 1e-9:
+                # The exit named a brokerage we never bought at. There is no
+                # position to report, and listing it as "sold" claimed an exit
+                # that never happened.
+                continue
+            left = max(0.0, bought - sold)
+            if left <= 1e-9:
+                state = SELL_DONE
+            elif b in called.get(sym, {}):
+                state = SELL_NOW
+            else:
+                state = SELL_WAIT
+            # SELL rejections only. A buy that failed months ago says nothing
+            # about whether we can get out, and reporting it here read as
+            # "this exit was rejected" on a broker that was never asked.
+            bad = [r for (s2, b2, _a), r in attempts.items()
+                   if s2 == sym and b2 == b and not r.get("ok")
+                   and r.get("side") == "sell"]
+            legs.append(SellLeg(
+                broker=b, bought=bought, sold=sold, left=left, state=state,
+                alert_date=called.get(sym, {}).get(b, ""),
+                failed_accounts=len(bad) if state != SELL_DONE else 0,
+                fail_reason=_tidy_reason(bad[0].get("msg", ""), 90) if bad else ""))
+        plays.append(SellPlay(symbol=sym, exit_price=price.get(sym),
+                              legs=tuple(legs), last_alert=newest.get(sym, "")))
+    # Worklist order: most money ready to sell first, then most recently called.
+    plays.sort(key=lambda p: (-p.ready_value, p.last_alert and -ord(p.last_alert[0])))
+    plays.sort(key=lambda p: p.last_alert, reverse=True)
+    plays.sort(key=lambda p: p.ready_value, reverse=True)
+    return plays
 
 
 PICKS_FILE = ROOT_DIR / "picks.json"
@@ -1035,7 +1157,7 @@ def _load_trade_attempts() -> Dict[tuple, Dict[str, Any]]:
         return _trade_attempts_cache["data"]
 
     out: Dict[tuple, Dict[str, Any]] = {}
-    sym = broker = ts = None
+    sym = broker = ts = side = None
     try:
         text = TRADE_RESULTS_LOG.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -1046,6 +1168,7 @@ def _load_trade_attempts() -> Dict[tuple, Dict[str, Any]]:
             sym = head.group("sym").upper()
             broker = head.group("broker").lower()
             ts = head.group("ts")
+            side = head.group("side").lower()
             continue
         row = _TRADE_ROW_RE.match(line)
         if row and sym:
@@ -1055,6 +1178,7 @@ def _load_trade_attempts() -> Dict[tuple, Dict[str, Any]]:
                 "ok": row.group("st") == "OK",
                 "msg": row.group("msg").strip(),
                 "ts": ts,
+                "side": side or "",
                 "label": row.group("acct").strip(),
             }
     _trade_attempts_cache["mtime"] = mtime
@@ -3776,34 +3900,38 @@ class App(ctk.CTk):
 
         sell_header = tk.Frame(sell_card.inner, bg=BG_CARD)
         sell_header.pack(fill="x", padx=20, pady=(16, 8))
-        self._sells_tab_active = "alerts"   # "alerts", "partial" or "sold"
+        # Sell now / Holding / Closed, in the order you act on them. The old
+        # split (Sell Alerts / Partial / Sold) sorted by what had happened to
+        # the ALERT rather than by what you can do about the PLAY, which is why
+        # one ticker could appear under all three at once.
+        self._sells_tab_active = "now"      # "now", "holding" or "closed"
         tk.Label(sell_header, text=icon("down"), bg=BG_CARD, fg=RED,
                  font=(ICON_FONT, 12)).pack(side="left", padx=(0, 8))
 
         self._sells_tab_lbl = tk.Label(
-            sell_header, text="Sell Alerts", bg=BG_CARD, fg=TEXT_PRIMARY,
+            sell_header, text="Sell now", bg=BG_CARD, fg=RED,
             font=(FONT_FAMILY, 13, "bold"), cursor="hand2")
         self._sells_tab_lbl.pack(side="left")
         self._sells_tab_lbl.bind("<Button-1>",
-                                 lambda e: self._switch_sells_tab("alerts"))
+                                 lambda e: self._switch_sells_tab("now"))
 
         tk.Label(sell_header, text="   |   ", bg=BG_CARD, fg=TEXT_MUTED,
                  font=(FONT_FAMILY, 12)).pack(side="left")
-        self._sells_partial_lbl = tk.Label(
-            sell_header, text="Partial", bg=BG_CARD, fg=TEXT_MUTED,
+        self._sells_holding_lbl = tk.Label(
+            sell_header, text="Holding", bg=BG_CARD, fg=TEXT_MUTED,
             font=(FONT_FAMILY, 13, "bold"), cursor="hand2")
-        self._sells_partial_lbl.pack(side="left")
-        self._sells_partial_lbl.bind("<Button-1>",
-                                     lambda e: self._switch_sells_tab("partial"))
+        self._sells_holding_lbl.pack(side="left")
+        self._sells_holding_lbl.bind("<Button-1>",
+                                     lambda e: self._switch_sells_tab("holding"))
 
         tk.Label(sell_header, text="   |   ", bg=BG_CARD, fg=TEXT_MUTED,
                  font=(FONT_FAMILY, 12)).pack(side="left")
-        self._sells_sold_lbl = tk.Label(
-            sell_header, text="Sold", bg=BG_CARD, fg=TEXT_MUTED,
+        self._sells_closed_lbl = tk.Label(
+            sell_header, text="Closed", bg=BG_CARD, fg=TEXT_MUTED,
             font=(FONT_FAMILY, 13, "bold"), cursor="hand2")
-        self._sells_sold_lbl.pack(side="left")
-        self._sells_sold_lbl.bind("<Button-1>",
-                                  lambda e: self._switch_sells_tab("sold"))
+        self._sells_closed_lbl.pack(side="left")
+        self._sells_closed_lbl.bind("<Button-1>",
+                                    lambda e: self._switch_sells_tab("closed"))
         tk.Label(sell_header, text=icon("down"), bg=BG_CARD, fg=RED,
                  font=(ICON_FONT, 12)).pack(side="left", padx=(0, 8))
         self._sell_count_lbl = tk.Label(sell_header, text="", bg=BG_CARD,
@@ -3815,93 +3943,34 @@ class App(ctk.CTk):
 
         sell_body = tk.Frame(sell_card.inner, bg=BG_CARD)
         sell_body.pack(fill="x", padx=20, pady=(0, 16))
-        self._sell_grid = tk.Frame(sell_body, bg=BG_CARD)
-        self._sell_grid.pack(fill="x")
+        self._sell_now_grid = tk.Frame(sell_body, bg=BG_CARD)
+        self._sell_now_grid.pack(fill="x")
         # hidden until their tab is selected, same as the picks card
-        self._sell_partial_grid = tk.Frame(sell_body, bg=BG_CARD)
-        self._sell_sold_grid = tk.Frame(sell_body, bg=BG_CARD)
+        self._sell_holding_grid = tk.Frame(sell_body, bg=BG_CARD)
+        self._sell_closed_grid = tk.Frame(sell_body, bg=BG_CARD)
         self._render_sell_alerts()
 
         # Fetch picks in background on startup
         self.after(300, self._reload_quick_picks)
 
-    def _sell_alert_position_map(self) -> tuple:
-        """(open (broker, symbol) pairs, accounts bought per symbol,
-        accounts sold per symbol).
-
-        Accounts rather than shares: a sell-alert row is about coverage — "I was
-        in this at 21 accounts and I am out of all 21" — and on an RSA play the
-        share count is 1 everywhere anyway.
-
-        The open set keeps the BROKER. It used to be flattened to bare symbols,
-        which is what let one broker's exit speak for every other broker's
-        position in the same ticker; see `_sell_alert_scope`.
-        """
-        try:
-            open_pairs = set(trade_journal.get_portfolio())
-            trades = trade_journal.get_trades()
-        except Exception:
-            return set(), {}, {}
-        bought: Dict[str, set] = {}
-        sold: Dict[str, set] = {}
-        for t in trades:
-            sym = str(t.get("symbol") or "").upper()
-            if not sym:
-                continue
-            acct = (t.get("broker"), t.get("account_id"))
-            side = t.get("side")
-            if side == "buy":
-                bought.setdefault(sym, set()).add(acct)
-            elif side in ("sell", trade_journal.SIDE_CLOSE):
-                sold.setdefault(sym, set()).add(acct)
-        return open_pairs, bought, sold
-
-    def _sell_date_header(self, parent, date_str: str, n: int) -> None:
-        """A dated band across the list.
-
-        The exits used to run together as one undivided column with the date
-        shrunk into the right-hand end of each row, so "what came in today" was
-        something you read for rather than saw.
-        """
-        try:
-            d = datetime.strptime(str(date_str), "%Y-%m-%d").date()
-            display = d.strftime("%B %d, %Y").upper()
-            days = (datetime.now().date() - d).days
-            rel = ("TODAY" if days <= 0 else
-                   "YESTERDAY" if days == 1 else f"{days} DAYS AGO")
-        except (ValueError, TypeError):
-            display, rel = str(date_str).upper(), ""
-
-        hdr = tk.Frame(parent, bg=BG_CARD)
-        hdr.pack(fill="x", pady=(14, 5))
-        tk.Label(hdr, text=display, bg=BG_CARD, fg=TEXT_SECONDARY,
-                 font=(FONT_FAMILY, 9, "bold")).pack(side="left")
-        if rel:
-            tk.Label(hdr, text=f"   {rel}", bg=BG_CARD, fg=ACCENT,
-                     font=(FONT_FAMILY, 8, "bold")).pack(side="left")
-        tk.Label(hdr, text=f"{n} exit{'s' if n != 1 else ''}", bg=BG_CARD,
-                 fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).pack(side="right")
-        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", pady=(0, 6))
-
     def _switch_sells_tab(self, tab: str) -> None:
-        """Switch between Sell Alerts / Partial / Sold."""
+        """Switch between Sell now / Holding / Closed."""
         self._sells_tab_active = tab
-        grids = {"alerts": self._sell_grid,
-                 "partial": self._sell_partial_grid,
-                 "sold": self._sell_sold_grid}
+        grids = {"now": self._sell_now_grid,
+                 "holding": self._sell_holding_grid,
+                 "closed": self._sell_closed_grid}
         for g in grids.values():
             g.pack_forget()
-        grids.get(tab, self._sell_grid).pack(fill="x")
-        self._sells_tab_lbl.configure(
-            fg=TEXT_PRIMARY if tab == "alerts" else TEXT_MUTED)
-        self._sells_partial_lbl.configure(
-            fg=YELLOW if tab == "partial" else TEXT_MUTED)
-        self._sells_sold_lbl.configure(
-            fg=GREEN if tab == "sold" else TEXT_MUTED)
+        grids.get(tab, self._sell_now_grid).pack(fill="x")
+        self._sells_tab_lbl.configure(fg=RED if tab == "now" else TEXT_MUTED)
+        self._sells_holding_lbl.configure(
+            fg=YELLOW if tab == "holding" else TEXT_MUTED)
+        self._sells_closed_lbl.configure(
+            fg=GREEN if tab == "closed" else TEXT_MUTED)
 
     # Board status -> (chip text, colour). Written out in full, because the
     # raw words do not survive contact: "pending" and "new" are the two that
-    # actually have to be told apart, and neither says which is which — one
+    # actually have to be told apart, and neither says which is which - one
     # means the split is declared and we are waiting on it, the other means
     # nothing has happened at all.
     _SELL_STATUS_CHIP = {
@@ -3910,8 +3979,8 @@ class App(ctk.CTk):
         "cash_in_lieu": ("SETTLED AS CASH", TEXT_MUTED),
         "canceled":     ("SPLIT CANCELLED", YELLOW),
         "low_odds":     ("LOW ODDS", TEXT_MUTED),
-        "pending":      ("SPLIT DECLARED · WAITING", YELLOW),
-        "new":          ("ALERTED · NOTHING YET", TEXT_MUTED),
+        "pending":      ("SPLIT DECLARED - WAITING", YELLOW),
+        "new":          ("ALERTED - NOTHING YET", TEXT_MUTED),
         "unknown":      ("STATUS UNKNOWN", TEXT_MUTED),
     }
 
@@ -3933,84 +4002,21 @@ class App(ctk.CTk):
                     out[str(name).upper()] = status
         return out
 
-    def _sell_alert_scope(self, sell: dict, open_pairs: set,
-                          bought: Dict[str, set],
-                          sold: Dict[str, set]) -> tuple:
-        """What this ONE alert is about: (brokers, bought, sold, still_open).
-
-        Every field is narrowed to the brokers the alert actually names.
-
-        A sell alert is per-brokerage — the feed posts HAO at Public and HAO at
-        Wells Fargo as two separate exits, an hour apart — but all of this was
-        judged per SYMBOL. So the moment Public's HAO was sold, every other HAO
-        alert was treated as half-done: the brand-new Wells Fargo exit, where we
-        still held all ten accounts and had sold nothing, was filed under
-        Partial and disappeared from the tab you actually work from. The newest
-        and most actionable exit on the board was the one it hid.
-
-        Falls back to the symbol as a whole when the alert names no brokerage we
-        automate (the feed also calls exits at Webull and Vanguard), because
-        then there is no narrower question to ask.
-        """
-        sym = str(sell.get("symbol") or "").upper()
-        keys = set(_sell_leg_broker_keys(sell))
-        if not keys:
-            return ((), bought.get(sym, set()), sold.get(sym, set()),
-                    any(s == sym for (_b, s) in open_pairs))
-        return (
-            tuple(sorted(keys)),
-            {a for a in bought.get(sym, ()) if a[0] in keys},
-            {a for a in sold.get(sym, ()) if a[0] in keys},
-            any(b in keys for (b, s) in open_pairs if s == sym),
-        )
-
-    def _sell_alert_is_update(self, sell: dict, sold: Dict[str, set]) -> bool:
-        """True when we have already sold this ticker at some OTHER brokerage.
-
-        That is what makes a fresh exit easy to miss: the name is familiar, it
-        has been on the board for days, and part of it is already closed — so a
-        new leg reads as old news. It is the opposite: it is the only part of
-        the play still worth acting on.
-        """
-        keys = set(_sell_leg_broker_keys(sell))
-        if not keys:
-            return False
-        sym = str(sell.get("symbol") or "").upper()
-        return any(a[0] not in keys for a in sold.get(sym, ()))
-
-    def _sell_alert_state(self, sell: dict, open_pairs: set,
-                          bought: Dict[str, set], sold: Dict[str, set]) -> str:
-        """Which of the three buckets an exit belongs in.
-
-          sold      bought at the brokers it names, and out of all of them
-          partial   still open at some of them, already out of others
-          alerts    still fully open there, or an exit on something we never bought
-
-        GREEN means "I bought this", for all of the first two and the open half
-        of the third. Reserving green for closed plays only answered "am I out",
-        when the question on this card is "was this ever mine".
-        """
-        _keys, bought_here, sold_here, open_here = self._sell_alert_scope(
-            sell, open_pairs, bought, sold)
-        if not bought_here:
-            return "alerts"
-        if not open_here:
-            return "sold"
-        return "partial" if sold_here else "alerts"
-
     def _render_sell_alerts(self) -> None:
-        """Recent exits, split across three tabs and grouped by the day called.
+        """One card per PLAY, a row per brokerage inside it.
 
-        Mirrors the Quick Picks card deliberately — Sell Alerts / Partial / Sold
-        against Quick Picks / Partial / Purchased — because they are the same
-        shape of question at the two ends of a play.
+        This card used to render one row per exit MESSAGE. Exits are called per
+        brokerage and arrive days apart, so a single ticker became up to four
+        rows spread across three tabs - BYAH sat under Sell Alerts, Partial and
+        Sold at the same time - and nothing on screen answered "where do I stand
+        on this play". Now the play is the row and the brokerage is a line
+        inside it, so the whole position reads top to bottom in one place.
         """
-        grid = getattr(self, "_sell_grid", None)
-        if grid is None:
+        grids = {"now": getattr(self, "_sell_now_grid", None),
+                 "holding": getattr(self, "_sell_holding_grid", None),
+                 "closed": getattr(self, "_sell_closed_grid", None)}
+        if grids["now"] is None:
             return
-        grids = {"alerts": self._sell_grid,
-                 "partial": self._sell_partial_grid,
-                 "sold": self._sell_sold_grid}
         for g in grids.values():
             for w in g.winfo_children():
                 w.destroy()
@@ -4019,208 +4025,138 @@ class App(ctk.CTk):
         if not sells:
             self._sell_count_lbl.configure(text="")
             self._empty_state(
-                grid, "info", "No sell alerts yet",
+                grids["now"], "info", "No exits yet",
                 "Exits arrive with your subscription once this device is "
-                "linked — no Discord needed — and name the brokerage each one "
-                "was taken at.",
+                "linked - no Discord needed - and name the brokerage each one "
+                "was called at.",
                 bg=BG_CARD, pad=16).pack(fill="x")
             return
 
-        open_pairs, bought, sold = self._sell_alert_position_map()
-        board = self._board_status_map()
+        buckets = {"now": [], "holding": [], "closed": []}
+        for play in _sell_plays(sells):
+            buckets[play.bucket].append(play)
 
-        buckets: Dict[str, list] = {"alerts": [], "partial": [], "sold": []}
-        for sl in sells:
-            buckets[self._sell_alert_state(sl, open_pairs, bought, sold)].append(sl)
+        ready_cash = sum(p.ready_value for p in buckets["now"])
+        ready_sh = sum(l.left for p in buckets["now"] for l in p.of(SELL_NOW))
+        self._sell_count_lbl.configure(
+            text=(f"{_qty_text(ready_sh)} share(s) ready  -  ~${ready_cash:,.2f}"
+                  if ready_sh else
+                  f"{len(sells)} exit(s) in the last {SELL_MAX_AGE_DAYS} days"))
 
-        # Surface re-opened names on the tab itself. A count that only ever
-        # said "Sell Alerts" gave no reason to look, which is how a fresh leg
-        # of a half-sold play went unnoticed for an hour.
-        n_upd = sum(1 for sl in buckets["alerts"]
-                    if self._sell_alert_is_update(sl, sold))
-        self._sells_tab_lbl.configure(
-            text=f"Sell Alerts · {n_upd} new" if n_upd else "Sell Alerts")
-
-        n_owned = sum(1 for sl in sells
-                      if bought.get(str(sl.get("symbol") or "").upper()))
-        parts = [f"{len(sells)} in the last {SELL_MAX_AGE_DAYS} days"]
-        if n_owned:
-            parts.append(f"{n_owned} you bought")
-        self._sell_count_lbl.configure(text="   ·   ".join(parts))
-
-        self._sells_partial_lbl.configure(
-            text=f"Partial ({len(buckets['partial'])})" if buckets["partial"]
-            else "Partial")
-        self._sells_sold_lbl.configure(
-            text=f"Sold ({len(buckets['sold'])})" if buckets["sold"] else "Sold")
+        for lbl, key, word in ((self._sells_tab_lbl, "now", "Sell now"),
+                               (self._sells_holding_lbl, "holding", "Holding"),
+                               (self._sells_closed_lbl, "closed", "Closed")):
+            n = len(buckets[key])
+            lbl.configure(text=f"{word} ({n})" if n else word)
 
         empties = {
-            "alerts": ("No open exits",
-                       "Exits you have not sold yet land here. Ones you bought "
-                       "are marked green."),
-            "partial": ("Nothing half-sold",
-                        "A play sold at some accounts but not all shows up here."),
-            "sold": ("Nothing closed yet",
-                     "Exits move here once every account you bought is out."),
+            "now": ("Nothing to sell right now",
+                    "A play lands here the moment an exit is called at a "
+                    "brokerage where you still hold it."),
+            "holding": ("Nothing waiting",
+                        "Plays you still hold, where no exit has been called "
+                        "for those brokerages yet, wait here."),
+            "closed": ("Nothing closed yet",
+                       "A play moves here once you are out of it everywhere."),
         }
         for name, rows in buckets.items():
             if rows:
-                self._render_sells_list(grids[name], rows, open_pairs, bought,
-                                        sold, board)
+                for play in rows[:SELL_ALERTS_SHOWN]:
+                    self._sell_play_card(grids[name], play)
+                if len(rows) > SELL_ALERTS_SHOWN:
+                    tk.Label(grids[name],
+                             text=f"+{len(rows) - SELL_ALERTS_SHOWN} more - the "
+                                  f"Exits tab has the full board",
+                             bg=BG_CARD, fg=TEXT_MUTED,
+                             font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(10, 0))
             else:
                 title, body = empties[name]
                 self._empty_state(grids[name], "check", title, body,
                                   bg=BG_CARD, pad=14).pack(fill="x")
 
-        # Keep whichever tab was open, and re-apply its highlight.
-        self._switch_sells_tab(getattr(self, "_sells_tab_active", "alerts"))
+        self._switch_sells_tab(getattr(self, "_sells_tab_active", "now"))
 
-    def _render_sells_list(self, parent, rows: List[dict], open_pairs: set,
-                           bought: Dict[str, set], sold: Dict[str, set],
-                           board: Dict[str, str]) -> None:
-        """One tab's exits, under dated bands, newest day first."""
-        from collections import OrderedDict
-
-        shown = rows[:SELL_ALERTS_SHOWN]
-        grouped: OrderedDict = OrderedDict()
-        for sl in shown:
-            grouped.setdefault(str(sl.get("sell_date") or "Undated"), []).append(sl)
-
-        for date_str, day_rows in grouped.items():
-            self._sell_date_header(parent, date_str, len(day_rows))
-            for sl in day_rows:
-                self._sell_alert_row(parent, sl, open_pairs, bought, sold, board)
-
-        if len(rows) > len(shown):
-            tk.Label(parent,
-                     text=f"+{len(rows) - len(shown)} older exit(s) — the Exits "
-                          f"tab has the full board",
-                     bg=BG_CARD, fg=TEXT_MUTED,
-                     font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(10, 0))
-
-    def _sell_alert_row(self, parent, sell: dict, open_pairs: set,
-                        bought: Dict[str, set], sold: Dict[str, set],
-                        board: Dict[str, str]) -> None:
-        sym = str(sell.get("symbol") or "???").upper()
-        # Counted against the brokers THIS alert names, so "10 of 10 sold"
-        # means the ten accounts the alert is about — not every account that
-        # ever held the ticker anywhere.
-        _keys, bought_here, sold_here, still_open = self._sell_alert_scope(
-            sell, open_pairs, bought, sold)
-        n_bought = len(bought_here)
-        n_sold = len(sold_here)
-        owned = bool(n_bought)
-        is_update = still_open and self._sell_alert_is_update(sell, sold)
-
-        # Green is the ownership signal, not the done signal: every play we ever
-        # bought carries it, whether we are out of it or still holding. What
-        # changes with state is the badge and the action, not the colour.
-        stripe = GREEN if owned else BORDER
+    def _sell_play_card(self, parent, play) -> None:
+        """One play: a headline, then a line per brokerage state."""
         row_bg = BG_INPUT
-        row = tk.Frame(parent, bg=row_bg)
-        row.pack(fill="x", pady=(0, 5))
-        tk.Frame(row, bg=stripe, width=3).pack(side="left", fill="y")
-        inner = tk.Frame(row, bg=row_bg)
+        ready = play.of(SELL_NOW)
+        card = tk.Frame(parent, bg=row_bg)
+        card.pack(fill="x", pady=(0, 6))
+        tk.Frame(card, bg=RED if ready else (YELLOW if play.left else GREEN),
+                 width=3).pack(side="left", fill="y")
+        inner = tk.Frame(card, bg=row_bg)
         inner.pack(side="left", fill="x", expand=True, padx=(12, 14), pady=9)
 
-        top = tk.Frame(inner, bg=row_bg)
-        top.pack(fill="x")
-        tk.Label(top, text=sym, bg=row_bg,
-                 fg=GREEN if owned else TEXT_PRIMARY,
+        head = tk.Frame(inner, bg=row_bg)
+        head.pack(fill="x")
+        tk.Label(head, text=play.symbol, bg=row_bg, fg=TEXT_PRIMARY,
                  font=(FONT_FAMILY, 13, "bold")).pack(side="left")
-        px = sell.get("exit_price")
-        if px is not None:
-            tk.Label(top, text=f"  @ ${float(px):,.4f}".rstrip("0").rstrip("."),
-                     bg=row_bg, fg=TEXT_SECONDARY,
+        if play.exit_price is not None:
+            px = f"  @ ${float(play.exit_price):,.4f}".rstrip("0").rstrip(".")
+            tk.Label(head, text=px, bg=row_bg, fg=TEXT_SECONDARY,
                      font=(FONT_MONO, 9)).pack(side="left")
-
-        if owned and not still_open:
-            badge, colour = f" {icon('check')} SOLD · {n_sold} ACCOUNTS ", GREEN
-        elif owned and n_sold:
-            badge, colour = f" {n_sold} OF {n_bought} SOLD ", YELLOW
-        elif owned:
-            badge, colour = f" BOUGHT · {n_bought} ACCOUNTS ", GREEN
-        else:
-            badge, colour = "", ""
-        if badge:
-            tk.Label(top, text=badge, bg=_blend(colour, row_bg, 0.82), fg=colour,
-                     font=(FONT_FAMILY, 7, "bold"), pady=1).pack(
-                         side="left", padx=(10, 0))
-
-        # A ticker we are already part-way out of, with a fresh exit somewhere
-        # we still hold all of it. Worth calling out precisely because the name
-        # looks like something already dealt with.
-        if is_update:
-            where = ", ".join(rsa_feed.normalize_broker(k) for k in _keys).upper()
-            text = (f" {icon('up')} UPDATED · NEW SALE AT {where} " if where
-                    else f" {icon('up')} UPDATED · NEW SALE ")
-            tk.Label(top, text=text, bg=_blend(ACCENT, row_bg, 0.78), fg=ACCENT,
-                     font=(FONT_FAMILY, 7, "bold"), pady=1).pack(
-                         side="left", padx=(6, 0))
-
-        # What the SPLIT did, beside what WE did. "23 of 34 sold" says how far
-        # through the exit we are and nothing about whether there was a round-up
-        # to exit from — which is the next thing you ask every single time.
-        status = board.get(sym, "")
+        status = self._board_status_map().get(play.symbol, "")
         chip_text, chip_col = self._SELL_STATUS_CHIP.get(
             status, ("NOT ON THE BOARD", TEXT_MUTED) if not status
             else (status.replace("_", " ").upper(), TEXT_MUTED))
-        tk.Label(top, text=f" {chip_text} ", bg=_blend(chip_col, row_bg, 0.86),
+        tk.Label(head, text=f" {chip_text} ", bg=_blend(chip_col, row_bg, 0.86),
                  fg=chip_col, font=(FONT_FAMILY, 7, "bold"), pady=1).pack(
-                     side="left", padx=(6, 0))
+                     side="left", padx=(8, 0))
+        # Shares, always. Counting accounts is what told you LBGJ was "3/3
+        # sold" while three shares were still sitting at Robinhood.
+        summary = (f"{_qty_text(play.left)} of {_qty_text(play.bought)} shares left"
+                   if play.left else f"all {_qty_text(play.bought)} shares sold")
+        tk.Label(head, text=summary, bg=row_bg,
+                 fg=TEXT_SECONDARY if play.left else GREEN,
+                 font=(FONT_FAMILY, 9)).pack(side="right")
 
-        # Only offer the action for something we actually hold — an alerter
-        # exiting says nothing about our own position, and a closed play has
-        # nothing left to sell.
-        if still_open:
-            # The alert names the brokerage; the ticket should open armed at
-            # that one alone, not at every broker we happen to have linked.
-            keys = [b for b in _sell_leg_broker_keys(sell)
-                    if b in getattr(self, "_trade_broker_chips", {})]
-            if len(keys) == 1:
-                act_text = f"Sell 1 ea at {rsa_feed.normalize_broker(keys[0])} →"
-            elif keys:
-                act_text = f"Sell 1 ea at {len(keys)} brokers →"
-            else:
-                act_text = "Sell 1 ea →"
-            act = tk.Label(top, text=act_text,
+        for leg in ready:
+            line = tk.Frame(inner, bg=row_bg)
+            line.pack(fill="x", pady=(6, 0))
+            tk.Label(line, text="●", bg=row_bg, fg=RED,
+                     font=(FONT_FAMILY, 9)).pack(side="left", padx=(2, 7))
+            tk.Label(line, text=leg.label, bg=row_bg, fg=TEXT_PRIMARY,
+                     font=(FONT_FAMILY, 10, "bold")).pack(side="left")
+            tk.Label(line, text=f"   {_qty_text(leg.left)} sh", bg=row_bg,
+                     fg=TEXT_SECONDARY, font=(FONT_MONO, 9)).pack(side="left")
+            if leg.sold:
+                tk.Label(line, text=f"   ({_qty_text(leg.sold)} already sold)",
+                         bg=row_bg, fg=TEXT_MUTED,
+                         font=(FONT_FAMILY, 8)).pack(side="left")
+            act = tk.Label(line, text=f"Sell {_qty_text(leg.left)} →",
                            bg=_blend(RED, row_bg, 0.82), fg=RED,
                            font=(FONT_FAMILY, 9, "bold"), padx=10, pady=3,
                            cursor="hand2")
             act.pack(side="right")
             act.bind("<Button-1>",
-                     lambda e, sy=sym, k=keys: self._sell_alert_trade(sy, k))
-        elif not owned:
-            tk.Label(top, text="never bought", bg=row_bg, fg=TEXT_MUTED,
-                     font=(FONT_FAMILY, 8)).pack(side="right")
-        # The per-row date is gone: the dated header above it already says so,
-        # and repeating it on every line is what made the list read as one
-        # undivided column.
+                     lambda e, sy=play.symbol, k=[leg.broker]:
+                     self._sell_alert_trade(sy, k))
+            if leg.failed_accounts:
+                # The only thing worse than an exit you missed is one you think
+                # you took. Fidelity has rejected ONFO ten times.
+                tk.Label(line,
+                         text=f"  {icon('warning')} rejected {leg.failed_accounts}x",
+                         bg=row_bg, fg=YELLOW,
+                         font=(FONT_FAMILY, 8, "bold")).pack(side="right",
+                                                             padx=(0, 10))
+        for leg in ready:
+            if leg.fail_reason:
+                tk.Label(inner, text=f"      {leg.label}: {leg.fail_reason}",
+                         bg=row_bg, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
+                         justify="left", wraplength=740).pack(anchor="w")
 
-        legs = _sell_legs_text(sell)
-        if legs:
-            tk.Label(inner, text=legs, bg=row_bg, fg=TEXT_SECONDARY,
-                     font=(FONT_MONO, 8), justify="left",
-                     wraplength=760).pack(anchor="w", pady=(4, 0))
-        meta = []
-        proceeds = sell.get("proceeds_low")
-        if proceeds is not None:
-            hi = sell.get("proceeds_high")
-            cash = (f"+${float(proceeds):,.2f}"
-                    + (f"–${float(hi):,.2f}" if hi and hi > proceeds else ""))
-            # Say where the number came from. It is the ALERTER's account
-            # spread times their exit price — not our coverage and not our
-            # money — and an unqualified dollar figure on a row that also
-            # carries our own account counts reads as ours.
-            basis = _sell_accounts_label(sell)
-            meta.append(f"{cash} est. from {basis}" if basis else f"{cash} est.")
-        if sell.get("note"):
-            meta.append(str(sell["note"])[:110])
-        if meta:
-            tk.Label(inner, text="  ·  ".join(meta), bg=row_bg, fg=TEXT_MUTED,
-                     font=(FONT_FAMILY, 8), justify="left",
-                     wraplength=760).pack(anchor="w", pady=(2, 0))
-        self._bind_row_hover(row, row_bg, BG_CARD_ALT)
+        waiting = play.of(SELL_WAIT)
+        if waiting:
+            where = "  ".join(f"{l.label} {_qty_text(l.left)}" for l in waiting)
+            tk.Label(inner, text=f"○  holding, no exit called yet:  {where}",
+                     bg=row_bg, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
+                     justify="left", wraplength=740).pack(anchor="w", pady=(6, 0))
+        done = play.of(SELL_DONE)
+        if done:
+            where = "  ".join(f"{l.label} {_qty_text(l.sold)}" for l in done)
+            tk.Label(inner, text=f"{icon('check')}  sold:  {where}",
+                     bg=row_bg, fg=GREEN, font=(FONT_FAMILY, 8),
+                     justify="left", wraplength=740).pack(anchor="w", pady=(4, 0))
 
     def _sell_alert_trade(self, symbol: str, brokers: List[str]) -> None:
         """Sell-alert row → Trade Desk, armed only where the alert says.
