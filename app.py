@@ -95,6 +95,37 @@ AUTOSELL_WAIT_TICKS = 120
 # human instead of hammering the door.
 AUTOSELL_MAX_ATTEMPTS = 3
 
+# --- Confirmed round-up sweep -----------------------------------------------
+# A fraction is a decaying remnant and selling it is nearly always right. A
+# confirmed round-up is a whole share held on purpose, so the bar for touching a
+# batch of them in one press is higher, and these are the numbers that keep the
+# button off plays it has no business selling.
+#
+# WHICH ROUND-UPS A SWEEP MAY REACH
+#
+# Measured from when the BOARD confirmed the round-up (status_changed_at), not
+# from the alert date. The alert date is when the play was called, which can be
+# weeks before the split resolves — so an alert-date window throws away exactly
+# the case you want most: a play alerted a month ago that rounded up this
+# morning.
+#
+# Two rules, both on that clock:
+#
+#   1. Never before the WATERMARK — the moment this install first started
+#      watching round-ups. On a fresh setup that means a sweep reaches nothing
+#      retroactively at all, which is the safe default: the button cannot open
+#      by selling a backlog you never asked it to touch.
+#   2. Optionally further back, by ROUNDUP_BACKTRACK_CHOICES days, when you DO
+#      want to catch up. Off by default.
+#
+# Nothing else is needed to keep it off things already sold: sell_worklist
+# scopes brokers through held_accounts(), which nets sells and is split
+# adjusted, and the order reads live holdings before it is placed.
+ROUNDUP_BACKTRACK_CHOICES = (0, 3, 7, 14)
+# Ceiling on a single press, so a board that changes shape can't queue thirty
+# live orders off one click.
+ROUNDUP_SWEEP_MAX = 6
+
 load_dotenv(ENV_FILE)
 
 
@@ -723,6 +754,9 @@ SELLS_FILE = ROOT_DIR / "sells.json"
 # How many days of exits the dashboard SELL card shows. Exits stay useful only
 # while you might still be holding the position.
 SELL_MAX_AGE_DAYS = 10
+# Rows the Command Center card shows before deferring to the Exits tab.
+# Dated headers cost vertical space, so this is a card, not a ledger.
+SELL_ALERTS_SHOWN = 12
 
 
 def _load_sells() -> List[Dict[str, Any]]:
@@ -770,23 +804,42 @@ def _merge_sells(existing: List[Dict[str, Any]],
     return rows
 
 
+def _parse_iso_utc(value: Any) -> Optional[datetime]:
+    """Parse an ISO timestamp to an aware UTC datetime, or None.
+
+    Naive values are read as UTC: everything that writes one here
+    (lifecycle._now) is UTC already, and guessing local for a stray naive
+    string would shift a comparison by hours in the direction of selling MORE.
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def _sell_legs_text(sell: Dict[str, Any]) -> str:
-    """'Robinhood x3 · Fidelity x10' — which brokerage the alert says to sell on.
+    """'Robinhood · Fidelity' — which brokerage the alert says to sell on.
 
     This is the whole point of the SELL card: the Discord text names the
     brokerages, and that detail was previously parsed and thrown away.
+
+    The account counts that used to trail each name ('Public x21') are the
+    ALERTER's account spread, not ours, and printing them next to our own
+    coverage numbers invited reading one as the other. Brokerage only.
     """
     parts = []
+    seen = set()
     for leg in sell.get("legs") or []:
         if not isinstance(leg, dict):
             continue
         broker = str(leg.get("broker") or "").strip()
-        if not broker:
+        if not broker or broker in seen:
             continue
-        low = int(leg.get("accounts_low") or 0)
-        high = int(leg.get("accounts_high") or low)
-        n = f"{low}-{high}" if high > low else str(low)
-        parts.append(f"{broker} x{n}" if low else broker)
+        seen.add(broker)
+        parts.append(broker)
     return "  ·  ".join(parts)
 
 
@@ -1433,6 +1486,16 @@ class App(ctk.CTk):
         # the previous run already closed. Built here, before _build_frames,
         # because the Exits page renders the toggles.
         _as = self._load_autosell_state()
+        # Stamped on first use and never moved — see _roundup_watermark.
+        self._roundup_since: str = str(_as.get("roundup_since") or "")
+        _bt = _as.get("roundup_backtrack_days", ROUNDUP_BACKTRACK_CHOICES[0])
+        try:
+            _bt = int(_bt)
+        except (TypeError, ValueError):
+            _bt = ROUNDUP_BACKTRACK_CHOICES[0]
+        self._roundup_backtrack = tk.IntVar(
+            value=_bt if _bt in ROUNDUP_BACKTRACK_CHOICES else ROUNDUP_BACKTRACK_CHOICES[0])
+        self._roundup_chips: Dict[int, Any] = {}
         self._autosell_enabled = tk.BooleanVar(value=bool(_as.get("enabled")))
         self._autosell_dry_run = tk.BooleanVar(value=bool(_as.get("dry_run", True)))
         self._autosell_roundups = tk.BooleanVar(value=bool(_as.get("include_roundups")))
@@ -3539,20 +3602,51 @@ class App(ctk.CTk):
         self._partial_grid = tk.Frame(picks_body, bg=BG_CARD)
         self._purchased_grid = tk.Frame(picks_body, bg=BG_CARD)
 
-        # ---- Sell Alerts card ----
+        # ---- Sells card ----
         # The SELL channel names the brokerage for every exit; that was parsed
         # and dropped on the floor. Exits are never auto-traded (an alerter
         # selling says nothing about what you hold), so this is a worklist.
+        #
+        # Tabbed the same way Quick Picks is, and for the same reason: one flat
+        # list mixed "an exit on something I never owned", "I am half out of
+        # this" and "I am done with this" into a single column you had to read
+        # line by line.
         sell_card = RoundedFrame(frame, bg_color=BG_CARD, border_color=BORDER,
                                  radius=14)
         sell_card.pack(fill="x", pady=(12, 0))
 
         sell_header = tk.Frame(sell_card.inner, bg=BG_CARD)
         sell_header.pack(fill="x", padx=20, pady=(16, 8))
+        self._sells_tab_active = "alerts"   # "alerts", "partial" or "sold"
         tk.Label(sell_header, text=icon("down"), bg=BG_CARD, fg=RED,
                  font=(ICON_FONT, 12)).pack(side="left", padx=(0, 8))
-        tk.Label(sell_header, text="Sell Alerts", bg=BG_CARD, fg=TEXT_PRIMARY,
-                 font=(FONT_FAMILY, 13, "bold")).pack(side="left")
+
+        self._sells_tab_lbl = tk.Label(
+            sell_header, text="Sell Alerts", bg=BG_CARD, fg=TEXT_PRIMARY,
+            font=(FONT_FAMILY, 13, "bold"), cursor="hand2")
+        self._sells_tab_lbl.pack(side="left")
+        self._sells_tab_lbl.bind("<Button-1>",
+                                 lambda e: self._switch_sells_tab("alerts"))
+
+        tk.Label(sell_header, text="   |   ", bg=BG_CARD, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 12)).pack(side="left")
+        self._sells_partial_lbl = tk.Label(
+            sell_header, text="Partial", bg=BG_CARD, fg=TEXT_MUTED,
+            font=(FONT_FAMILY, 13, "bold"), cursor="hand2")
+        self._sells_partial_lbl.pack(side="left")
+        self._sells_partial_lbl.bind("<Button-1>",
+                                     lambda e: self._switch_sells_tab("partial"))
+
+        tk.Label(sell_header, text="   |   ", bg=BG_CARD, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 12)).pack(side="left")
+        self._sells_sold_lbl = tk.Label(
+            sell_header, text="Sold", bg=BG_CARD, fg=TEXT_MUTED,
+            font=(FONT_FAMILY, 13, "bold"), cursor="hand2")
+        self._sells_sold_lbl.pack(side="left")
+        self._sells_sold_lbl.bind("<Button-1>",
+                                  lambda e: self._switch_sells_tab("sold"))
+        tk.Label(sell_header, text=icon("down"), bg=BG_CARD, fg=RED,
+                 font=(ICON_FONT, 12)).pack(side="left", padx=(0, 8))
         self._sell_count_lbl = tk.Label(sell_header, text="", bg=BG_CARD,
                                         fg=TEXT_MUTED,
                                         font=(FONT_FAMILY, 9))
@@ -3560,27 +3654,159 @@ class App(ctk.CTk):
         tk.Label(sell_header, text="FROM DISCORD · NEVER AUTO-TRADED", bg=BG_CARD,
                  fg=TEXT_MUTED, font=(FONT_FAMILY, 7, "bold")).pack(side="right")
 
-        self._sell_grid = tk.Frame(sell_card.inner, bg=BG_CARD)
-        self._sell_grid.pack(fill="x", padx=20, pady=(0, 16))
+        sell_body = tk.Frame(sell_card.inner, bg=BG_CARD)
+        sell_body.pack(fill="x", padx=20, pady=(0, 16))
+        self._sell_grid = tk.Frame(sell_body, bg=BG_CARD)
+        self._sell_grid.pack(fill="x")
+        # hidden until their tab is selected, same as the picks card
+        self._sell_partial_grid = tk.Frame(sell_body, bg=BG_CARD)
+        self._sell_sold_grid = tk.Frame(sell_body, bg=BG_CARD)
         self._render_sell_alerts()
 
         # Fetch picks in background on startup
         self.after(300, self._reload_quick_picks)
 
+    def _sell_alert_position_map(self) -> tuple:
+        """(open symbols, accounts bought per symbol, accounts sold per symbol).
+
+        Accounts rather than shares: a sell-alert row is about coverage — "I was
+        in this at 21 accounts and I am out of all 21" — and on an RSA play the
+        share count is 1 everywhere anyway.
+        """
+        try:
+            open_syms = {sym for (_b, sym) in trade_journal.get_portfolio()}
+            trades = trade_journal.get_trades()
+        except Exception:
+            return set(), {}, {}
+        bought: Dict[str, set] = {}
+        sold: Dict[str, set] = {}
+        for t in trades:
+            sym = str(t.get("symbol") or "").upper()
+            if not sym:
+                continue
+            acct = (t.get("broker"), t.get("account_id"))
+            side = t.get("side")
+            if side == "buy":
+                bought.setdefault(sym, set()).add(acct)
+            elif side in ("sell", trade_journal.SIDE_CLOSE):
+                sold.setdefault(sym, set()).add(acct)
+        return open_syms, bought, sold
+
+    def _sell_date_header(self, parent, date_str: str, n: int) -> None:
+        """A dated band across the list.
+
+        The exits used to run together as one undivided column with the date
+        shrunk into the right-hand end of each row, so "what came in today" was
+        something you read for rather than saw.
+        """
+        try:
+            d = datetime.strptime(str(date_str), "%Y-%m-%d").date()
+            display = d.strftime("%B %d, %Y").upper()
+            days = (datetime.now().date() - d).days
+            rel = ("TODAY" if days <= 0 else
+                   "YESTERDAY" if days == 1 else f"{days} DAYS AGO")
+        except (ValueError, TypeError):
+            display, rel = str(date_str).upper(), ""
+
+        hdr = tk.Frame(parent, bg=BG_CARD)
+        hdr.pack(fill="x", pady=(14, 5))
+        tk.Label(hdr, text=display, bg=BG_CARD, fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 9, "bold")).pack(side="left")
+        if rel:
+            tk.Label(hdr, text=f"   {rel}", bg=BG_CARD, fg=ACCENT,
+                     font=(FONT_FAMILY, 8, "bold")).pack(side="left")
+        tk.Label(hdr, text=f"{n} exit{'s' if n != 1 else ''}", bg=BG_CARD,
+                 fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).pack(side="right")
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", pady=(0, 6))
+
+    def _switch_sells_tab(self, tab: str) -> None:
+        """Switch between Sell Alerts / Partial / Sold."""
+        self._sells_tab_active = tab
+        grids = {"alerts": self._sell_grid,
+                 "partial": self._sell_partial_grid,
+                 "sold": self._sell_sold_grid}
+        for g in grids.values():
+            g.pack_forget()
+        grids.get(tab, self._sell_grid).pack(fill="x")
+        self._sells_tab_lbl.configure(
+            fg=TEXT_PRIMARY if tab == "alerts" else TEXT_MUTED)
+        self._sells_partial_lbl.configure(
+            fg=YELLOW if tab == "partial" else TEXT_MUTED)
+        self._sells_sold_lbl.configure(
+            fg=GREEN if tab == "sold" else TEXT_MUTED)
+
+    # Board status -> (chip text, colour). Written out in full, because the
+    # raw words do not survive contact: "pending" and "new" are the two that
+    # actually have to be told apart, and neither says which is which — one
+    # means the split is declared and we are waiting on it, the other means
+    # nothing has happened at all.
+    _SELL_STATUS_CHIP = {
+        "rounded_up":   ("ROUND-UP CONFIRMED", GREEN),
+        "fractional":   ("FRACTION RETURNED", ACCENT),
+        "cash_in_lieu": ("SETTLED AS CASH", TEXT_MUTED),
+        "canceled":     ("SPLIT CANCELLED", YELLOW),
+        "low_odds":     ("LOW ODDS", TEXT_MUTED),
+        "pending":      ("SPLIT DECLARED · WAITING", YELLOW),
+        "new":          ("ALERTED · NOTHING YET", TEXT_MUTED),
+        "unknown":      ("STATUS UNKNOWN", TEXT_MUTED),
+    }
+
+    def _board_status_map(self) -> Dict[str, str]:
+        """SYMBOL -> board status, filed under BOTH tickers a play can carry.
+
+        A renamed play (AGAE -> AIFA) has to answer to either name: the sell
+        alert can arrive under the new ticker while the journal still knows the
+        old one, and a lookup that only tries one of them silently reports
+        "not on the board" for a play sitting right there on it.
+        """
+        out: Dict[str, str] = {}
+        for row in getattr(self, "_track_rows", ()) or ():
+            status = str(getattr(row, "status", "") or "")
+            if not status:
+                continue
+            for name in (getattr(row, "symbol", ""), getattr(row, "sell_symbol", "")):
+                if name:
+                    out[str(name).upper()] = status
+        return out
+
+    def _sell_alert_state(self, sym: str, open_syms: set,
+                          bought: Dict[str, set], sold: Dict[str, set]) -> str:
+        """Which of the three buckets an exit belongs in.
+
+          sold      bought, and nothing left open — done with it
+          partial   still open somewhere, but some accounts are already out
+          alerts    still fully open, or an exit on something we never bought
+
+        GREEN means "I bought this", for all of the first two and the open half
+        of the third. Reserving green for closed plays only answered "am I out",
+        when the question on this card is "was this ever mine".
+        """
+        if not bought.get(sym):
+            return "alerts"
+        if sym not in open_syms:
+            return "sold"
+        return "partial" if sold.get(sym) else "alerts"
+
     def _render_sell_alerts(self) -> None:
-        """Recent exits, newest first. Fed by the cloud, or by Discord when
-        this machine is the one running the feed."""
+        """Recent exits, split across three tabs and grouped by the day called.
+
+        Mirrors the Quick Picks card deliberately — Sell Alerts / Partial / Sold
+        against Quick Picks / Partial / Purchased — because they are the same
+        shape of question at the two ends of a play.
+        """
         grid = getattr(self, "_sell_grid", None)
         if grid is None:
             return
-        for w in grid.winfo_children():
-            w.destroy()
+        grids = {"alerts": self._sell_grid,
+                 "partial": self._sell_partial_grid,
+                 "sold": self._sell_sold_grid}
+        for g in grids.values():
+            for w in g.winfo_children():
+                w.destroy()
 
         sells = _load_sells()
-        self._sell_count_lbl.configure(
-            text=f"{len(sells)} in the last {SELL_MAX_AGE_DAYS} days" if sells else "")
-
         if not sells:
+            self._sell_count_lbl.configure(text="")
             self._empty_state(
                 grid, "info", "No sell alerts yet",
                 "Exits arrive with your subscription once this device is "
@@ -3589,72 +3815,172 @@ class App(ctk.CTk):
                 bg=BG_CARD, pad=16).pack(fill="x")
             return
 
-        held = {s for (_b, s) in trade_journal.get_portfolio()}
-        for sell in sells[:12]:
-            sym = str(sell.get("symbol") or "???").upper()
-            row_bg = BG_INPUT
-            row = tk.Frame(grid, bg=row_bg)
-            row.pack(fill="x", pady=(0, 5))
-            tk.Frame(row, bg=RED if sym in held else BORDER, width=3).pack(
-                side="left", fill="y")
-            inner = tk.Frame(row, bg=row_bg)
-            inner.pack(side="left", fill="x", expand=True, padx=(12, 14), pady=9)
+        open_syms, bought, sold = self._sell_alert_position_map()
+        board = self._board_status_map()
 
-            top = tk.Frame(inner, bg=row_bg)
-            top.pack(fill="x")
-            tk.Label(top, text=sym, bg=row_bg, fg=TEXT_PRIMARY,
-                     font=(FONT_FAMILY, 13, "bold")).pack(side="left")
-            px = sell.get("exit_price")
-            if px is not None:
-                tk.Label(top, text=f"  @ ${float(px):,.4f}".rstrip("0").rstrip("."),
-                         bg=row_bg, fg=TEXT_SECONDARY,
-                         font=(FONT_MONO, 9)).pack(side="left")
-            # Only offer the action for something we actually hold — an alerter
-            # exiting says nothing about our own position.
-            if sym in held:
-                # The alert names the brokerage; the ticket should open armed at
-                # that one alone, not at every broker we happen to have linked.
-                keys = [b for b in _sell_leg_broker_keys(sell)
-                        if b in getattr(self, "_trade_broker_chips", {})]
-                if len(keys) == 1:
-                    act_text = f"Sell 1 ea at {rsa_feed.normalize_broker(keys[0])} →"
-                elif keys:
-                    act_text = f"Sell 1 ea at {len(keys)} brokers →"
-                else:
-                    act_text = "Sell 1 ea →"
-                act = tk.Label(top, text=act_text,
-                               bg=_blend(RED, row_bg, 0.82), fg=RED,
-                               font=(FONT_FAMILY, 9, "bold"), padx=10, pady=3,
-                               cursor="hand2")
-                act.pack(side="right")
-                act.bind("<Button-1>",
-                         lambda e, s=sym, k=keys: self._sell_alert_trade(s, k))
+        buckets: Dict[str, list] = {"alerts": [], "partial": [], "sold": []}
+        for sl in sells:
+            sym = str(sl.get("symbol") or "").upper()
+            buckets[self._sell_alert_state(sym, open_syms, bought, sold)].append(sl)
+
+        n_owned = sum(1 for sl in sells
+                      if bought.get(str(sl.get("symbol") or "").upper()))
+        parts = [f"{len(sells)} in the last {SELL_MAX_AGE_DAYS} days"]
+        if n_owned:
+            parts.append(f"{n_owned} you bought")
+        self._sell_count_lbl.configure(text="   ·   ".join(parts))
+
+        self._sells_partial_lbl.configure(
+            text=f"Partial ({len(buckets['partial'])})" if buckets["partial"]
+            else "Partial")
+        self._sells_sold_lbl.configure(
+            text=f"Sold ({len(buckets['sold'])})" if buckets["sold"] else "Sold")
+
+        empties = {
+            "alerts": ("No open exits",
+                       "Exits you have not sold yet land here. Ones you bought "
+                       "are marked green."),
+            "partial": ("Nothing half-sold",
+                        "A play sold at some accounts but not all shows up here."),
+            "sold": ("Nothing closed yet",
+                     "Exits move here once every account you bought is out."),
+        }
+        for name, rows in buckets.items():
+            if rows:
+                self._render_sells_list(grids[name], rows, open_syms, bought,
+                                        sold, board)
             else:
-                tk.Label(top, text="not held", bg=row_bg, fg=TEXT_MUTED,
-                         font=(FONT_FAMILY, 8)).pack(side="right")
-            if sell.get("sell_date"):
-                tk.Label(top, text=str(sell["sell_date"]), bg=row_bg,
-                         fg=TEXT_MUTED, font=(FONT_MONO, 8)).pack(
-                             side="right", padx=(0, 14))
+                title, body = empties[name]
+                self._empty_state(grids[name], "check", title, body,
+                                  bg=BG_CARD, pad=14).pack(fill="x")
 
-            legs = _sell_legs_text(sell)
-            if legs:
-                tk.Label(inner, text=legs, bg=row_bg, fg=TEXT_SECONDARY,
-                         font=(FONT_MONO, 8), justify="left",
-                         wraplength=760).pack(anchor="w", pady=(4, 0))
-            meta = []
-            proceeds = sell.get("proceeds_low")
-            if proceeds is not None:
-                hi = sell.get("proceeds_high")
-                meta.append(f"+${float(proceeds):,.2f}"
-                            + (f"–${float(hi):,.2f}" if hi and hi > proceeds else ""))
-            if sell.get("note"):
-                meta.append(str(sell["note"])[:110])
-            if meta:
-                tk.Label(inner, text="  ·  ".join(meta), bg=row_bg, fg=TEXT_MUTED,
-                         font=(FONT_FAMILY, 8), justify="left",
-                         wraplength=760).pack(anchor="w", pady=(2, 0))
-            self._bind_row_hover(row, row_bg, BG_CARD_ALT)
+        # Keep whichever tab was open, and re-apply its highlight.
+        self._switch_sells_tab(getattr(self, "_sells_tab_active", "alerts"))
+
+    def _render_sells_list(self, parent, rows: List[dict], open_syms: set,
+                           bought: Dict[str, set], sold: Dict[str, set],
+                           board: Dict[str, str]) -> None:
+        """One tab's exits, under dated bands, newest day first."""
+        from collections import OrderedDict
+
+        shown = rows[:SELL_ALERTS_SHOWN]
+        grouped: OrderedDict = OrderedDict()
+        for sl in shown:
+            grouped.setdefault(str(sl.get("sell_date") or "Undated"), []).append(sl)
+
+        for date_str, day_rows in grouped.items():
+            self._sell_date_header(parent, date_str, len(day_rows))
+            for sl in day_rows:
+                self._sell_alert_row(parent, sl, open_syms, bought, sold, board)
+
+        if len(rows) > len(shown):
+            tk.Label(parent,
+                     text=f"+{len(rows) - len(shown)} older exit(s) — the Exits "
+                          f"tab has the full board",
+                     bg=BG_CARD, fg=TEXT_MUTED,
+                     font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(10, 0))
+
+    def _sell_alert_row(self, parent, sell: dict, open_syms: set,
+                        bought: Dict[str, set], sold: Dict[str, set],
+                        board: Dict[str, str]) -> None:
+        sym = str(sell.get("symbol") or "???").upper()
+        n_bought = len(bought.get(sym, ()))
+        n_sold = len(sold.get(sym, ()))
+        owned = bool(n_bought)
+        still_open = sym in open_syms
+
+        # Green is the ownership signal, not the done signal: every play we ever
+        # bought carries it, whether we are out of it or still holding. What
+        # changes with state is the badge and the action, not the colour.
+        stripe = GREEN if owned else BORDER
+        row_bg = BG_INPUT
+        row = tk.Frame(parent, bg=row_bg)
+        row.pack(fill="x", pady=(0, 5))
+        tk.Frame(row, bg=stripe, width=3).pack(side="left", fill="y")
+        inner = tk.Frame(row, bg=row_bg)
+        inner.pack(side="left", fill="x", expand=True, padx=(12, 14), pady=9)
+
+        top = tk.Frame(inner, bg=row_bg)
+        top.pack(fill="x")
+        tk.Label(top, text=sym, bg=row_bg,
+                 fg=GREEN if owned else TEXT_PRIMARY,
+                 font=(FONT_FAMILY, 13, "bold")).pack(side="left")
+        px = sell.get("exit_price")
+        if px is not None:
+            tk.Label(top, text=f"  @ ${float(px):,.4f}".rstrip("0").rstrip("."),
+                     bg=row_bg, fg=TEXT_SECONDARY,
+                     font=(FONT_MONO, 9)).pack(side="left")
+
+        if owned and not still_open:
+            badge, colour = f" {icon('check')} SOLD · {n_sold} ACCOUNTS ", GREEN
+        elif owned and n_sold:
+            badge, colour = f" {n_sold} OF {n_bought} SOLD ", YELLOW
+        elif owned:
+            badge, colour = f" BOUGHT · {n_bought} ACCOUNTS ", GREEN
+        else:
+            badge, colour = "", ""
+        if badge:
+            tk.Label(top, text=badge, bg=_blend(colour, row_bg, 0.82), fg=colour,
+                     font=(FONT_FAMILY, 7, "bold"), pady=1).pack(
+                         side="left", padx=(10, 0))
+
+        # What the SPLIT did, beside what WE did. "23 of 34 sold" says how far
+        # through the exit we are and nothing about whether there was a round-up
+        # to exit from — which is the next thing you ask every single time.
+        status = board.get(sym, "")
+        chip_text, chip_col = self._SELL_STATUS_CHIP.get(
+            status, ("NOT ON THE BOARD", TEXT_MUTED) if not status
+            else (status.replace("_", " ").upper(), TEXT_MUTED))
+        tk.Label(top, text=f" {chip_text} ", bg=_blend(chip_col, row_bg, 0.86),
+                 fg=chip_col, font=(FONT_FAMILY, 7, "bold"), pady=1).pack(
+                     side="left", padx=(6, 0))
+
+        # Only offer the action for something we actually hold — an alerter
+        # exiting says nothing about our own position, and a closed play has
+        # nothing left to sell.
+        if still_open:
+            # The alert names the brokerage; the ticket should open armed at
+            # that one alone, not at every broker we happen to have linked.
+            keys = [b for b in _sell_leg_broker_keys(sell)
+                    if b in getattr(self, "_trade_broker_chips", {})]
+            if len(keys) == 1:
+                act_text = f"Sell 1 ea at {rsa_feed.normalize_broker(keys[0])} →"
+            elif keys:
+                act_text = f"Sell 1 ea at {len(keys)} brokers →"
+            else:
+                act_text = "Sell 1 ea →"
+            act = tk.Label(top, text=act_text,
+                           bg=_blend(RED, row_bg, 0.82), fg=RED,
+                           font=(FONT_FAMILY, 9, "bold"), padx=10, pady=3,
+                           cursor="hand2")
+            act.pack(side="right")
+            act.bind("<Button-1>",
+                     lambda e, sy=sym, k=keys: self._sell_alert_trade(sy, k))
+        elif not owned:
+            tk.Label(top, text="never bought", bg=row_bg, fg=TEXT_MUTED,
+                     font=(FONT_FAMILY, 8)).pack(side="right")
+        # The per-row date is gone: the dated header above it already says so,
+        # and repeating it on every line is what made the list read as one
+        # undivided column.
+
+        legs = _sell_legs_text(sell)
+        if legs:
+            tk.Label(inner, text=legs, bg=row_bg, fg=TEXT_SECONDARY,
+                     font=(FONT_MONO, 8), justify="left",
+                     wraplength=760).pack(anchor="w", pady=(4, 0))
+        meta = []
+        proceeds = sell.get("proceeds_low")
+        if proceeds is not None:
+            hi = sell.get("proceeds_high")
+            meta.append(f"+${float(proceeds):,.2f}"
+                        + (f"–${float(hi):,.2f}" if hi and hi > proceeds else ""))
+        if sell.get("note"):
+            meta.append(str(sell["note"])[:110])
+        if meta:
+            tk.Label(inner, text="  ·  ".join(meta), bg=row_bg, fg=TEXT_MUTED,
+                     font=(FONT_FAMILY, 8), justify="left",
+                     wraplength=760).pack(anchor="w", pady=(2, 0))
+        self._bind_row_hover(row, row_bg, BG_CARD_ALT)
 
     def _sell_alert_trade(self, symbol: str, brokers: List[str]) -> None:
         """Sell-alert row → Trade Desk, armed only where the alert says.
@@ -11191,6 +11517,10 @@ class App(ctk.CTk):
                        f"at most {AUTOSELL_MAX_PER_PULL} plays per pull; never the same "
                        "play twice.")).pack(fill="x", pady=(6, 10))
 
+        # Two sweeps now, so the armed/confirm state is per button. It was a
+        # bare bool, which would have let one button's confirm arm the other's.
+        self._sweep_armed: Dict[str, bool] = {}
+
         opts = tk.Frame(body, bg=BG_CARD)
         opts.pack(fill="x")
         for var, text in ((self._autosell_enabled, "Arm auto-sell"),
@@ -11215,6 +11545,44 @@ class App(ctk.CTk):
         btn_row = tk.Frame(body, bg=BG_CARD)
         btn_row.pack(anchor="w", pady=(10, 0))
         self._sweep_btn.pack(in_=btn_row, side="left")
+
+        # The round-ups are the other half of the board and had no bulk action
+        # at all — every confirmed split had to be sold one row at a time. Its
+        # own button rather than a wider fractional sweep, because the two have
+        # different rules: see _roundup_sweep.
+        self._roundup_btn = tk.Button(
+            btn_row, text="Sell confirmed round-ups", command=self._roundup_sweep,
+            bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_CARD,
+            activeforeground=TEXT_PRIMARY, font=(FONT_FAMILY, 9, "bold"),
+            relief="flat", bd=0, padx=14, pady=7, cursor="hand2",
+        )
+        self._roundup_btn.pack(side="left", padx=(8, 0))
+
+        # How far back that button may reach. Off by default: the sweep should
+        # never open its career by selling a backlog nobody asked it to touch.
+        back_row = tk.Frame(body, bg=BG_CARD)
+        back_row.pack(anchor="w", pady=(10, 0))
+        tk.Label(back_row, text="ROUND-UP SWEEP REACHES BACK", bg=BG_CARD,
+                 fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 8, "bold")).pack(anchor="w", pady=(0, 5))
+        chips = tk.Frame(back_row, bg=BG_CARD)
+        chips.pack(anchor="w")
+        current_bt = self._roundup_backtrack_days()
+        for days in ROUNDUP_BACKTRACK_CHOICES:
+            chip = self._make_chip(
+                chips, "Since setup" if days == 0 else f"+{days} days",
+                lambda d=days: self._set_roundup_backtrack(d),
+                selected=(days == current_bt))
+            chip.pack(side="left", padx=(0, 8))
+            self._roundup_chips[days] = chip
+        tk.Label(back_row, bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
+                 justify="left", anchor="w", wraplength=760,
+                 text=("Measured from when the BOARD confirmed the round-up, not "
+                       "from the alert date. 'Since setup' means it only touches "
+                       "round-ups confirmed after this install started watching — "
+                       "nothing retroactive. Widen it only to clear a backlog on "
+                       "purpose; anything outside the window is still on the list "
+                       "below to sell one at a time.")).pack(anchor="w", pady=(6, 0))
 
         # "Sold once, ever" is what stops a re-pull selling twice, and it is
         # also what makes a play that FAILED disappear from the sweep for good.
@@ -11247,9 +11615,11 @@ class App(ctk.CTk):
         self._autosell_sold.clear()
         self._autosell_fails.clear()
         self._save_autosell_state()
-        self._log(f"Auto-sell: cleared {n} attempted play(s) — the sweep will "
+        self._log(f"Auto-sell: cleared {n} attempted play(s) — both sweeps will "
                   f"offer them again.")
-        self._sweep_say(f"Cleared {n} — press Sell all fractionals")
+        # The record is shared, so say so: clearing it from the fractional
+        # button also re-opens the confirmed round-ups.
+        self._sweep_say(f"Cleared {n} — press either sweep", hold_ms=5000)
 
     def _autosell_toggled(self, save: bool = True) -> None:
         armed = bool(self._autosell_enabled.get())
@@ -11350,12 +11720,35 @@ class App(ctk.CTk):
             for t in frac:
                 self._exits_row(t)
 
-        if whole:
+        # Split out, because they are not the same job and the bulk button only
+        # covers the first: a confirmed round-up is a share the split handed
+        # you, a cancelled play is one where the split never happened.
+        rounded = [t for t in whole if t.status == "rounded_up"]
+        other = [t for t in whole if t.status != "rounded_up"]
+
+        if rounded:
+            board_state = lifecycle.load_state()
+            n_old = sum(1 for t in rounded
+                        if not self._roundup_in_window(t, board_state))
+            sub = ("The split rounded you up to a whole share. Sellable at any "
+                   "broker you hold it in, and covered by Sell confirmed "
+                   "round-ups above.")
+            if n_old:
+                sub += (f"  {n_old} of these were confirmed before the sweep's "
+                        f"window — still sellable here one at a time, but the "
+                        f"bulk button leaves them alone.")
             self._exits_group_header(
-                self._exits_list, "ROUND-UP / CANCELLED",
-                "A whole share exists. Sellable at any broker you hold it in.",
-                len(whole))
-            for t in whole:
+                self._exits_list, "CONFIRMED ROUND-UPS", sub, len(rounded))
+            for t in rounded:
+                self._exits_row(t)
+
+        if other:
+            self._exits_group_header(
+                self._exits_list, "CANCELLED",
+                "The split was called off, so you still hold the whole share. "
+                "Sellable at any broker you hold it in — never swept in bulk.",
+                len(other))
+            for t in other:
                 self._exits_row(t)
 
     def _exits_row(self, task) -> None:
@@ -11703,11 +12096,74 @@ class App(ctk.CTk):
             # Bounded: this only has to outlive a re-pull of the same board, and
             # an unbounded list would grow for the life of the install.
             "sold": list(self._autosell_sold)[-500:],
+            "roundup_since": self._roundup_watermark(),
+            "roundup_backtrack_days": self._roundup_backtrack_days(),
         }
         try:
             AUTOSELL_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
         except OSError as exc:
             self._log(f"Auto-sell: could not save state — {exc}", "warn")
+
+    # ---- Round-up sweep window ---------------------------------------------
+
+    def _roundup_watermark(self) -> str:
+        """ISO timestamp this install first started watching round-ups.
+
+        Stamped once, on first read, and never moved. It is what makes the
+        sweep safe to press the day you find it: everything the board confirmed
+        before this moment is out of reach unless you deliberately backtrack,
+        so the button cannot open its career by selling a month of positions
+        you had already dealt with by hand.
+        """
+        mark = getattr(self, "_roundup_since", "")
+        if not mark:
+            mark = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+            self._roundup_since = mark
+        return mark
+
+    def _roundup_backtrack_days(self) -> int:
+        try:
+            days = int(self._roundup_backtrack.get())
+        except (AttributeError, TypeError, ValueError, tk.TclError):
+            return ROUNDUP_BACKTRACK_CHOICES[0]
+        return days if days in ROUNDUP_BACKTRACK_CHOICES else ROUNDUP_BACKTRACK_CHOICES[0]
+
+    def _roundup_cutoff(self) -> datetime:
+        """Earliest confirmation time a sweep will touch."""
+        base = _parse_iso_utc(self._roundup_watermark()) or datetime.now(timezone.utc)
+        return base - timedelta(days=self._roundup_backtrack_days())
+
+    def _roundup_confirmed_at(self, task, board_state=None):
+        """When the board moved this play into its current status, or None.
+
+        Read from the lifecycle state rather than the row, because that is the
+        only place the transition time is kept — LifecycleRow carries what the
+        board says now, not when it started saying it.
+        """
+        state = board_state if board_state is not None else lifecycle.load_state()
+        row = (state.get("rows") or {}).get(self._autosell_key(task)) or {}
+        return _parse_iso_utc(row.get("status_changed_at"))
+
+    def _roundup_in_window(self, task, board_state=None) -> bool:
+        """Is this round-up inside the sweep's reach?
+
+        An unknown confirmation time counts as OUT. The window exists to keep a
+        bulk button off positions we cannot place in time, and "no timestamp" is
+        not evidence of recency.
+        """
+        at = self._roundup_confirmed_at(task, board_state)
+        return at is not None and at >= self._roundup_cutoff()
+
+    def _set_roundup_backtrack(self, days: int) -> None:
+        days = int(days)
+        self._roundup_backtrack.set(days)
+        for d, chip in getattr(self, "_roundup_chips", {}).items():
+            self._style_chip(chip, d == days)
+        self._save_autosell_state()
+        self._log(f"Round-ups: backtrack set to "
+                  + ("none — only what was confirmed since this install started "
+                     "watching" if not days else f"{days} days before that"))
+        self._render_exits()
 
     def _autosell_key(self, task) -> str:
         """One play's identity. The ALERT symbol, deliberately: a play that
@@ -11787,24 +12243,19 @@ class App(ctk.CTk):
             self._push_notification("Pull the board first — nothing to sweep.", "warning")
             return
 
-        fractional = [t for t in lifecycle.sell_worklist(self._track_rows)
-                      if t.brokers and t.is_fractional]
-        tasks = [t for t in fractional
-                 if self._autosell_key(t) not in self._autosell_sold]
+        # NOT filtered by the sold-once record. That record exists to stop the
+        # AUTOMATIC path double-firing on a re-pull; applied to a button the
+        # user pressed on purpose it only buries plays — a play that failed
+        # three times, or one whose ticker came back around, would never be
+        # offered again. The real double-sell guards are underneath it and do
+        # not care how many times we have looked: sell_worklist scopes brokers
+        # through held_accounts(), which nets sells and is split-adjusted, and
+        # the order still reads live holdings before it is placed.
+        tasks = [t for t in lifecycle.sell_worklist(self._track_rows)
+                 if t.brokers and t.is_fractional]
         if not tasks:
-            # "Nothing to sell" and "everything here has already been tried" are
-            # completely different answers, and showing the first when the
-            # second is true is how a full worklist reads as an empty one.
-            held_back = len(fractional)
-            if held_back:
-                self._sweep_say(f"All {held_back} already tried — use Retry skipped",
-                                hold_ms=5000)
-                self._push_notification(
-                    f"{held_back} fractional play(s) on the board have already been "
-                    f"attempted. Retry skipped to try them again.", "info")
-            else:
-                self._sweep_say("Nothing fractional to sell")
-                self._push_notification("No fractional positions to sell.", "info")
+            self._sweep_say("Nothing fractional to sell")
+            self._push_notification("No fractional positions to sell.", "info")
             return
 
         state, label, _ = _market_status()
@@ -11822,8 +12273,8 @@ class App(ctk.CTk):
         # Two clicks, and the second one knows the count. No modal: the button
         # states what it is about to do and waits, which is the same protection
         # with none of the dialog's ability to be dismissed by reflex.
-        if not getattr(self, "_sweep_armed", False):
-            self._sweep_armed = True
+        if not self._sweep_armed.get("fractional"):
+            self._sweep_armed["fractional"] = True
             syms = ", ".join(t.symbol for t in tasks[:6])
             more = f" +{len(tasks) - 6} more" if len(tasks) > 6 else ""
             self._sweep_btn.configure(
@@ -11831,10 +12282,14 @@ class App(ctk.CTk):
             # Long enough to actually read the tickers before deciding. At 8s
             # this expired while you were still reading it, so the second click
             # only re-armed and the button appeared to do nothing.
-            self.after(20000, self._autosell_sweep_disarm)
+            self.after(20000, lambda: self._sweep_disarm("fractional"))
             return
 
-        self._sweep_armed = False
+        self._sweep_armed["fractional"] = False
+        # Release any historical claim on exactly these plays, so the pump does
+        # not drop what the user just confirmed. Deliberately scoped to the
+        # tasks in hand rather than clearing the whole record.
+        self._autosell_unclaim(tasks)
         self._autosell_queue.extend(tasks)
         self._log(f"Sweep: queued {len(tasks)} fractional play(s) — "
                   f"{', '.join(t.symbol for t in tasks)}"
@@ -11846,40 +12301,159 @@ class App(ctk.CTk):
         self._sweep_progress()
         self._autosell_pump()
 
-    def _sweep_say(self, msg: str, hold_ms: int = 3000) -> None:
-        """Put a sentence on the button, then let it go back to normal."""
-        if not hasattr(self, "_sweep_btn"):
-            return
-        self._sweep_armed = False
-        self._sweep_btn.configure(text=msg, bg=BG_INPUT)
-        self.after(hold_ms, self._autosell_sweep_disarm)
+    # Both sweeps drive their button through one set of helpers: same states,
+    # same timers, different widget and resting label. Duplicating them is how
+    # one button ends up with a progress label the other never got.
+    _SWEEP_BUTTONS = {
+        "fractional": ("_sweep_btn", "Sell all fractionals now"),
+        "roundup": ("_roundup_btn", "Sell confirmed round-ups"),
+    }
 
-    def _sweep_progress(self) -> None:
+    def _sweep_button(self, which: str):
+        attr, resting = self._SWEEP_BUTTONS.get(
+            which, self._SWEEP_BUTTONS["fractional"])
+        return getattr(self, attr, None), resting
+
+    def _sweep_say(self, msg: str, hold_ms: int = 3000,
+                   which: str = "fractional") -> None:
+        """Put a sentence on the button, then let it go back to normal."""
+        btn, _resting = self._sweep_button(which)
+        if btn is None:
+            return
+        self._sweep_armed[which] = False
+        btn.configure(text=msg, bg=BG_INPUT)
+        self.after(hold_ms, lambda: self._sweep_disarm(which))
+
+    def _sweep_progress(self, which: str = "fractional") -> None:
         """Follow the queue on the button until it drains."""
-        if not hasattr(self, "_sweep_btn"):
+        btn, _resting = self._sweep_button(which)
+        if btn is None:
             return
         left = len(self._autosell_queue)
         busy = getattr(self, "_trade_in_flight", False)
         if not left and not busy:
-            self._sweep_btn.configure(text="Done — check Activity for the fills",
-                                      bg=BG_INPUT)
-            self.after(6000, self._autosell_sweep_disarm)
+            btn.configure(text="Done — check Activity for the fills", bg=BG_INPUT)
+            self.after(6000, lambda: self._sweep_disarm(which))
             return
-        self._sweep_btn.configure(
+        btn.configure(
             text=(f"Working… {left} left" if left else "Working… placing the order"),
             bg=BG_INPUT)
-        self.after(1500, self._sweep_progress)
+        self.after(1500, lambda: self._sweep_progress(which))
 
-    def _autosell_sweep_disarm(self) -> None:
-        self._sweep_armed = False
-        if not hasattr(self, "_sweep_btn"):
+    def _sweep_disarm(self, which: str = "fractional") -> None:
+        self._sweep_armed[which] = False
+        btn, resting = self._sweep_button(which)
+        if btn is None:
             return
         # The arm timer is still pending when a sweep actually starts, so
         # without this it fires mid-run and wipes the progress label — putting
-        # "Sell all fractionals now" back on screen while orders are going out.
+        # the resting label back on screen while orders are going out.
         if self._autosell_queue or getattr(self, "_trade_in_flight", False):
             return
-        self._sweep_btn.configure(text="Sell all fractionals now", bg=BG_INPUT)
+        btn.configure(text=resting, bg=BG_INPUT)
+
+    def _roundup_sweep(self) -> None:
+        """Sell the plays whose split is CONFIRMED rounded up.
+
+        The fractional sweep's twin, and deliberately a separate button, because
+        a whole share held on purpose deserves a higher bar than a decaying
+        remnant. Four things keep it from running away over old plays:
+
+          * rounded_up ONLY. 'canceled' shares the whole-share group on the
+            Exits page but it is not a round-up — the split was called off — and
+            a button named for round-ups must not quietly sweep it.
+          * only what the journal still shows open. sell_worklist scopes every
+            task through held_accounts(), which nets sells and is split
+            adjusted, so a play sold through this app drops out by itself.
+          * a window on CONFIRMATION time — never before the watermark this
+            install was set up at, plus whatever backtrack the user has dialled
+            in. A fresh setup therefore sweeps nothing retroactively. Rows
+            outside it stay on the page and stay sellable individually; the
+            bulk button just leaves them alone.
+
+        Deliberately NOT filtered by the sold-once record: that exists to stop
+        the automatic path double-firing on a re-pull, and a ticker can come
+        back around for a second split. Pressing this is an instruction about
+        named tickers and outranks it — see _autosell_unclaim.
+
+        And the order still reads live holdings first, so anything that survives
+        all three places nothing into an account that is already empty.
+        """
+        if not self._track_rows:
+            self._sweep_say("Pull the board first", which="roundup")
+            self._push_notification("Pull the board first — nothing to sweep.",
+                                    "warning")
+            return
+
+        confirmed = [t for t in lifecycle.sell_worklist(self._track_rows)
+                     if t.brokers and t.status == "rounded_up"]
+        # Read the board state once, not once per task.
+        board_state = lifecycle.load_state()
+        fresh, stale = [], []
+        for t in confirmed:
+            (fresh if self._roundup_in_window(t, board_state) else stale).append(t)
+        # Not filtered by the sold-once record — see the note in _autosell_sweep.
+        tasks = list(fresh)
+
+        if not tasks:
+            if not confirmed:
+                self._sweep_say("No confirmed round-ups to sell", which="roundup")
+                self._push_notification(
+                    "No confirmed round-ups you hold anywhere.", "info")
+            else:
+                self._sweep_say(f"{len(stale)} outside the window — sell by hand",
+                                hold_ms=6000, which="roundup")
+                self._push_notification(
+                    f"{len(stale)} confirmed round-up(s) were confirmed before "
+                    f"this sweep's window. They are still listed on Exits to "
+                    f"sell one at a time — widen the backtrack if you meant to "
+                    f"catch them up.", "info")
+            return
+
+        state, label, _ = _market_status()
+        if state != "open":
+            self._sweep_say(f"{label} — not selling", which="roundup")
+            self._push_notification(
+                f"{label} — a market order now would pay the whole spread. "
+                f"{len(tasks)} round-up(s) ready when it opens.", "warning")
+            return
+
+        if getattr(self, "_trade_in_flight", False):
+            self._sweep_say("A trade is already running", which="roundup")
+            return
+
+        if len(tasks) > ROUNDUP_SWEEP_MAX:
+            held_back = [t.symbol for t in tasks[ROUNDUP_SWEEP_MAX:]]
+            self._log(f"Round-ups: selling {ROUNDUP_SWEEP_MAX} of {len(tasks)} — "
+                      f"{', '.join(held_back)} wait for the next press.", "warn")
+            tasks = tasks[:ROUNDUP_SWEEP_MAX]
+
+        # Two clicks, and the second one knows the count. Same protection as a
+        # modal with none of its ability to be dismissed by reflex.
+        if not self._sweep_armed.get("roundup"):
+            self._sweep_armed["roundup"] = True
+            syms = ", ".join(t.symbol for t in tasks[:6])
+            more = f" +{len(tasks) - 6} more" if len(tasks) > 6 else ""
+            self._roundup_btn.configure(
+                text=f"Confirm: sell {len(tasks)} — {syms}{more}", bg=RED)
+            self.after(20000, lambda: self._sweep_disarm("roundup"))
+            return
+
+        self._sweep_armed["roundup"] = False
+        self._autosell_unclaim(tasks)
+        self._autosell_queue.extend(tasks)
+        self._log(f"Round-ups: queued {len(tasks)} confirmed play(s) — "
+                  f"{', '.join(t.symbol for t in tasks)}"
+                  + (" [DRY RUN]" if self._autosell_dry_run.get() else ""))
+        if stale:
+            # Said out loud rather than silently dropped: a sweep that skipped
+            # half the board without mentioning it is indistinguishable from one
+            # that could not see it.
+            self._log(f"Round-ups: left {len(stale)} play(s) confirmed before "
+                      f"the sweep window alone — "
+                      f"{', '.join(t.symbol for t in stale[:6])}", "meta")
+        self._sweep_progress("roundup")
+        self._autosell_pump()
 
     def _autosell_pump(self) -> None:
         """Start the next play once the previous one has finished.
@@ -11955,6 +12529,25 @@ class App(ctk.CTk):
         self._push_notification(f"Auto-sell couldn't handle {task.symbol}: {why}",
                                 "warning")
         self.after(1000, self._autosell_pump)
+
+    def _autosell_unclaim(self, tasks) -> None:
+        """Forget that these particular plays were ever attempted.
+
+        A sweep is an explicit two-click instruction about named tickers, so it
+        outranks the sold-once record for those tickers — including a play that
+        exhausted AUTOSELL_MAX_ATTEMPTS and would otherwise be stuck for the
+        life of the install. Scoped to the plays in hand, so pressing a sweep
+        never re-opens the whole backlog the way Retry skipped does.
+
+        Safe because nothing here decides what is sold: held_accounts() has
+        already dropped anything the journal shows closed, and the live holdings
+        read still refuses to place an order into an empty account.
+        """
+        for t in tasks:
+            key = self._autosell_key(t)
+            self._autosell_sold.discard(key)
+            self._autosell_fails.pop(key, None)
+        self._save_autosell_state()
 
     def _autosell_retry(self, task, why: str) -> None:
         """Give a play back so a later pull can try it again — up to a point.
