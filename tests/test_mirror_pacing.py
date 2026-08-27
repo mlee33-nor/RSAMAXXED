@@ -70,6 +70,9 @@ class Mirror:
     _render_mirror_queue_lbl = A.App._render_mirror_queue_lbl
     _mirror_resume = A.App._mirror_resume
     _mirror_poll = A.App._mirror_poll
+    # _mirror_poll is re-entrant now (resume and enable both call it), so it
+    # cancels its own pending tick before scheduling the next one.
+    _cancel_timer = A.App._cancel_timer
     _release_broker = A.App._release_broker
     # Static on App: re-wrapping keeps them static here too, otherwise the stub
     # would hand them `self` as the pick.

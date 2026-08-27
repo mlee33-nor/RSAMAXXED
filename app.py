@@ -711,6 +711,34 @@ class PillButton(ctk.CTkButton):
         self.configure(text=text)
 
 
+class FlatPillButton(tk.Label):
+    """A pill-styled button made of one tk.Label. For LIST ROWS only.
+
+    PillButton is a CTkButton, and a CTkButton is not cheap: it builds a canvas
+    and draws a rounded rect with border shapes on every instantiation and every
+    restyle. That is fine for the handful on a page header, and much too slow
+    once there is one PER ROW — the Watchlist renders a row per RSA pick, so a
+    79-pick feed paid for 79 canvas-backed buttons on every redraw and blocked
+    the UI thread for the better part of a second doing it.
+
+    Square-ish rather than truly rounded, which at this size reads the same in
+    a dense list. `_bind_row_hover` walks past it untouched: it only repaints
+    widgets whose bg matches the row surface, and this one is filled.
+    """
+
+    def __init__(self, parent, text="", command=None, bg_color=ACCENT,
+                 hover_color=ACCENT_HOVER, fg_color=TEXT_PRIMARY,
+                 width=72, height=30, font_size=9):
+        super().__init__(parent, text=text, bg=bg_color, fg=fg_color,
+                         font=(FONT_FAMILY, font_size, "bold"),
+                         cursor="hand2", padx=10, pady=5)
+        self._fill, self._hover = bg_color, hover_color
+        if command is not None:
+            self.bind("<Button-1>", lambda _e: command())
+        self.bind("<Enter>", lambda _e: self.configure(bg=self._hover))
+        self.bind("<Leave>", lambda _e: self.configure(bg=self._fill))
+
+
 class StatusDot(tk.Canvas):
     """Tiny glowing status indicator."""
 
@@ -2456,6 +2484,8 @@ class App(ctk.CTk):
         self.after(1000, self._tick_clock)
 
     def _start_quote_loop(self) -> None:
+        # Re-entrant: also the "Refresh Quotes" button and Ctrl+R (_global_refresh).
+        self._cancel_timer("_quote_loop_id")
         self._run_in_thread(self._quote_worker)
 
     @staticmethod
@@ -3087,14 +3117,24 @@ class App(ctk.CTk):
             if not inside:
                 _paint(base)
 
-        def _bind_all(w) -> None:
-            if w.__class__.__module__.startswith("customtkinter"):
-                return
-            w.bind("<Enter>", lambda e: _paint(hover), add="+")
-            w.bind("<Leave>", _on_leave, add="+")
-            for ch in w.winfo_children():
-                _bind_all(ch)
-        _bind_all(row)
+        # Bound on the row ONLY, not on every descendant.
+        #
+        # Tk sends crossing events to the ancestor chain, so entering any child
+        # from outside still fires <Enter> here (NotifyVirtual/NotifyInferior),
+        # and moving between children inside the row fires nothing — which is
+        # exactly the behaviour wanted. Leaving for a child would also fire
+        # <Leave>, and that is precisely what the pointer-position check in
+        # `_on_leave` above is for: it repaints only once the pointer is really
+        # outside the row.
+        #
+        # Binding the whole subtree instead put an <Enter> and a <Leave> on all
+        # ~18 widgets of every row. Each binding is a Tcl command that has to be
+        # registered on create and individually deleted on destroy, and these
+        # lists are torn down and rebuilt wholesale on every render — which made
+        # widget *destruction* 82% of the Watchlist's render cost. A 79-pick
+        # feed was paying for ~2,800 bindings it did not need.
+        row.bind("<Enter>", lambda e: _paint(hover), add="+")
+        row.bind("<Leave>", _on_leave, add="+")
 
     # ---- Watchlist --------------------------------------------------------
 
@@ -3126,15 +3166,47 @@ class App(ctk.CTk):
     def _render_watchlist(self) -> None:
         if not hasattr(self, "_wl_list"):
             return
-        for w in self._wl_list.winfo_children():
-            w.destroy()
         if not self._watchlist:
+            for w in self._wl_list.winfo_children():
+                w.destroy()
             self._empty_state(
                 self._wl_list, "watchlist", "No picks on the radar yet",
                 "Your RSA picks appear here automatically once they sync — "
                 "or pin an extra ticker above.").pack(fill="x")
+            self._wl_sig = None
             return
         purchased = {s for (s, d) in self._get_purchased_pick_set(self._quick_picks)}
+
+        # Skip the rebuild when every value on screen would come out identical.
+        #
+        # A row is ~18 widgets, so a 79-pick feed tears down and recreates ~1,460
+        # of them per render — and Tk widget teardown, not creation, was the
+        # single most expensive thing this page did. Meanwhile the page is
+        # re-rendered on every visit and on every quote merge, and most of those
+        # renders produce pixel-identical output: OTC names have no quote to
+        # move, and switching tabs changes nothing at all.
+        #
+        # The signature covers exactly what a row draws, so anything that would
+        # actually look different still redraws. Prices are rounded to the two
+        # decimals they are displayed at — a sub-cent tick is not a visible
+        # change and must not cost a full rebuild.
+        sig = tuple(
+            (sym,
+             sym in purchased,
+             sym in self._pick_symbols,
+             (lambda i: (i.get("note", ""), i.get("date", "")) if i else None)(
+                 self._pick_info(sym)),
+             (lambda q: (round(q["price"], 2), round(q["change"], 2),
+                         round(q["pct"], 2), len(q.get("spark") or ()))
+              if q else None)(self._quotes.get(sym)))
+            for sym in self._watchlist)
+        if (getattr(self, "_wl_sig", None) == sig
+                and self._wl_list.winfo_children()):
+            return
+        self._wl_sig = sig
+
+        for w in self._wl_list.winfo_children():
+            w.destroy()
         reg_notes = ("reg alert", "alert", "early access")
         # Flat rows (tk.Frame, no per-row CTk canvas) keep a 39-row list snappy.
         for sym in self._watchlist:
@@ -3187,8 +3259,9 @@ class App(ctk.CTk):
                               font=(ICON_FONT, 12), cursor="hand2")
                 rm.pack(side="right", padx=(16, 0))
                 rm.bind("<Button-1>", lambda e, s=sym: self._remove_watchlist_symbol(s))
-            PillButton(act, text="Buy 1", command=lambda s=sym: self._palette_trade(s),
-                       width=72, height=30, font_size=9).pack(side="right")
+            FlatPillButton(act, text="Buy 1",
+                           command=lambda s=sym: self._palette_trade(s),
+                           font_size=9).pack(side="right")
 
             # quote + change (many RSA/OTC names have no public quote)
             if q:
@@ -3326,13 +3399,31 @@ class App(ctk.CTk):
                 return spec
         return ("SYS", "sys")
 
+    #: How much session history the Activity feed keeps.
+    #:
+    #: Nothing bounded this. `_log_lines` grew for the life of the process and
+    #: every line was also inserted into the Activity Text widget and never
+    #: deleted — and a Tk Text holds a tagged, laid-out copy of everything it
+    #: has ever been given. A long session with a few mirror runs (each broker
+    #: logs per account) put tens of thousands of tagged lines in there: memory
+    #: that only goes up, and a widget that gets slower to insert into as it
+    #: fills. Rebuilding the page replayed the entire backlog in one go.
+    #:
+    #: A few thousand lines is far more than anyone scrolls back through, and
+    #: logs/trade_results.log keeps the permanent record regardless.
+    LOG_MAX_LINES = 2000
+
     def _log(self, msg: str, tag: Optional[str] = None) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         self._log_lines.append((f"{ts}  {msg}", tag))
+        if len(self._log_lines) > self.LOG_MAX_LINES:
+            # Trim in one slice rather than popping per line.
+            del self._log_lines[:len(self._log_lines) - self.LOG_MAX_LINES]
         if not hasattr(self, "_log_text"):
             return
         t = self._log_text
         t.configure(state="normal")
+        self._trim_log_widget(t)
         t.insert("end", f"{ts}  ", "ts")
         stripped = msg.lstrip() if msg else ""
         is_detail = bool(msg) and (msg[:1] in (" ", "\t")
@@ -3351,8 +3442,42 @@ class App(ctk.CTk):
         t.see("end")
         t.configure(state="disabled")
 
+    def _trim_log_widget(self, t: tk.Text) -> None:
+        """Drop the oldest lines from the Activity feed once it is over cap.
+
+        Deletes a block at a time rather than one line per insert: `delete` on
+        a Text re-lays-out everything after the cut, so trimming on every line
+        would put back the cost this cap exists to remove.
+        """
+        try:
+            lines = int(t.index("end-1c").split(".")[0])
+        except (tk.TclError, ValueError):
+            return
+        if lines <= self.LOG_MAX_LINES + 250:
+            return
+        t.delete("1.0", f"{lines - self.LOG_MAX_LINES}.0")
+
     def _run_in_thread(self, target, *args) -> None:
         threading.Thread(target=target, args=args, daemon=True).start()
+
+    def _cancel_timer(self, attr: str) -> None:
+        """Cancel the pending `after` held on `self.<attr>`, if any.
+
+        Every self-rescheduling loop here stores its timer id and then hands
+        out its entry point to a button as well — "Refresh Quotes" is literally
+        wired to `_start_quote_loop`. Without this, each click FORKED the loop:
+        the id was overwritten, the old timer was never cancelled, and both
+        chains kept firing forever. Two clicks meant two quote sweeps every 45s
+        (16 network threads, three main-thread re-renders each), and it never
+        recovered until restart. Cancel-then-schedule makes re-entry idempotent.
+        """
+        tid = getattr(self, attr, None)
+        if tid is not None:
+            try:
+                self.after_cancel(tid)
+            except Exception:
+                pass          # already fired or a stale id — nothing to undo
+        setattr(self, attr, None)
 
     # ---- Dashboard --------------------------------------------------------
 
@@ -10318,6 +10443,9 @@ class App(ctk.CTk):
         ACTIVE, and mirror looked like it had "turned itself off". Losing one
         slot is recoverable; losing the heartbeat costs the rest of the day.
         """
+        # Re-entrant: called on resume and on enable as well as by its own
+        # timer, so drop any pending tick before scheduling the next one.
+        self._cancel_timer("_mirror_poll_id")
         if not self._mirror_enabled.get():
             return
         try:
@@ -11135,6 +11263,8 @@ class App(ctk.CTk):
         """
         if not self._discord_state.get("enabled"):
             return
+        # Re-entrant: enabling the toggle and the launch pull both call in.
+        self._cancel_timer("_discord_poll_id")
         today = datetime.now().strftime("%Y-%m-%d")
         if force or self._discord_state.get("last_pull_date") != today:
             self._discord_state["last_pull_date"] = today
@@ -13356,7 +13486,7 @@ class App(ctk.CTk):
 
         if self._log_lines:
             self._log_text.configure(state="normal")
-            for entry in self._log_lines:
+            for entry in self._log_lines[-self.LOG_MAX_LINES:]:
                 line, tag = entry if isinstance(entry, tuple) else (entry, None)
                 start = self._log_text.index("end-1c")
                 self._log_text.insert("end", line + "\n")
