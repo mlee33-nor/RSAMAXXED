@@ -3826,14 +3826,19 @@ class App(ctk.CTk):
         self.after(300, self._reload_quick_picks)
 
     def _sell_alert_position_map(self) -> tuple:
-        """(open symbols, accounts bought per symbol, accounts sold per symbol).
+        """(open (broker, symbol) pairs, accounts bought per symbol,
+        accounts sold per symbol).
 
         Accounts rather than shares: a sell-alert row is about coverage — "I was
         in this at 21 accounts and I am out of all 21" — and on an RSA play the
         share count is 1 everywhere anyway.
+
+        The open set keeps the BROKER. It used to be flattened to bare symbols,
+        which is what let one broker's exit speak for every other broker's
+        position in the same ticker; see `_sell_alert_scope`.
         """
         try:
-            open_syms = {sym for (_b, sym) in trade_journal.get_portfolio()}
+            open_pairs = set(trade_journal.get_portfolio())
             trades = trade_journal.get_trades()
         except Exception:
             return set(), {}, {}
@@ -3849,7 +3854,7 @@ class App(ctk.CTk):
                 bought.setdefault(sym, set()).add(acct)
             elif side in ("sell", trade_journal.SIDE_CLOSE):
                 sold.setdefault(sym, set()).add(acct)
-        return open_syms, bought, sold
+        return open_pairs, bought, sold
 
     def _sell_date_header(self, parent, date_str: str, n: int) -> None:
         """A dated band across the list.
@@ -3928,23 +3933,70 @@ class App(ctk.CTk):
                     out[str(name).upper()] = status
         return out
 
-    def _sell_alert_state(self, sym: str, open_syms: set,
+    def _sell_alert_scope(self, sell: dict, open_pairs: set,
+                          bought: Dict[str, set],
+                          sold: Dict[str, set]) -> tuple:
+        """What this ONE alert is about: (brokers, bought, sold, still_open).
+
+        Every field is narrowed to the brokers the alert actually names.
+
+        A sell alert is per-brokerage — the feed posts HAO at Public and HAO at
+        Wells Fargo as two separate exits, an hour apart — but all of this was
+        judged per SYMBOL. So the moment Public's HAO was sold, every other HAO
+        alert was treated as half-done: the brand-new Wells Fargo exit, where we
+        still held all ten accounts and had sold nothing, was filed under
+        Partial and disappeared from the tab you actually work from. The newest
+        and most actionable exit on the board was the one it hid.
+
+        Falls back to the symbol as a whole when the alert names no brokerage we
+        automate (the feed also calls exits at Webull and Vanguard), because
+        then there is no narrower question to ask.
+        """
+        sym = str(sell.get("symbol") or "").upper()
+        keys = set(_sell_leg_broker_keys(sell))
+        if not keys:
+            return ((), bought.get(sym, set()), sold.get(sym, set()),
+                    any(s == sym for (_b, s) in open_pairs))
+        return (
+            tuple(sorted(keys)),
+            {a for a in bought.get(sym, ()) if a[0] in keys},
+            {a for a in sold.get(sym, ()) if a[0] in keys},
+            any(b in keys for (b, s) in open_pairs if s == sym),
+        )
+
+    def _sell_alert_is_update(self, sell: dict, sold: Dict[str, set]) -> bool:
+        """True when we have already sold this ticker at some OTHER brokerage.
+
+        That is what makes a fresh exit easy to miss: the name is familiar, it
+        has been on the board for days, and part of it is already closed — so a
+        new leg reads as old news. It is the opposite: it is the only part of
+        the play still worth acting on.
+        """
+        keys = set(_sell_leg_broker_keys(sell))
+        if not keys:
+            return False
+        sym = str(sell.get("symbol") or "").upper()
+        return any(a[0] not in keys for a in sold.get(sym, ()))
+
+    def _sell_alert_state(self, sell: dict, open_pairs: set,
                           bought: Dict[str, set], sold: Dict[str, set]) -> str:
         """Which of the three buckets an exit belongs in.
 
-          sold      bought, and nothing left open — done with it
-          partial   still open somewhere, but some accounts are already out
-          alerts    still fully open, or an exit on something we never bought
+          sold      bought at the brokers it names, and out of all of them
+          partial   still open at some of them, already out of others
+          alerts    still fully open there, or an exit on something we never bought
 
         GREEN means "I bought this", for all of the first two and the open half
         of the third. Reserving green for closed plays only answered "am I out",
         when the question on this card is "was this ever mine".
         """
-        if not bought.get(sym):
+        _keys, bought_here, sold_here, open_here = self._sell_alert_scope(
+            sell, open_pairs, bought, sold)
+        if not bought_here:
             return "alerts"
-        if sym not in open_syms:
+        if not open_here:
             return "sold"
-        return "partial" if sold.get(sym) else "alerts"
+        return "partial" if sold_here else "alerts"
 
     def _render_sell_alerts(self) -> None:
         """Recent exits, split across three tabs and grouped by the day called.
@@ -3974,13 +4026,20 @@ class App(ctk.CTk):
                 bg=BG_CARD, pad=16).pack(fill="x")
             return
 
-        open_syms, bought, sold = self._sell_alert_position_map()
+        open_pairs, bought, sold = self._sell_alert_position_map()
         board = self._board_status_map()
 
         buckets: Dict[str, list] = {"alerts": [], "partial": [], "sold": []}
         for sl in sells:
-            sym = str(sl.get("symbol") or "").upper()
-            buckets[self._sell_alert_state(sym, open_syms, bought, sold)].append(sl)
+            buckets[self._sell_alert_state(sl, open_pairs, bought, sold)].append(sl)
+
+        # Surface re-opened names on the tab itself. A count that only ever
+        # said "Sell Alerts" gave no reason to look, which is how a fresh leg
+        # of a half-sold play went unnoticed for an hour.
+        n_upd = sum(1 for sl in buckets["alerts"]
+                    if self._sell_alert_is_update(sl, sold))
+        self._sells_tab_lbl.configure(
+            text=f"Sell Alerts · {n_upd} new" if n_upd else "Sell Alerts")
 
         n_owned = sum(1 for sl in sells
                       if bought.get(str(sl.get("symbol") or "").upper()))
@@ -4006,7 +4065,7 @@ class App(ctk.CTk):
         }
         for name, rows in buckets.items():
             if rows:
-                self._render_sells_list(grids[name], rows, open_syms, bought,
+                self._render_sells_list(grids[name], rows, open_pairs, bought,
                                         sold, board)
             else:
                 title, body = empties[name]
@@ -4016,7 +4075,7 @@ class App(ctk.CTk):
         # Keep whichever tab was open, and re-apply its highlight.
         self._switch_sells_tab(getattr(self, "_sells_tab_active", "alerts"))
 
-    def _render_sells_list(self, parent, rows: List[dict], open_syms: set,
+    def _render_sells_list(self, parent, rows: List[dict], open_pairs: set,
                            bought: Dict[str, set], sold: Dict[str, set],
                            board: Dict[str, str]) -> None:
         """One tab's exits, under dated bands, newest day first."""
@@ -4030,7 +4089,7 @@ class App(ctk.CTk):
         for date_str, day_rows in grouped.items():
             self._sell_date_header(parent, date_str, len(day_rows))
             for sl in day_rows:
-                self._sell_alert_row(parent, sl, open_syms, bought, sold, board)
+                self._sell_alert_row(parent, sl, open_pairs, bought, sold, board)
 
         if len(rows) > len(shown):
             tk.Label(parent,
@@ -4039,14 +4098,19 @@ class App(ctk.CTk):
                      bg=BG_CARD, fg=TEXT_MUTED,
                      font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(10, 0))
 
-    def _sell_alert_row(self, parent, sell: dict, open_syms: set,
+    def _sell_alert_row(self, parent, sell: dict, open_pairs: set,
                         bought: Dict[str, set], sold: Dict[str, set],
                         board: Dict[str, str]) -> None:
         sym = str(sell.get("symbol") or "???").upper()
-        n_bought = len(bought.get(sym, ()))
-        n_sold = len(sold.get(sym, ()))
+        # Counted against the brokers THIS alert names, so "10 of 10 sold"
+        # means the ten accounts the alert is about — not every account that
+        # ever held the ticker anywhere.
+        _keys, bought_here, sold_here, still_open = self._sell_alert_scope(
+            sell, open_pairs, bought, sold)
+        n_bought = len(bought_here)
+        n_sold = len(sold_here)
         owned = bool(n_bought)
-        still_open = sym in open_syms
+        is_update = still_open and self._sell_alert_is_update(sell, sold)
 
         # Green is the ownership signal, not the done signal: every play we ever
         # bought carries it, whether we are out of it or still holding. What
@@ -4082,6 +4146,17 @@ class App(ctk.CTk):
             tk.Label(top, text=badge, bg=_blend(colour, row_bg, 0.82), fg=colour,
                      font=(FONT_FAMILY, 7, "bold"), pady=1).pack(
                          side="left", padx=(10, 0))
+
+        # A ticker we are already part-way out of, with a fresh exit somewhere
+        # we still hold all of it. Worth calling out precisely because the name
+        # looks like something already dealt with.
+        if is_update:
+            where = ", ".join(rsa_feed.normalize_broker(k) for k in _keys).upper()
+            text = (f" {icon('up')} UPDATED · NEW SALE AT {where} " if where
+                    else f" {icon('up')} UPDATED · NEW SALE ")
+            tk.Label(top, text=text, bg=_blend(ACCENT, row_bg, 0.78), fg=ACCENT,
+                     font=(FONT_FAMILY, 7, "bold"), pady=1).pack(
+                         side="left", padx=(6, 0))
 
         # What the SPLIT did, beside what WE did. "23 of 34 sold" says how far
         # through the exit we are and nothing about whether there was a round-up
