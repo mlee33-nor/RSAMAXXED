@@ -363,15 +363,9 @@ def test_each_button_returns_to_its_own_resting_label():
 
 # ------------------------------------------------- Command Center sells card
 
-def _exit(symbol, broker="Public"):
-    """A sell alert as the feed writes it: one ticker, one brokerage."""
-    return {"symbol": symbol, "legs": [{"broker": broker, "accounts_low": 1}]}
-
-
 class Card:
-    _sell_alert_position_map = A.App._sell_alert_position_map
-    _sell_alert_scope = A.App._sell_alert_scope
-    _sell_alert_state = A.App._sell_alert_state
+    """Just enough App for the board-status chip."""
+
     _board_status_map = A.App._board_status_map
     _SELL_STATUS_CHIP = A.App._SELL_STATUS_CHIP
 
@@ -379,50 +373,7 @@ class Card:
         self._track_rows = list(rows)
 
 
-def test_a_bought_play_is_told_apart_from_one_never_owned(monkeypatch):
-    """Both used to render as 'not held', which is true and useless."""
-    trades = [
-        {"symbol": "SOLDOUT", "side": "buy", "broker": "public", "account_id": "1"},
-        {"symbol": "SOLDOUT", "side": "sell", "broker": "public", "account_id": "1"},
-        {"symbol": "STILLIN", "side": "buy", "broker": "public", "account_id": "2"},
-    ]
-    monkeypatch.setattr(A.trade_journal, "get_trades", lambda *a, **k: trades)
-    monkeypatch.setattr(A.trade_journal, "get_portfolio",
-                        lambda: {("public", "STILLIN"): {"qty": 1.0}})
-
-    c = Card()
-    open_pairs, bought, sold = Card._sell_alert_position_map(c)
-
-    # The open set keeps the broker now — one broker's exit must not speak for
-    # another's position in the same ticker.
-    assert open_pairs == {("public", "STILLIN")}
-    state = lambda sym: Card._sell_alert_state(
-        c, _exit(sym), open_pairs, bought, sold)
-    assert state("SOLDOUT") == "sold"
-    assert state("STILLIN") == "alerts"
-    assert state("NEVER") == "alerts"
-
-
-def test_a_half_sold_play_lands_in_partial(monkeypatch):
-    trades = [
-        {"symbol": "HALF", "side": "buy", "broker": "public", "account_id": "1"},
-        {"symbol": "HALF", "side": "buy", "broker": "public", "account_id": "2"},
-        {"symbol": "HALF", "side": "sell", "broker": "public", "account_id": "1"},
-    ]
-    monkeypatch.setattr(A.trade_journal, "get_trades", lambda *a, **k: trades)
-    monkeypatch.setattr(A.trade_journal, "get_portfolio",
-                        lambda: {("public", "HALF"): {"qty": 1.0}})
-    c = Card()
-    open_pairs, bought, sold = Card._sell_alert_position_map(c)
-    assert Card._sell_alert_state(
-        c, _exit("HALF"), open_pairs, bought, sold) == "partial"
-
-
-def test_a_journal_read_failure_does_not_take_the_card_down(monkeypatch):
-    def boom(*_a, **_k):
-        raise RuntimeError("journal unreadable")
-    monkeypatch.setattr(A.trade_journal, "get_portfolio", boom)
-    assert Card._sell_alert_position_map(Card()) == (set(), {}, {})
+# Bucketing moved to the play model; see test_sell_plays.py.
 
 
 def test_the_board_status_answers_to_either_ticker():
