@@ -409,6 +409,40 @@ MIRROR_CHECK_TIMES_ET: List[Tuple[int, int]] = [
 ]
 MIRROR_HEARTBEAT_MS = 300_000  # 5 min wall-clock re-check — NOT a feed poll
 
+# --- Pacing -----------------------------------------------------------------
+# One check can turn up ten eligible picks at once — an enable after a quiet
+# week, or a Monday that catches Friday's alerts. The first version fired all
+# of them in the same instant: ten picks x six brokers is ~56 execute_trade()
+# threads in one second, i.e. nine concurrent orders per broker. The run log
+# shows exactly what that costs — Chase filling 4/4 on one pick and 0/4 on
+# another in the SAME second, same profile, same credentials; Fidelity never
+# reporting at all on seven runs of ten. Browser brokers queue behind their
+# per-broker Chrome lock until the session goes stale; the API brokers have no
+# lock and simply get hammered.
+#
+# So picks are drained one at a time and the next only starts once the previous
+# batch has fully reported. Raising the in-flight count is a one-line change,
+# but 1 is the number the log supports.
+MIRROR_MAX_INFLIGHT_PICKS = 1
+# Breather after a batch lands, before the next pick goes out — long enough for
+# a broker session to settle rather than being re-entered the same second.
+MIRROR_PICK_GAP_MS = 20_000
+# How often the drain wakes to see whether the batch ahead has landed.
+MIRROR_DRAIN_POLL_MS = 5_000
+# Backstop: a broker thread that never reports would otherwise hold the queue
+# shut forever. Past this the batch is written off and the next pick goes.
+MIRROR_QUEUE_STALL_MS = 900_000  # 15 min
+
+# --- Age gate ---------------------------------------------------------------
+# How stale a pick may be and still be auto-bought, user-configurable on the
+# Automation page. DELIBERATELY separate from PICK_MAX_AGE_DAYS: that constant
+# drives _prune_stale_picks, which DELETES picks from picks.json and pushes the
+# deletion to the shared remote feed. Narrowing it to trim mirror's appetite
+# would quietly wipe day-3 and day-4 plays off the Plays board and the web app.
+# This one only decides what mirror buys; nothing is deleted.
+MIRROR_MAX_AGE_DEFAULT = 2
+MIRROR_AGE_CHOICES = (1, 2, 3, 4)
+
 # Pick notes mirror will act on. Everything else (conditional, OTC) is a
 # deliberate pass — see _mirror_skip_reason.
 MIRROR_NOTES = ("reg alert", "alert", "early access")
@@ -1431,6 +1465,10 @@ class App(ctk.CTk):
         self.after(700, self._startup_refresh)
         # TRACK board: runs on its own hourly timer, not the Discord toggle.
         self.after(2500, self._track_loop)
+        # Mirror was armed when we last closed: bring it back, and say so. Late
+        # enough that the activity log and the notification centre exist to
+        # carry the announcement.
+        self.after(3000, self._mirror_resume)
         # No plays-password prompt on startup: the hosted feed is open, so a
         # fresh install has nothing to enter and asking would invent friction
         # that the product does not have. _prompt_plays_key stays reachable
@@ -2142,7 +2180,9 @@ class App(ctk.CTk):
                     bool(getattr(self, "_mirror_enabled", None)
                          and self._mirror_enabled.get()),
                     tuple(sorted(getattr(self, "_mirror_selected_brokers", ()))),
-                    len(getattr(self, "_mirror_failed", ())))
+                    len(getattr(self, "_mirror_failed", ())),
+                    self._mirror_max_age_days(),
+                    len(getattr(self, "_mirror_queue", ())))
         if name == "invest":
             return ("invest", balances.version(), etf_journal.version(),
                     self._etf_symbol, self._etf_mode, self._etf_auto.get(),
@@ -3708,6 +3748,10 @@ class App(ctk.CTk):
         self._quick_picks = picks
         if picks:
             self._repair_mirror_executed()
+            # "would skip: X, Y" is computed from the feed, so it has to be
+            # recomputed when the feed lands rather than only when the chip
+            # is clicked.
+            self._render_mirror_age_note()
         # Watchlist + ticker tape track the RSA picks we buy.
         self._sync_watchlist_from_picks()
         self._render_pipeline()
@@ -6793,6 +6837,24 @@ class App(ctk.CTk):
             if batch is not None:
                 self.after(0, self._trade_broker_complete, batch, summary)
 
+    def _release_broker(self, broker: str, batch: dict) -> None:
+        """Hand a broker back to the duplicate guard — unless another live batch
+        still has an order out on it.
+
+        Batches overlap (a desk ticket beside a mirror pick, an exit beside an
+        ETF run), and this used to discard unconditionally: the first batch to
+        land handed the broker back while a second was still mid-order there,
+        which is exactly the duplicate the guard exists to stop. It went
+        unnoticed while mirror fired every pick at once, because then the
+        overlapping batches were mirror's own.
+        """
+        for other in getattr(self, "_live_batches", ()):
+            if other is batch or other.get("finished"):
+                continue
+            if broker in (other.get("pending") or ()):
+                return
+        self._brokers_in_flight.discard(broker)
+
     def _trade_broker_complete(self, batch: dict, summary: dict) -> None:
         """Runs on the Tk main thread as each broker finishes. When the last
         broker reports in, renders the completion receipt with totals."""
@@ -6803,7 +6865,7 @@ class App(ctk.CTk):
         # Free this broker the moment IT lands, not when the slowest one does:
         # Robinhood taking 4s shouldn't wait on Fidelity's browser to finish
         # before it can take the next ticket.
-        self._brokers_in_flight.discard(summary["broker"])
+        self._release_broker(summary["broker"], batch)
         self._refresh_trade_busy()
         # Persist the leg as it lands, not at the end: a crash or a force-quit
         # mid-fan-out then still leaves the brokers that did report on disk.
@@ -6865,6 +6927,11 @@ class App(ctk.CTk):
             self._invalidate_page("mirror")
             if self._active_nav == "mirror":
                 self.after(80, self._render_mirror)
+            # This batch landing is what frees the next queued pick. Nudge the
+            # drain rather than leaving it to its own poll — otherwise the last
+            # batch of a run leaves the queue counter reading "buying 1" with
+            # nothing left in the air.
+            self._mirror_nudge_drain()
 
         if total_ok > 0 and not failed:
             kind = "ok"
@@ -6945,7 +7012,7 @@ class App(ctk.CTk):
         # Belt and braces: a broker that somehow never reported still gets
         # released here, so one lost thread can't wedge its chip forever.
         for b in batch.get("all_brokers") or []:
-            self._brokers_in_flight.discard(b)
+            self._release_broker(b, batch)
         self._refresh_trade_busy()
 
         # The flag means "some broker is mid-order", so it is recomputed for
@@ -8911,7 +8978,8 @@ class App(ctk.CTk):
             except Exception:
                 pass
         return {"enabled": False, "brokers": [], "executed": [],
-                "last_slot": "", "failed": []}
+                "last_slot": "", "failed": [],
+                "max_age_days": MIRROR_MAX_AGE_DEFAULT}
 
     def _repair_mirror_executed(self) -> None:
         """One-shot: drop 'executed' entries that were never actually executed.
@@ -8944,7 +9012,7 @@ class App(ctk.CTk):
             fresh_unbought = {
                 self._mirror_key(p) for p in picks
                 if str(p.get("note", "")).lower() in MIRROR_NOTES
-                and _pick_is_fresh(p)
+                and self._mirror_pick_age_ok(p)
                 and self._mirror_journal_key(p) not in bought
                 and self._mirror_journal_key(p) not in attempted}
         except Exception:
@@ -8960,7 +9028,14 @@ class App(ctk.CTk):
                   f"never bought — {syms}")
 
     def _save_mirror_state(self) -> None:
-        """Persist mirror trading state to disk."""
+        """Persist mirror trading state to disk.
+
+        Never raises. This is called from inside the schedule heartbeat, and an
+        unwritable state file used to take the whole `after` chain down with it
+        — the badge kept saying ACTIVE while nothing was ever checked again.
+        Losing a state write costs one re-run of a slot; losing the heartbeat
+        costs the rest of the day.
+        """
         import json
         state = {
             "enabled": self._mirror_enabled.get(),
@@ -8970,8 +9045,12 @@ class App(ctk.CTk):
             # doesn't re-run a slot that already fired today.
             "last_slot": self._mirror_last_slot,
             "failed": [list(k) for k in self._mirror_failed],
+            "max_age_days": self._mirror_max_age_days(),
         }
-        MIRROR_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        try:
+            MIRROR_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        except Exception as e:
+            self._log(f"Mirror: could not save state — {e}", "warn")
 
     def _build_settings(self) -> None:
         frame = tk.Frame(self._content, bg=BG_PRIMARY)
@@ -9002,7 +9081,14 @@ class App(ctk.CTk):
 
         # Load saved state
         saved = self._load_mirror_state()
-        self._mirror_enabled = tk.BooleanVar(value=False)  # always start OFF
+        # Restored, not forced off. The state file has always recorded the
+        # toggle faithfully and the loader has always thrown it away, so every
+        # restart silently disarmed automation while the file said enabled:true
+        # — you had to notice and re-arm it by hand. It is re-armed for real by
+        # _mirror_resume() once the shell is up, which announces itself in the
+        # log and the notification centre so a running mirror is never a
+        # surprise.
+        self._mirror_enabled = tk.BooleanVar(value=bool(saved.get("enabled")))
         self._mirror_selected_brokers: set = set(saved.get("brokers", []))
         self._mirror_executed: set = set(
             tuple(x) if isinstance(x, list) else x
@@ -9016,7 +9102,28 @@ class App(ctk.CTk):
         # feed is still empty at build time.
         self._mirror_repaired = False
 
-        # Status indicator
+        # How stale a pick may be and still be auto-bought. See the comment on
+        # MIRROR_MAX_AGE_DEFAULT for why this is not PICK_MAX_AGE_DAYS.
+        try:
+            _age = int(saved.get("max_age_days", MIRROR_MAX_AGE_DEFAULT))
+        except (TypeError, ValueError):
+            _age = MIRROR_MAX_AGE_DEFAULT
+        self._mirror_max_age = tk.IntVar(
+            value=min(max(_age, MIRROR_AGE_CHOICES[0]), MIRROR_AGE_CHOICES[-1]))
+        self._mirror_age_chips: Dict[int, Any] = {}
+
+        # --- Pick queue (pacing) -------------------------------------------
+        # Picks waiting their turn, the batches currently out, and the handle
+        # of the pending drain tick. See MIRROR_MAX_INFLIGHT_PICKS.
+        self._mirror_queue: List[Dict[str, str]] = []
+        self._mirror_active: List[dict] = []
+        self._mirror_drain_id: Optional[str] = None
+        self._mirror_settled_at: Optional[datetime] = None
+        self._mirror_busy_logged: Optional[datetime] = None
+
+        # Status indicator. Painted from the restored toggle at the end of this
+        # method (_mirror_sync_toggle_ui) rather than hard-coded OFF here — the
+        # dot claiming OFF over an armed mirror is the worst of both.
         self._mirror_status_frame = tk.Frame(mirror_header, bg=BG_CARD)
         self._mirror_status_frame.pack(side="right")
         self._mirror_status_dot = StatusDot(self._mirror_status_frame, color=RED, size=8)
@@ -9034,8 +9141,9 @@ class App(ctk.CTk):
 
         explanation = (
             "Mirror Trading automatically executes BUY orders when new Quick Picks "
-            "appear. It monitors the picks list every 60 seconds and places trades "
-            "on your selected brokers.\n"
+            f"appear. It checks the feed {_mirror_schedule_label()} on market days "
+            "(and immediately after an import) and places trades on your selected "
+            "brokers, one pick at a time.\n"
         )
         tk.Label(safety_card, text=explanation, bg=BG_INPUT, fg=TEXT_SECONDARY,
                  font=(FONT_FAMILY, 9), wraplength=600, justify="left").pack(anchor="w")
@@ -9049,18 +9157,46 @@ class App(ctk.CTk):
             "\u2713  BUY only — will never auto-sell your positions",
             "\u2713  Each pick is only executed once — duplicates are tracked and skipped",
             "\u2713  Only runs on brokers YOU select below",
-            "\u2713  Checks every 60 seconds — does not rapid-fire",
+            "\u2713  One pick at a time — the next only starts once the last "
+            "one has reported, so no broker is asked for several orders at once",
+            "\u2713  Skips picks older than the limit you set below",
             "\u2713  Stops immediately when toggled off",
             "\u2713  All auto-trades are logged and appear in your trade journal",
         ]
         for point in safety_points:
             tk.Label(safety_card, text=point, bg=BG_INPUT, fg=GREEN,
-                     font=(FONT_FAMILY, 8), anchor="w").pack(anchor="w", pady=1)
+                     font=(FONT_FAMILY, 8), anchor="w", wraplength=600,
+                     justify="left").pack(anchor="w", pady=1)
 
-        tk.Label(safety_card, text="\nYou can disable Mirror Trading at any time. "
-                 "It will NOT execute trades for picks that existed before you turned it on.",
+        tk.Label(safety_card, text="\nYou can disable Mirror Trading at any time. It "
+                 "stays armed across restarts — if it was on when you closed the app "
+                 "it comes back on, and says so in the Activity log.",
                  bg=BG_INPUT, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
                  wraplength=600, justify="left").pack(anchor="w")
+
+        # ---- Age gate ------------------------------------------------------
+        # Separate from the feed's own expiry (PICK_MAX_AGE_DAYS): this decides
+        # what mirror BUYS, and deletes nothing.
+        age_section = tk.Frame(mirror_card.inner, bg=BG_CARD)
+        age_section.pack(fill="x", padx=20, pady=(0, 12))
+        tk.Label(age_section, text="DON'T BUY PICKS OLDER THAN", bg=BG_CARD,
+                 fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 9, "bold")).pack(anchor="w", pady=(0, 6))
+        age_chips = tk.Frame(age_section, bg=BG_CARD)
+        age_chips.pack(anchor="w")
+        current_age = self._mirror_max_age_days()
+        for days in MIRROR_AGE_CHOICES:
+            chip = self._make_chip(age_chips,
+                                   "1 day" if days == 1 else f"{days} days",
+                                   lambda d=days: self._set_mirror_max_age(d),
+                                   selected=(days == current_age))
+            chip.pack(side="left", padx=(0, 8))
+            self._mirror_age_chips[days] = chip
+        self._mirror_age_note = tk.Label(
+            age_section, text="", bg=BG_CARD, fg=TEXT_MUTED,
+            font=(FONT_FAMILY, 8), wraplength=600, justify="left")
+        self._mirror_age_note.pack(anchor="w", pady=(6, 0))
+        self._render_mirror_age_note()
 
         # Broker selection for mirror trading
         broker_section = tk.Frame(mirror_card.inner, bg=BG_CARD)
@@ -9111,6 +9247,17 @@ class App(ctk.CTk):
             toggle_frame, text=f"{count} pick(s) already executed",
             bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 8))
         self._mirror_exec_count.pack(side="left", padx=(16, 0))
+
+        # Queue depth. Picks are drained one at a time now, so "nothing is
+        # happening" and "six picks are waiting their turn" have to be
+        # distinguishable without reading the log.
+        self._mirror_queue_lbl = tk.Label(
+            toggle_frame, text="", bg=BG_CARD, fg=ACCENT,
+            font=(FONT_FAMILY, 8, "bold"))
+        self._mirror_queue_lbl.pack(side="left", padx=(12, 0))
+
+        # Paint dot / label / button from the restored toggle.
+        self._mirror_sync_toggle_ui()
 
         # ---- Discord auto-import card (feeds the picks Mirror Trading buys) ----
         self._build_discord_card(scroll_frame)
@@ -9356,6 +9503,151 @@ class App(ctk.CTk):
         self._mirror_log.configure(state="disabled")
         self._log(f"Mirror: {msg}")
 
+    # ---- Mirror: age gate -------------------------------------------------
+
+    def _mirror_max_age_days(self) -> int:
+        """How stale a pick may be and still be auto-bought.
+
+        Falls back to the default when the var is missing (the Automation page
+        is what builds it) or holds junk. The gate must never fail open — a
+        broken setting has to mean "buy less", not "buy everything".
+        """
+        try:
+            days = int(self._mirror_max_age.get())
+        except (AttributeError, TypeError, ValueError, tk.TclError):
+            return MIRROR_MAX_AGE_DEFAULT
+        return min(max(days, MIRROR_AGE_CHOICES[0]), MIRROR_AGE_CHOICES[-1])
+
+    def _mirror_pick_age_ok(self, pick: Dict[str, str]) -> bool:
+        """True while a pick is inside the user's own buying window.
+
+        Deliberately NOT plain _pick_is_fresh(): that answers "is this pick
+        still in the feed", and its constant also drives _prune_stale_picks,
+        which DELETES picks and pushes the deletion to the shared remote. This
+        answers "do we still want to buy it" and deletes nothing.
+        """
+        return _pick_is_fresh(pick, self._mirror_max_age_days())
+
+    def _set_mirror_max_age(self, days: int) -> None:
+        days = int(days)
+        self._mirror_max_age.set(days)
+        for d, chip in getattr(self, "_mirror_age_chips", {}).items():
+            self._style_chip(chip, d == days)
+        self._render_mirror_age_note()
+        self._save_mirror_state()
+        self._mirror_log_msg(
+            f"Age limit set to {days} day{'s' if days != 1 else ''} — older "
+            f"alerts will be skipped")
+        self._invalidate_page("mirror")
+
+    def _render_mirror_age_note(self) -> None:
+        """Say concretely what the current limit would skip right now.
+
+        A number on a chip is easy to set and easy to misjudge; naming the
+        tickers it would pass over makes the choice legible before it costs
+        anything.
+        """
+        lbl = getattr(self, "_mirror_age_note", None)
+        if lbl is None:
+            return
+        days = self._mirror_max_age_days()
+        stale = []
+        for pick in (self._quick_picks or []):
+            if str(pick.get("note", "")).lower() not in MIRROR_NOTES:
+                continue
+            # Too old for us, but still live in the feed — i.e. genuinely
+            # skipped by this setting rather than gone anyway.
+            if not self._mirror_pick_age_ok(pick) and _pick_is_fresh(pick):
+                stale.append(str(pick.get("symbol") or "?").upper())
+        text = (f"Mirror only buys alerts from the last {days} "
+                f"day{'s' if days != 1 else ''}. The feed itself still keeps "
+                f"picks for {PICK_MAX_AGE_DAYS} days — this setting skips them, "
+                f"it never deletes them.")
+        if stale:
+            names = sorted(set(stale))
+            shown = ", ".join(names[:8])
+            if len(names) > 8:
+                shown += f", +{len(names) - 8} more"
+            text += f"  Right now it would skip: {shown}."
+        lbl.configure(text=text)
+
+    # ---- Mirror: toggle ---------------------------------------------------
+
+    def _mirror_sync_toggle_ui(self) -> None:
+        """Paint the dot, the label and the button from the toggle var.
+
+        One place, so the restored-on-startup state and both toggle paths can't
+        drift. A badge reading OFF over an armed mirror is exactly what made
+        "it keeps turning itself off" so hard to pin down.
+        """
+        on = bool(self._mirror_enabled.get())
+        color = GREEN if on else RED
+        try:
+            self._mirror_status_dot.itemconfig("all", fill=color, outline=color)
+            self._mirror_status_lbl.configure(text="ACTIVE" if on else "OFF",
+                                              fg=color)
+            self._mirror_toggle_btn.configure_text(
+                "Disable Mirror Trading" if on else "Enable Mirror Trading")
+        except (AttributeError, tk.TclError):
+            pass
+        self._render_mirror_queue_lbl()
+
+    def _render_mirror_queue_lbl(self) -> None:
+        """Queue depth beside the toggle.
+
+        Picks drain one at a time now, so "nothing is happening" and "six picks
+        are waiting their turn" have to be distinguishable without reading the
+        log.
+        """
+        lbl = getattr(self, "_mirror_queue_lbl", None)
+        if lbl is None:
+            return
+        waiting = len(getattr(self, "_mirror_queue", ()))
+        active = len([b for b in getattr(self, "_mirror_active", ())
+                      if not b.get("finished")])
+        if active and waiting:
+            txt = f"buying 1 · {waiting} queued"
+        elif active:
+            txt = "buying 1"
+        elif waiting:
+            txt = f"{waiting} queued"
+        else:
+            txt = ""
+        try:
+            lbl.configure(text=txt)
+        except tk.TclError:
+            pass
+
+    def _mirror_resume(self) -> None:
+        """Re-arm the schedule after a restart, if it was armed when we closed.
+
+        The state file has always recorded the toggle honestly; the loader threw
+        it away, so every restart silently disarmed automation and you had to
+        notice. Resumed loudly rather than quietly — automation that comes back
+        without saying so is worse than automation that forgets.
+        """
+        if not getattr(self, "_mirror_enabled", None) or not self._mirror_enabled.get():
+            return
+        if not self._mirror_selected_brokers:
+            # Armed against brokers that are no longer linked. Staying "on" with
+            # nothing to buy on is a lie the status dot would keep telling.
+            self._mirror_enabled.set(False)
+            self._mirror_sync_toggle_ui()
+            self._mirror_log_msg("Was enabled, but no brokers are linked now — left OFF")
+            self._save_mirror_state()
+            return
+        brokers_str = ", ".join(sorted(self._mirror_selected_brokers))
+        age = self._mirror_max_age_days()
+        self._mirror_log_msg(f"Resumed after restart — armed on: {brokers_str}")
+        self._mirror_log_msg(
+            f"Checking {_mirror_schedule_label()} on market days · buying picks "
+            f"up to {age} day{'s' if age != 1 else ''} old · one pick at a time")
+        self._push_notification(
+            f"Mirror trading resumed on {len(self._mirror_selected_brokers)} broker(s)",
+            "info")
+        self._invalidate_page("mirror")
+        self._mirror_poll()
+
     def _toggle_mirror_trading(self) -> None:
         if self._mirror_enabled.get():
             # Turning OFF
@@ -9363,11 +9655,27 @@ class App(ctk.CTk):
             if self._mirror_poll_id:
                 self.after_cancel(self._mirror_poll_id)
                 self._mirror_poll_id = None
-            self._mirror_status_dot.itemconfig("all", fill=RED, outline=RED)
-            self._mirror_status_lbl.configure(text="OFF", fg=RED)
-            self._mirror_toggle_btn.configure_text("Enable Mirror Trading")
+            if self._mirror_drain_id:
+                self.after_cancel(self._mirror_drain_id)
+                self._mirror_drain_id = None
+            # Drop whatever is still waiting its turn. Orders already sent
+            # belong to the brokers and can't be recalled, but a queued pick has
+            # not been bought and must not fire after the user said stop. It is
+            # NOT marked executed (that happens at launch), so it stays eligible
+            # if mirror is turned back on.
+            dropped = [str(p.get("symbol") or "?").upper() for p in self._mirror_queue]
+            self._mirror_queue = []
+            self._mirror_sync_toggle_ui()
             self._mirror_log_msg("Mirror trading DISABLED")
+            if dropped:
+                self._mirror_log_msg(
+                    f"Dropped {len(dropped)} queued pick(s), not bought: "
+                    + ", ".join(dropped))
+            if any(not b.get("finished") for b in self._mirror_active):
+                self._mirror_log_msg(
+                    "Orders already sent are still running — they can't be recalled")
             self._save_mirror_state()
+            self._invalidate_page("mirror")
             return
 
         # Turning ON — require confirmation
@@ -9378,14 +9686,23 @@ class App(ctk.CTk):
             return
 
         brokers_str = ", ".join(sorted(self._mirror_selected_brokers))
+        age = self._mirror_max_age_days()
         pending = self._mirror_pending_picks()
         if pending:
             names = ", ".join(f"{p.get('symbol', '?')} ({p.get('date', '')})"
                               for p in pending[:6])
             if len(pending) > 6:
                 names += f", +{len(pending) - 6} more"
-            pending_txt = (f"{len(pending)} pick(s) have no buy on record yet and "
-                           f"will be bought at the next check:\n\n  {names}\n\n")
+            # Say how it will be paced, not just how many. Ten picks landing at
+            # once is the behaviour this dialog used to under-sell.
+            mins = max(1, round(len(pending) * (MIRROR_PICK_GAP_MS / 60000.0)))
+            pending_txt = (
+                f"{len(pending)} pick(s) have no buy on record yet and will be "
+                f"bought at the next check:\n\n  {names}\n\n"
+                f"They go out ONE AT A TIME — the next only starts once the "
+                f"previous one has reported back, plus a "
+                f"{MIRROR_PICK_GAP_MS // 1000}s gap. Expect this to take "
+                f"noticeably longer than {mins} minute(s).\n\n")
         else:
             pending_txt = "Nothing is waiting to be bought right now.\n\n"
 
@@ -9395,6 +9712,7 @@ class App(ctk.CTk):
             f"This will automatically BUY 1 share of any new Reg Alert pick "
             f"on the following brokers:\n\n"
             f"  {brokers_str}\n\n"
+            f"Alerts older than {age} day{'s' if age != 1 else ''} are skipped.\n\n"
             f"{pending_txt}"
             f"You can disable it at any time.",
             parent=self)
@@ -9413,17 +9731,19 @@ class App(ctk.CTk):
                 self._mirror_executed.add(key)
 
         self._mirror_enabled.set(True)
-        self._mirror_status_dot.itemconfig("all", fill=GREEN, outline=GREEN)
-        self._mirror_status_lbl.configure(text="ACTIVE", fg=GREEN)
-        self._mirror_toggle_btn.configure_text("Disable Mirror Trading")
+        self._mirror_sync_toggle_ui()
         self._mirror_log_msg(f"Mirror trading ENABLED on: {brokers_str}")
         self._mirror_log_msg(
             f"Checking for new Reg Alert picks at {_mirror_schedule_label()} on market days")
+        self._mirror_log_msg(
+            f"Skipping alerts older than {age} day{'s' if age != 1 else ''} · "
+            f"one pick at a time, {MIRROR_PICK_GAP_MS // 1000}s apart")
         if pending:
             self._mirror_log_msg(
                 f"{len(pending)} unbought pick(s) queued: "
                 + ", ".join(str(p.get("symbol", "?")) for p in pending))
         self._save_mirror_state()
+        self._invalidate_page("mirror")
 
         # Start the schedule heartbeat
         self._mirror_poll()
@@ -9506,9 +9826,9 @@ class App(ctk.CTk):
         and was never looked at again. Whether the journal shows a buy is the
         real test; whether the pick predates the switch is not.
 
-        Picks past PICK_MAX_AGE_DAYS stay suppressed regardless: their round-up
-        window has closed, and flipping the switch must never open a month of
-        old positions at once.
+        Picks past the user's age limit stay suppressed regardless: their
+        round-up window has closed, and flipping the switch must never open a
+        month of old positions at once.
         """
         bought = self._mirror_bought_keys(self._quick_picks)
         pending: List[Dict[str, str]] = []
@@ -9519,7 +9839,7 @@ class App(ctk.CTk):
                 continue
             if self._mirror_journal_key(pick) in bought:
                 continue
-            if not _pick_is_fresh(pick):
+            if not self._mirror_pick_age_ok(pick):
                 continue
             pending.append(pick)
         return pending
@@ -9570,22 +9890,32 @@ class App(ctk.CTk):
         MIRROR_CHECK_TIMES_ET. Waking often is what makes the schedule survive
         a sleeping laptop or a clock jump — a single long after() would drift
         straight past a slot.
+
+        The reschedule sits in a finally. It used to be the last statement, so
+        anything that threw on the way there — an unwritable state file, a tz
+        hiccup — killed the after() chain for good while the badge still read
+        ACTIVE, and mirror looked like it had "turned itself off". Losing one
+        slot is recoverable; losing the heartbeat costs the rest of the day.
         """
         if not self._mirror_enabled.get():
             return
-
-        _state, _label, now = _market_status()
-        slot = _mirror_due_slot(now)
-        if slot and slot != self._mirror_last_slot:
-            self._mirror_last_slot = slot
-            self._save_mirror_state()
-            self._mirror_check_now(slot.split("@", 1)[-1])
-
-        self._mirror_poll_id = self.after(MIRROR_HEARTBEAT_MS, self._mirror_poll)
+        try:
+            _state, _label, now = _market_status()
+            slot = _mirror_due_slot(now)
+            if slot and slot != self._mirror_last_slot:
+                self._mirror_last_slot = slot
+                self._save_mirror_state()
+                self._mirror_check_now(slot.split("@", 1)[-1])
+        except Exception as e:
+            self._mirror_log_msg(f"Heartbeat error (schedule kept): {e}")
+        finally:
+            if self._mirror_enabled.get():
+                self._mirror_poll_id = self.after(MIRROR_HEARTBEAT_MS,
+                                                  self._mirror_poll)
 
     def _mirror_check_now(self, when: str = "manual",
                           trigger: str = "") -> None:
-        """One pass over the pick feed; buys anything new and eligible."""
+        """One pass over the pick feed; queues anything new and eligible."""
         if not self._mirror_enabled.get():
             return
         trigger = trigger or ("manual" if when == "manual" else "schedule")
@@ -9595,8 +9925,10 @@ class App(ctk.CTk):
             try:
                 picks = _fetch_quick_picks()
                 bought = self._mirror_bought_keys(picks)
+                max_age = self._mirror_max_age_days()
                 new_picks = []
                 skipped: List[Dict[str, str]] = []
+                queued = {self._mirror_key(p) for p in self._mirror_queue}
                 for pick in picks:
                     note = pick.get("note", "").lower()
                     sym = str(pick.get("symbol", "")).upper()
@@ -9611,15 +9943,18 @@ class App(ctk.CTk):
                     if self._mirror_key(pick) in self._mirror_executed:
                         skipped.append({"symbol": sym, "reason": "already executed"})
                         continue
+                    if self._mirror_key(pick) in queued:
+                        skipped.append({"symbol": sym, "reason": "already queued"})
+                        continue
                     # Bought by hand, or by an earlier install: the executed set
                     # only knows about orders mirror itself placed, so without
                     # this a Trade Desk buy gets bought a second time.
                     if self._mirror_journal_key(pick) in bought:
                         skipped.append({"symbol": sym, "reason": "already bought"})
                         continue
-                    if not _pick_is_fresh(pick):
+                    if not self._mirror_pick_age_ok(pick):
                         skipped.append({"symbol": sym,
-                                        "reason": "past its round-up window"})
+                                        "reason": f"older than the {max_age}-day limit"})
                         continue
                     new_picks.append(pick)
 
@@ -9647,71 +9982,213 @@ class App(ctk.CTk):
 
     def _mirror_execute(self, picks: List[Dict[str, str]],
                         when: str = "manual", trigger: str = "") -> None:
-        """Execute BUY 1 share for each new pick on the brokers still owed it."""
+        """Queue new picks for a BUY 1 — one at a time, not all at once.
+
+        This used to BE the execution: a loop over every new pick, and inside
+        it a loop over every selected broker, spawning a thread each with
+        nothing in between. Ten picks across six brokers is ~56 concurrent
+        execute_trade() calls in the same second — nine per broker. The queue
+        is drained by _mirror_drain instead; see MIRROR_MAX_INFLIGHT_PICKS.
+        """
         if not self._mirror_selected_brokers:
             self._mirror_log_msg("No brokers selected — skipping")
             return
 
-        # Which brokers already hold each pick. A pick reaches here when at
-        # least one selected broker still owes it — buying blind on the whole
-        # set would double up on the ones that already filled.
-        holders = _pick_broker_map(picks)
-
+        seen = {self._mirror_key(p) for p in self._mirror_queue}
+        fresh: List[Dict[str, str]] = []
         for pick in picks:
-            symbol = pick.get("symbol", "").upper()
             key = self._mirror_key(pick)
-
-            # Double-check not already executed
-            if key in self._mirror_executed:
+            if key in self._mirror_executed or key in seen:
                 continue
+            seen.add(key)
+            # The slot/trigger travel with the pick: by the time it reaches the
+            # front of the queue the check that found it is long over.
+            fresh.append(dict(pick, _when=when, _trigger=trigger))
+        if not fresh:
+            return
 
-            self._mirror_executed.add(key)
-            held = holders.get(self._mirror_journal_key(pick), set())
-            selected = sorted(self._mirror_selected_brokers - held)
-            if not selected:
+        was_idle = not self._mirror_queue and not self._mirror_active
+        self._mirror_queue.extend(fresh)
+        if len(fresh) > 1 or not was_idle:
+            syms = ", ".join(str(p.get("symbol") or "?").upper() for p in fresh)
+            self._mirror_log_msg(
+                f"Queued {len(fresh)} pick(s): {syms}")
+            self._mirror_log_msg(
+                f"Executing one at a time, {MIRROR_PICK_GAP_MS // 1000}s "
+                f"after each one reports — this is deliberate, not a stall")
+        self._render_mirror_queue_lbl()
+        self._mirror_drain()
+
+    def _mirror_drain(self) -> None:
+        """Release the next queued pick once the one ahead of it has landed.
+
+        This is the whole of the pacing fix. The run log is what argues for it:
+        ten picks fired in the same second on 2026-08-27, and within that second
+        Chase filled 4/4 on one pick and 0/4 on another — same profile, same
+        credentials, same instant. Browser brokers queue behind their per-broker
+        Chrome lock until the session goes stale; the API brokers have no lock
+        at all and simply get hammered.
+        """
+        self._mirror_drain_id = None
+        if not self._mirror_enabled.get():
+            self._mirror_queue = []
+            self._render_mirror_queue_lbl()
+            return
+
+        now = datetime.now()
+
+        # Retire finished batches. One that never reports at all would hold the
+        # queue shut forever, so past the stall backstop it is written off —
+        # loudly, because a pick whose orders vanished is precisely what needs
+        # to reach the user.
+        still: List[dict] = []
+        for b in self._mirror_active:
+            if b.get("finished"):
+                self._mirror_settled_at = now
                 continue
-            skipping = sorted(self._mirror_selected_brokers & held)
-            self._mirror_log_msg(f"NEW PICK: {symbol} — executing BUY 1 share")
-            if skipping:
+            started = b.get("started") or now
+            if (now - started).total_seconds() * 1000 >= MIRROR_QUEUE_STALL_MS:
+                self._mirror_settled_at = now
                 self._mirror_log_msg(
-                    f"  skipping {', '.join(skipping)} — already holds {symbol}")
-            self._mirror_exec_count.configure(
-                text=f"{len(self._mirror_executed)} pick(s) already executed")
+                    f"{b.get('symbol', '?')}: no result after "
+                    f"{MIRROR_QUEUE_STALL_MS // 60000} min — moving on "
+                    f"(see the Activity log for a stuck broker)")
+                continue
+            still.append(b)
+        self._mirror_active = still
+        self._render_mirror_queue_lbl()
 
-            # Route through a batch (origin=mirror) so it gets the same live
-            # strip + completion receipt as a manual trade, and reuse the worker.
-            try:
-                run_id = mirror_journal.start_run(
-                    symbol=symbol, side="buy", qty="1", brokers=selected,
-                    trigger=trigger or ("manual" if when == "manual" else "schedule"),
-                    slot=when, note=str(pick.get("note", "")),
-                    pick_date=str(pick.get("date", "")), dry_run=False)
-            except Exception:
-                run_id = ""
-            batch = {
-                "pending": set(selected),
-                "all_brokers": selected,
-                "results": [],
-                "side": "buy",
-                "symbol": symbol,
-                "qty": "1",
-                "dry_run": False,
-                "origin": "mirror",
-                "mirror_key": key,
-                "mirror_run": run_id,
-                "finished": False,
-                "started": datetime.now(),
-            }
-            self._live_start(batch)
-            for broker in selected:
-                self._mirror_log_msg(f"  {broker}: sending BUY 1 {symbol}...")
-                self._run_in_thread(self._trade_worker, broker, "buy", symbol, "1", False, batch)
+        if not self._mirror_queue:
+            return
 
-            # Play notification sound
+        def _again(ms: int) -> None:
+            self._mirror_drain_id = self.after(int(ms), self._mirror_drain)
+
+        if len(self._mirror_active) >= MIRROR_MAX_INFLIGHT_PICKS:
+            _again(MIRROR_DRAIN_POLL_MS)
+            return
+
+        # Breather after the last batch landed, so a broker session settles
+        # rather than being re-entered the same second it finished.
+        if self._mirror_settled_at is not None:
+            waited = (now - self._mirror_settled_at).total_seconds() * 1000
+            if waited < MIRROR_PICK_GAP_MS:
+                _again(MIRROR_PICK_GAP_MS - waited + 100)
+                return
+
+        # Don't step on a desk order, an exit or an ETF run already using one of
+        # our brokers. _mirror_execute ignored this guard entirely; the Trade
+        # Desk has honoured it since the AIFA double-sell.
+        busy = sorted(set(self._mirror_selected_brokers)
+                      & getattr(self, "_brokers_in_flight", set()))
+        if busy:
+            if (self._mirror_busy_logged is None
+                    or (now - self._mirror_busy_logged).total_seconds() >= 120):
+                self._mirror_busy_logged = now
+                self._mirror_log_msg(
+                    f"Waiting — {', '.join(busy)} already mid-order "
+                    f"({len(self._mirror_queue)} pick(s) still queued)")
+            _again(MIRROR_DRAIN_POLL_MS)
+            return
+        self._mirror_busy_logged = None
+
+        self._mirror_launch_pick(self._mirror_queue.pop(0))
+        self._mirror_settled_at = None
+        self._render_mirror_queue_lbl()
+        if self._mirror_queue:
+            _again(MIRROR_DRAIN_POLL_MS)
+
+    def _mirror_nudge_drain(self) -> None:
+        """Advance the queue now that a batch has landed.
+
+        Cancels the pending drain tick first so the immediate run and the poll
+        can't carry on as two independent chains, each scheduling the next.
+        """
+        if getattr(self, "_mirror_queue", None) is None:
+            return
+        if self._mirror_drain_id:
             try:
-                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                self.after_cancel(self._mirror_drain_id)
             except Exception:
                 pass
+            self._mirror_drain_id = None
+        self.after(0, self._mirror_drain)
+
+    def _mirror_launch_pick(self, pick: Dict[str, str]) -> None:
+        """Send one pick's orders across the brokers still owed it."""
+        when = str(pick.get("_when") or "manual")
+        trigger = str(pick.get("_trigger") or "")
+        symbol = str(pick.get("symbol", "")).upper()
+        key = self._mirror_key(pick)
+        if key in self._mirror_executed:
+            return
+
+        # Age is re-checked at launch, not only when queued: a pick can sit in
+        # the queue across midnight, and buying yesterday's limit today is
+        # exactly what the limit exists to prevent.
+        if not self._mirror_pick_age_ok(pick):
+            self._mirror_log_msg(
+                f"{symbol}: aged past the {self._mirror_max_age_days()}-day "
+                f"limit while queued — skipped")
+            return
+
+        held = _pick_broker_map([pick]).get(self._mirror_journal_key(pick), set())
+        selected = sorted(self._mirror_selected_brokers - held)
+        skipping = sorted(self._mirror_selected_brokers & held)
+
+        # Marked executed the moment the orders go out and never before. Mirror
+        # does not retry (a second pass would double-buy every account that DID
+        # fill), so this has to happen here — but marking at QUEUE time would
+        # bury a pick the user cancelled before it ever ran.
+        self._mirror_executed.add(key)
+        self._mirror_exec_count.configure(
+            text=f"{len(self._mirror_executed)} pick(s) already executed")
+        if not selected:
+            self._save_mirror_state()
+            return
+
+        self._mirror_log_msg(f"NEW PICK: {symbol} — executing BUY 1 share")
+        if skipping:
+            self._mirror_log_msg(
+                f"  skipping {', '.join(skipping)} — already holds {symbol}")
+
+        # Route through a batch (origin=mirror) so it gets the same live
+        # strip + completion receipt as a manual trade, and reuse the worker.
+        try:
+            run_id = mirror_journal.start_run(
+                symbol=symbol, side="buy", qty="1", brokers=selected,
+                trigger=trigger or ("manual" if when == "manual" else "schedule"),
+                slot=when, note=str(pick.get("note", "")),
+                pick_date=str(pick.get("date", "")), dry_run=False)
+        except Exception:
+            run_id = ""
+        batch = {
+            "pending": set(selected),
+            "all_brokers": selected,
+            "results": [],
+            "side": "buy",
+            "symbol": symbol,
+            "qty": "1",
+            "dry_run": False,
+            "origin": "mirror",
+            "mirror_key": key,
+            "mirror_run": run_id,
+            "finished": False,
+            "started": datetime.now(),
+        }
+        # Tracked so the drain knows when this pick has landed and the next may
+        # go. _live_start claims the brokers on the shared in-flight guard.
+        self._mirror_active.append(batch)
+        self._live_start(batch)
+        for broker in selected:
+            self._mirror_log_msg(f"  {broker}: sending BUY 1 {symbol}...")
+            self._run_in_thread(self._trade_worker, broker, "buy", symbol, "1", False, batch)
+
+        # Play notification sound
+        try:
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:
+            pass
 
         self._save_mirror_state()
 
@@ -10399,7 +10876,9 @@ class App(ctk.CTk):
               ", ".join(b.capitalize() for b in brokers) if brokers else "none selected",
               TEXT_PRIMARY if brokers else RED)
         _fact("SCHEDULE", _mirror_schedule_label())
-        _fact("BUYS", "1 share of each new Reg Alert")
+        _fact("BUYS", "1 share of each new Reg Alert, one pick at a time")
+        _age = self._mirror_max_age_days()
+        _fact("MAX AGE", f"{_age} day{'s' if _age != 1 else ''}")
         last_scan = stats.get("last_scan") or {}
         _fact("LAST CHECK",
               (last_scan.get("at") or "—").replace("T", " ")[:16] or "—")
