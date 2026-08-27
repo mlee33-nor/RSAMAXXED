@@ -19,6 +19,7 @@ _lock = threading.Lock()
 
 
 def _load() -> List[Dict[str, Any]]:
+    """Parse trades.json. Raw read — no cache, for read-modify-write callers."""
     if not _FILE.exists():
         return []
     try:
@@ -27,8 +28,40 @@ def _load() -> List[Dict[str, Any]]:
         return []
 
 
+#: Parsed journal, keyed by the file fingerprint it was parsed from.
+#:
+#: The journal is 4,500+ rows and ~1.4MB, so a parse costs ~10ms. Nothing
+#: cached it, and the read paths call in far more often than that suggests:
+#: one Quick Picks render alone went through five full parses, because
+#: _purchased_pick_keys and _partial_pick_keys each recompute the same
+#: coverage from scratch. That is ~50ms of blocked UI thread per render, on
+#: a file that only changes when we place a trade.
+#:
+#: Keyed on version() — the same (mtime_ns, size) fingerprint the GUI already
+#: trusts for its page cache — so an external writer (reconcile.py, a restore
+#: from backup) is picked up on the next call rather than being served stale.
+_cache: Dict[str, Any] = {"key": None, "rows": []}
+
+
+def _load_shared() -> List[Dict[str, Any]]:
+    """The parsed journal, reused while the file underneath is unchanged.
+
+    Returns the SHARED list — callers must not mutate it. `get_trades` hands
+    out a copy; the read-modify-write paths deliberately use `_load` instead.
+    """
+    key = version()
+    if _cache["key"] != key:
+        _cache["rows"] = _load()
+        _cache["key"] = key
+    return _cache["rows"]
+
+
 def _save(trades: List[Dict[str, Any]]) -> None:
     _FILE.write_text(json.dumps(trades, indent=2), encoding="utf-8")
+    # Refresh rather than merely invalidate: we already hold the rows, and the
+    # very next thing a writer does is re-render off them.
+    _cache["rows"] = list(trades)
+    _cache["key"] = version()
 
 
 #: What `fill_price` on a row actually is.
@@ -201,12 +234,17 @@ def version() -> tuple:
 
 
 def get_trades(broker: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Return all recorded trades, optionally filtered by broker."""
+    """Return all recorded trades, optionally filtered by broker.
+
+    The returned list is a copy, so callers can filter and sort it freely; the
+    row dicts inside are shared with the cache and must be treated as read-only
+    (nothing mutates them today — split_adjusted copies every row it restates).
+    """
     with _lock:
-        trades = _load()
-    if broker:
-        trades = [t for t in trades if t["broker"] == broker.lower()]
-    return trades
+        trades = _load_shared()
+        if broker:
+            return [t for t in trades if t["broker"] == broker.lower()]
+        return list(trades)
 
 
 def split_adjusted(trades: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
