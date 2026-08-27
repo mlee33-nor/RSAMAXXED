@@ -363,8 +363,14 @@ def test_each_button_returns_to_its_own_resting_label():
 
 # ------------------------------------------------- Command Center sells card
 
+def _exit(symbol, broker="Public"):
+    """A sell alert as the feed writes it: one ticker, one brokerage."""
+    return {"symbol": symbol, "legs": [{"broker": broker, "accounts_low": 1}]}
+
+
 class Card:
     _sell_alert_position_map = A.App._sell_alert_position_map
+    _sell_alert_scope = A.App._sell_alert_scope
     _sell_alert_state = A.App._sell_alert_state
     _board_status_map = A.App._board_status_map
     _SELL_STATUS_CHIP = A.App._SELL_STATUS_CHIP
@@ -385,12 +391,16 @@ def test_a_bought_play_is_told_apart_from_one_never_owned(monkeypatch):
                         lambda: {("public", "STILLIN"): {"qty": 1.0}})
 
     c = Card()
-    open_syms, bought, sold = Card._sell_alert_position_map(c)
+    open_pairs, bought, sold = Card._sell_alert_position_map(c)
 
-    assert open_syms == {"STILLIN"}
-    assert Card._sell_alert_state(c, "SOLDOUT", open_syms, bought, sold) == "sold"
-    assert Card._sell_alert_state(c, "STILLIN", open_syms, bought, sold) == "alerts"
-    assert Card._sell_alert_state(c, "NEVER", open_syms, bought, sold) == "alerts"
+    # The open set keeps the broker now — one broker's exit must not speak for
+    # another's position in the same ticker.
+    assert open_pairs == {("public", "STILLIN")}
+    state = lambda sym: Card._sell_alert_state(
+        c, _exit(sym), open_pairs, bought, sold)
+    assert state("SOLDOUT") == "sold"
+    assert state("STILLIN") == "alerts"
+    assert state("NEVER") == "alerts"
 
 
 def test_a_half_sold_play_lands_in_partial(monkeypatch):
@@ -403,8 +413,9 @@ def test_a_half_sold_play_lands_in_partial(monkeypatch):
     monkeypatch.setattr(A.trade_journal, "get_portfolio",
                         lambda: {("public", "HALF"): {"qty": 1.0}})
     c = Card()
-    open_syms, bought, sold = Card._sell_alert_position_map(c)
-    assert Card._sell_alert_state(c, "HALF", open_syms, bought, sold) == "partial"
+    open_pairs, bought, sold = Card._sell_alert_position_map(c)
+    assert Card._sell_alert_state(
+        c, _exit("HALF"), open_pairs, bought, sold) == "partial"
 
 
 def test_a_journal_read_failure_does_not_take_the_card_down(monkeypatch):
