@@ -843,6 +843,40 @@ def _sell_legs_text(sell: Dict[str, Any]) -> str:
     return "  ·  ".join(parts)
 
 
+def _sell_accounts_label(sell: Dict[str, Any]) -> str:
+    """'21 accounts' / '21+ accounts' — what the alert's dollar figure assumes.
+
+    The counts came off the broker names ('Public x21') because there they sat
+    beside OUR coverage and invited being read as ours. They belong here
+    instead: the proceeds figure is exactly the alerter's account spread times
+    their exit price, so naming it turns an unqualified dollar amount into an
+    estimate with its basis attached.
+
+    A leg quoted as a range ('21-23') makes the whole figure a floor, so the
+    total is written with a '+'.
+    """
+    low = high = 0
+    for leg in sell.get("legs") or []:
+        if not isinstance(leg, dict):
+            continue
+        try:
+            leg_low = int(leg.get("accounts_low") or 0)
+            leg_high = int(leg.get("accounts_high") or leg_low)
+        except (TypeError, ValueError):
+            continue
+        low += leg_low
+        high += max(leg_high, leg_low)
+    if not low:
+        # Older records carry a single total rather than per-broker legs.
+        try:
+            low = high = int(sell.get("accounts") or 0)
+        except (TypeError, ValueError):
+            return ""
+    if not low:
+        return ""
+    return f"{low}{'+' if high > low else ''} account{'s' if low != 1 else ''}"
+
+
 def _sell_leg_broker_keys(sell: Dict[str, Any]) -> List[str]:
     """App broker keys a sell alert names, in the order it wrote them.
 
@@ -3972,8 +4006,14 @@ class App(ctk.CTk):
         proceeds = sell.get("proceeds_low")
         if proceeds is not None:
             hi = sell.get("proceeds_high")
-            meta.append(f"+${float(proceeds):,.2f}"
-                        + (f"–${float(hi):,.2f}" if hi and hi > proceeds else ""))
+            cash = (f"+${float(proceeds):,.2f}"
+                    + (f"–${float(hi):,.2f}" if hi and hi > proceeds else ""))
+            # Say where the number came from. It is the ALERTER's account
+            # spread times their exit price — not our coverage and not our
+            # money — and an unqualified dollar figure on a row that also
+            # carries our own account counts reads as ours.
+            basis = _sell_accounts_label(sell)
+            meta.append(f"{cash} est. from {basis}" if basis else f"{cash} est.")
         if sell.get("note"):
             meta.append(str(sell["note"])[:110])
         if meta:
@@ -7229,8 +7269,7 @@ class App(ctk.CTk):
         total_shares = sum(r["shares"] for r in results)
 
         if batch.get("origin") == "mirror" and batch.get("mirror_key") and not dry:
-            self._mirror_record_outcome(batch["mirror_key"], symbol,
-                                        total_ok, total_fail)
+            self._mirror_record_outcome(batch, total_ok, total_fail)
         ok_brokers = [r["broker"] for r in results if r["ok_accounts"] > 0]
         failed = [r for r in results if r["fail_accounts"] > 0 or r["errors"]]
 
@@ -9371,6 +9410,10 @@ class App(ctk.CTk):
             # doesn't re-run a slot that already fired today.
             "last_slot": self._mirror_last_slot,
             "failed": [list(k) for k in self._mirror_failed],
+            # Why each one is listed. Separate from `failed` so an older state
+            # file still loads — a missing note just falls back to generic text.
+            "failed_notes": [[d, sym, txt] for (d, sym), txt
+                             in self._mirror_failed_notes.items()],
             "max_age_days": self._mirror_max_age_days(),
         }
         try:
@@ -9424,6 +9467,13 @@ class App(ctk.CTk):
         self._mirror_failed: set = set(
             tuple(x) if isinstance(x, list) else x
             for x in saved.get("failed", []))
+        self._mirror_failed_notes: Dict[tuple, str] = {}
+        for entry in saved.get("failed_notes") or []:
+            try:
+                d, sym, txt = entry
+            except (TypeError, ValueError):
+                continue
+            self._mirror_failed_notes[(d, sym)] = str(txt)
         # Repaired once the picks actually land — see _render_quick_picks. The
         # feed is still empty at build time.
         self._mirror_repaired = False
@@ -10075,7 +10125,13 @@ class App(ctk.CTk):
         self._mirror_poll()
 
     def _render_mirror_failed(self) -> None:
-        """List picks mirror tried and could not fill anywhere."""
+        """Picks mirror tried and could not fill — with the reason each is here.
+
+        The heading used to assert FILLED NOWHERE for every row, which is wrong
+        for the common case: a play the other brokers already hold, where one
+        broker was owed and missed. Both need attention; only one means you own
+        none of it.
+        """
         frame = getattr(self, "_mirror_failed_frame", None)
         if frame is None:
             return
@@ -10084,18 +10140,23 @@ class App(ctk.CTk):
         if not self._mirror_failed:
             return
 
-        tk.Label(frame, text="NEEDS ATTENTION — FILLED NOWHERE", bg=BG_CARD,
+        tk.Label(frame, text="NEEDS ATTENTION — DID NOT FILL", bg=BG_CARD,
                  fg=RED, font=(FONT_FAMILY, 9, "bold")).pack(anchor="w",
                                                              pady=(10, 6))
         for date_str, sym in sorted(self._mirror_failed, reverse=True):
+            note = self._mirror_failed_notes.get((date_str, sym))
+            # An entry saved before the reason was recorded says the least it
+            # can get away with, rather than guessing which case it was.
+            partial = bool(note and "already hold" in note)
             row = tk.Frame(frame, bg=BG_INPUT)
             row.pack(fill="x", pady=(0, 4))
-            tk.Frame(row, bg=RED, width=3).pack(side="left", fill="y")
+            tk.Frame(row, bg=YELLOW if partial else RED, width=3).pack(
+                side="left", fill="y")
             inner = tk.Frame(row, bg=BG_INPUT)
             inner.pack(side="left", fill="x", expand=True, padx=(10, 12), pady=7)
             tk.Label(inner, text=sym, bg=BG_INPUT, fg=TEXT_PRIMARY,
                      font=(FONT_FAMILY, 11, "bold")).pack(side="left")
-            tk.Label(inner, text=f"  {date_str} · no broker filled",
+            tk.Label(inner, text=f"  {date_str} · {note or 'did not fill'}",
                      bg=BG_INPUT, fg=TEXT_SECONDARY,
                      font=(FONT_FAMILY, 9)).pack(side="left")
             clear = tk.Label(inner, text="Dismiss", bg=BG_INPUT, fg=TEXT_MUTED,
@@ -10113,33 +10174,67 @@ class App(ctk.CTk):
 
     def _mirror_clear_failed(self, key: tuple) -> None:
         self._mirror_failed.discard(tuple(key))
+        self._mirror_failed_notes.pop(tuple(key), None)
         self._save_mirror_state()
         self._render_mirror_failed()
 
-    def _mirror_record_outcome(self, key: tuple, symbol: str,
+    def _mirror_record_outcome(self, batch: dict,
                                total_ok: int, total_fail: int) -> None:
-        """Record how a mirror batch actually landed.
+        """Record how a mirror batch actually landed, in the run's own terms.
 
-        Mirror deliberately does not retry: the pick is already marked executed
-        before the orders go out, because a second pass would double-buy every
-        account that DID fill. The cost of that is a pick which filled nowhere
-        (an OTC name under $1, say) silently disappearing — so record it and
-        put it in front of the user instead.
+        Mirror deliberately does not retry: the pick is marked executed before
+        the orders go out, because a second pass would double-buy every account
+        that DID fill. The cost is that a pick which filled nowhere would
+        silently disappear — so it is recorded and put in front of the user.
+
+        The message has to be scoped to what the run ATTEMPTED, which is only
+        the brokers still owed the pick. Reporting zero fills as "filled on no
+        broker" was true of the run and false of the play: SFWL went out to
+        Fidelity alone, because the other five brokers already held it across
+        38 accounts, and the notification read as though the whole buy had
+        failed. Being short one broker and owning none of it are not the same
+        problem and must not share a sentence.
         """
-        key = tuple(key)
+        key = tuple(batch.get("mirror_key") or ())
+        if not key:
+            return
+        symbol = str(batch.get("symbol") or "")
         if total_ok > 0:
             if key in self._mirror_failed:
                 self._mirror_failed.discard(key)
+                self._mirror_failed_notes.pop(key, None)
                 self._save_mirror_state()
                 self._render_mirror_failed()
             return
+
+        def _names(keys) -> str:
+            return ", ".join(rsa_feed.normalize_broker(b) for b in keys)
+
+        attempted = list(batch.get("all_brokers") or [])
+        already = list(batch.get("mirror_skipped") or [])
+        who = _names(attempted) or "no broker"
+
+        if already:
+            note = f"{who} did not fill · {len(already)} broker(s) already hold it"
+            detail = (f"{symbol}: {who} filled 0 of {total_fail} account(s). The "
+                      f"other {len(already)} ({_names(already)}) already hold it "
+                      f"and were not asked — you are not out of this play, you "
+                      f"are short {who}.")
+            toast = (f"Mirror: {symbol} — only {who} was owed, and it didn't "
+                     f"fill. The rest already hold it.")
+            kind = "warning"
+        else:
+            note = f"no broker filled · {total_fail} account(s) rejected"
+            detail = (f"{symbol}: filled on NO broker ({total_fail} account(s) "
+                      f"rejected across {who}) — not retried, handle it manually")
+            toast = f"Mirror: {symbol} filled on no broker — needs manual action"
+            kind = "error"
+
         self._mirror_failed.add(key)
+        self._mirror_failed_notes[key] = note
         self._save_mirror_state()
-        self._mirror_log_msg(
-            f"{symbol}: filled on NO broker ({total_fail} account(s) rejected) "
-            f"— not retried, handle it manually")
-        self._push_notification(
-            f"Mirror: {symbol} filled on no broker — needs manual action", "error")
+        self._mirror_log_msg(detail)
+        self._push_notification(toast, kind)
         self._render_mirror_failed()
 
     def _mirror_pending_picks(self) -> List[Dict[str, str]]:
@@ -10499,6 +10594,11 @@ class App(ctk.CTk):
             "origin": "mirror",
             "mirror_key": key,
             "mirror_run": run_id,
+            # Which brokers were NOT asked, because they already hold the pick.
+            # Without this the outcome message can only see the legs that ran
+            # and calls a play "filled on no broker" when five of six brokers
+            # were holding it and had nothing to do.
+            "mirror_skipped": skipping,
             "finished": False,
             "started": datetime.now(),
         }
