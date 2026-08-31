@@ -170,3 +170,95 @@ def test_shares_are_formatted_without_a_pointless_decimal():
     assert A._qty_text(3.0) == "3"
     assert A._qty_text(0.1) == "0.1"
     assert A._qty_text(0) == "0"
+
+
+# ------------------------------------------ resolving a leg by hand
+
+"""A leg can end without this tool seeing it.
+
+LBGJ at Robinhood: 1 share bought into each of three accounts on 2026-03-25,
+1 more into each on 2026-07-31, a 1-for-N round-up collapsed each account back
+to one whole share, and the three that were sold on 2026-08-19 emptied it. The
+journal, which only counts trades, still believes three shares are open, so the
+desk keeps firing and Robinhood keeps answering "Not enough shares to sell".
+`split_adjusted` deliberately will not touch this - the sell was a WHOLE share,
+which is an ordinary partial exit everywhere else - so the fix is a hand-written
+resolution, and it has to be able to say "sold" and "gone" as separate things.
+"""
+
+
+def test_open_shares_are_reported_per_account(journal):
+    """A close has to be written per account, so that is how they are read."""
+    journal([trade("X", "robinhood", "buy", 1, account="a1"),
+             trade("X", "robinhood", "buy", 1, account="a2"),
+             trade("X", "robinhood", "sell", 1, account="a1"),
+             trade("X", "public", "buy", 1, account="p1")])
+    assert A._leg_open_accounts("robinhood", "X") == [("a2", 1.0)]
+
+
+def test_a_close_empties_an_account_the_same_way_a_sell_does(journal):
+    journal([trade("X", "robinhood", "buy", 2, account="a1"),
+             trade("X", "robinhood", "close", 2, account="a1")])
+    assert A._leg_open_accounts("robinhood", "X") == []
+
+
+def test_quantity_fills_whole_accounts_before_moving_on():
+    """"All of it" should write one clean row per account, not an even smear
+    that leaves every account holding an odd fraction."""
+    accts = [("a1", 1.0), ("a2", 1.0), ("a3", 1.0)]
+    assert A._spread_over_accounts(accts, 3) == [("a1", 1.0), ("a2", 1.0),
+                                                 ("a3", 1.0)]
+    assert A._spread_over_accounts(accts, 1.5) == [("a1", 1.0), ("a2", 0.5)]
+    assert A._spread_over_accounts(accts, 0) == []
+
+
+def test_a_reported_date_lands_on_that_day_not_the_evening_before():
+    """Every date in the app is timestamp[:10]; midnight UTC is the 17th in
+    every US time zone."""
+    assert A._iso_at_noon("2026-08-18")[:10] == "2026-08-18"
+    assert A._iso_at_noon("last tuesday") is None
+    assert A._iso_at_noon("") is None
+
+
+def test_resolving_a_leg_takes_the_play_off_the_worklist(journal):
+    """The LBGJ shape: rejected at the broker, closed by hand, gone from the
+    board."""
+    rows = [trade("LBGJ", "robinhood", "buy", 1, account="a1"),
+            trade("LBGJ", "robinhood", "buy", 1, account="a1")]
+    journal(rows)
+    play, = A._sell_plays([exit_alert("LBGJ", "Robinhood")])
+    assert play.bucket == "now"
+
+    rows.append(trade("LBGJ", "robinhood", "close", 2, account="a1"))
+    play, = A._sell_plays([exit_alert("LBGJ", "Robinhood")])
+    assert play.bucket == "closed"
+    assert play.left == 0
+
+
+def test_a_hand_reported_sale_carries_its_price_and_its_date(tmp_path,
+                                                             monkeypatch):
+    """A sale placed at the broker by hand is still a sale: it has proceeds and
+    a day it happened on, and both have to survive into the journal."""
+    monkeypatch.setattr(A.trade_journal, "_FILE", tmp_path / "trades.json")
+    A.trade_journal._cache.update({"rows": None, "key": None})
+    row = A.trade_journal.record_trade(
+        broker="robinhood", account_id="a1", side="sell", symbol="LBGJ",
+        qty=1, fill_price=3.45,
+        price_source=A.trade_journal.PRICE_MANUAL,
+        when=A._iso_at_noon("2026-08-18"))
+    assert row["timestamp"][:10] == "2026-08-18"
+    assert row["fill_price"] == 3.45
+    assert A.trade_journal.is_estimated(row)   # typed in, not read from a fill
+
+
+def test_a_hand_written_close_carries_no_price(tmp_path, monkeypatch):
+    """Shares that dissolved were never sold - nothing here may become P/L."""
+    monkeypatch.setattr(A.trade_journal, "_FILE", tmp_path / "trades.json")
+    A.trade_journal._cache.update({"rows": None, "key": None})
+    row = A.trade_journal.record_close(
+        broker="robinhood", account_id="a1", symbol="LBGJ", qty=3,
+        reason=A.trade_journal.CLOSE_MANUAL,
+        when=A._iso_at_noon("2026-08-18"))
+    assert row["fill_price"] is None
+    assert row["side"] == A.trade_journal.SIDE_CLOSE
+    assert row["timestamp"][:10] == "2026-08-18"

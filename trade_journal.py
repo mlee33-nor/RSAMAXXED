@@ -72,6 +72,10 @@ def _save(trades: List[Dict[str, Any]]) -> None:
 #: ""      recorded before this field existed, so unknown — treat as "quote".
 PRICE_FILL = "fill"
 PRICE_QUOTE = "quote"
+#: "manual" the user typed the price in, reporting a sale this tool did not
+#:          place. Not a fill we read, so it stays "estimated" — but it is the
+#:          only price anyone has for an order placed at the broker by hand.
+PRICE_MANUAL = "manual"
 
 #: A position that LEFT an account without a sale this tool placed.
 #:
@@ -97,6 +101,7 @@ SIDE_CLOSE = "close"
 #: Why a position was closed. Free text, but these are the ones that recur.
 CLOSE_CASH_IN_LIEU = "cash_in_lieu"
 CLOSE_RECONCILED = "reconciled"     # the broker simply does not have it
+CLOSE_MANUAL = "manual"             # the user says the shares are not there
 
 
 
@@ -122,6 +127,7 @@ def record_trade(
     fill_price: Optional[float] = None,
     order_id: Optional[str] = None,
     price_source: str = "",
+    when: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Append a trade entry and return it.
 
@@ -130,10 +136,14 @@ def record_trade(
     dropped here — which is why no trade in the journal can be checked against
     the broker that placed it. Keeping it costs one field and is the only thing
     that makes a fill recoverable after the fact.
+
+    `when` is an ISO timestamp for a trade that did not happen just now — a
+    sale placed at the broker by hand last Tuesday and reported here after the
+    fact. Defaults to now, which is right for everything this tool executes.
     """
     entry = {
         "id": str(uuid.uuid4()),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": when or datetime.now(timezone.utc).isoformat(),
         "broker": broker.lower(),
         "account_id": account_id,
         "side": side.lower(),
@@ -157,6 +167,7 @@ def record_close(
     qty: float,
     reason: str = CLOSE_RECONCILED,
     note: str = "",
+    when: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Record that a position is gone, without claiming it was sold.
 
@@ -167,7 +178,7 @@ def record_close(
     """
     entry = {
         "id": str(uuid.uuid4()),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": when or datetime.now(timezone.utc).isoformat(),
         "broker": broker.lower(),
         "account_id": account_id,
         "side": SIDE_CLOSE,
@@ -289,9 +300,13 @@ def split_adjusted(trades: Optional[List[Dict[str, Any]]] = None) -> List[Dict[s
     Rows are copies and trades.json is never rewritten — this is a lens, not a
     migration, so it stays correct for trades recorded before it existed.
     """
-    # Processed in file order, which is chronological: record_trade only ever
-    # appends. Sorting here would be a no-op that also reordered the caller's
-    # list out from under a display that expects newest-last.
+    # Processed in file order. record_trade only ever appends, so that is
+    # chronological except for a row reported after the fact with `when` — and
+    # such a row lands at the END, where it sees the whole history before it,
+    # which is exactly where a correction has to be applied. Sorting here would
+    # reorder the caller's list out from under a display that expects
+    # newest-last, and would move those corrections in front of trades that
+    # were recorded knowing about them.
     rows = get_trades() if trades is None else list(trades)
     held: Dict[tuple, float] = {}
     out: List[Dict[str, Any]] = []
