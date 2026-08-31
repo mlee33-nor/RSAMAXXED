@@ -885,6 +885,7 @@ def _qty_text(qty: float) -> str:
 SELL_NOW = "sell_now"     # we hold it there AND an exit has been called there
 SELL_WAIT = "waiting"     # we hold it there, no exit called there yet
 SELL_DONE = "done"        # we are out of it there
+SELL_NONE = "no_position"  # an exit was called there, but we never got in
 
 
 @dataclass(frozen=True)
@@ -1070,24 +1071,36 @@ def _sell_plays(sells: List[Dict[str, Any]]) -> List[SellPlay]:
         legs = []
         for b in brokers:
             bought, sold = ledger.get((b, sym), [0.0, 0.0])
-            if bought <= 1e-9 and sold <= 1e-9:
-                # The exit named a brokerage we never bought at. There is no
-                # position to report, and listing it as "sold" claimed an exit
-                # that never happened.
-                continue
             left = max(0.0, bought - sold)
-            if left <= 1e-9:
+            empty = bought <= 1e-9 and sold <= 1e-9
+            if empty and b not in called.get(sym, {}):
+                # A zero-quantity row and nobody called it: nothing to say.
+                continue
+            if empty:
+                # The exit named a brokerage we never got into. REPORTED, not
+                # dropped: dropping it was read as "no exit has been called",
+                # which is the exact opposite of what happened. GCTK and ARTL
+                # were called at Chase on 2026-08-31, all four Chase accounts
+                # had rejected the buy ("pending a corporate action"), so the
+                # only trace of the exit vanished and the card said the play
+                # was quietly waiting. It is not SELL_DONE either — that
+                # claimed an exit nobody took.
+                state = SELL_NONE
+            elif left <= 1e-9:
                 state = SELL_DONE
             elif b in called.get(sym, {}):
                 state = SELL_NOW
             else:
                 state = SELL_WAIT
-            # SELL rejections only. A buy that failed months ago says nothing
-            # about whether we can get out, and reporting it here read as
-            # "this exit was rejected" on a broker that was never asked.
+            # On a leg we hold, SELL rejections only: a buy that failed months
+            # ago says nothing about whether we can get out, and reporting it
+            # read as "this exit was rejected" on a broker never asked. On a
+            # leg we never got into, that failed BUY is the whole story — it is
+            # the answer to "why do I hold none here".
+            want = "buy" if state == SELL_NONE else "sell"
             bad = [r for (s2, b2, _a), r in attempts.items()
                    if s2 == sym and b2 == b and not r.get("ok")
-                   and r.get("side") == "sell"]
+                   and r.get("side") == want]
             legs.append(SellLeg(
                 broker=b, bought=bought, sold=sold, left=left, state=state,
                 alert_date=called.get(sym, {}).get(b, ""),
@@ -4140,8 +4153,9 @@ class App(ctk.CTk):
         ready = play.of(SELL_NOW)
         card = tk.Frame(parent, bg=row_bg)
         card.pack(fill="x", pady=(0, 6))
-        tk.Frame(card, bg=RED if ready else (YELLOW if play.left else GREEN),
-                 width=3).pack(side="left", fill="y")
+        stripe = (RED if ready else YELLOW if play.left
+                  else GREEN if play.bought > 1e-9 else BORDER_LIGHT)
+        tk.Frame(card, bg=stripe, width=3).pack(side="left", fill="y")
         inner = tk.Frame(card, bg=row_bg)
         inner.pack(side="left", fill="x", expand=True, padx=(12, 14), pady=9)
 
@@ -4162,10 +4176,17 @@ class App(ctk.CTk):
                      side="left", padx=(8, 0))
         # Shares, always. Counting accounts is what told you LBGJ was "3/3
         # sold" while three shares were still sitting at Robinhood.
-        summary = (f"{_qty_text(play.left)} of {_qty_text(play.bought)} shares left"
-                   if play.left else f"all {_qty_text(play.bought)} shares sold")
-        tk.Label(head, text=summary, bg=row_bg,
-                 fg=TEXT_SECONDARY if play.left else GREEN,
+        if play.bought <= 1e-9:
+            # Called somewhere we never got in. "all 0 shares sold" read as a
+            # completed exit.
+            summary, summary_fg = "never filled", TEXT_MUTED
+        elif play.left:
+            summary = (f"{_qty_text(play.left)} of {_qty_text(play.bought)} "
+                       f"shares left")
+            summary_fg = TEXT_SECONDARY
+        else:
+            summary, summary_fg = f"all {_qty_text(play.bought)} shares sold", GREEN
+        tk.Label(head, text=summary, bg=row_bg, fg=summary_fg,
                  font=(FONT_FAMILY, 9)).pack(side="right")
 
         for leg in ready:
@@ -4228,6 +4249,23 @@ class App(ctk.CTk):
             tk.Label(inner, text=f"{icon('check')}  sold:  {where}",
                      bg=row_bg, fg=GREEN, font=(FONT_FAMILY, 8),
                      justify="left", wraplength=740).pack(anchor="w", pady=(4, 0))
+        # Last, because it is context rather than a position: the exit that WAS
+        # called, at a brokerage holding none of it. Without this the card
+        # showed only "holding, no exit called yet" and flatly contradicted the
+        # feed the exit was read from.
+        missed = play.of(SELL_NONE)
+        if missed:
+            where = "  ".join(l.label for l in missed)
+            tk.Label(inner,
+                     text=f"–  exit called at {where}, but you hold none there",
+                     bg=row_bg, fg=TEXT_SECONDARY, font=(FONT_FAMILY, 8),
+                     justify="left", wraplength=740).pack(anchor="w", pady=(6, 0))
+            for l in missed:
+                if l.fail_reason:
+                    tk.Label(inner,
+                             text=f"      {l.label} never filled: {l.fail_reason}",
+                             bg=row_bg, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
+                             justify="left", wraplength=740).pack(anchor="w")
 
     def _resolve_sell_leg(self, play, leg) -> None:
         """Close one brokerage's leg by hand, when the tool cannot.

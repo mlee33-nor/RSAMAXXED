@@ -120,12 +120,19 @@ def test_out_everywhere_is_closed(journal):
 
 # ------------------------------------------------------- edges
 
-def test_a_brokerage_we_never_held_is_not_a_leg(journal):
-    """The exit named Fennel, we never bought there. Listing it as 'sold'
-    claimed an exit that never happened."""
+def test_a_brokerage_we_never_held_is_never_counted_as_sold(journal):
+    """The exit named Fennel, we never bought there.
+
+    It used to be dropped outright, because listing it as 'sold' claimed an
+    exit that never happened. Dropping it turned out to say something equally
+    untrue — see the GCTK block at the end of this file — so it is kept, in a
+    state that claims nothing.
+    """
     journal([trade("X", "public", "buy", 5)])
     play, = A._sell_plays([exit_alert("X", "Public", "Fennel")])
-    assert {l.broker for l in play.legs} == {"public"}
+    assert leg(play, "fennel").state == A.SELL_NONE
+    assert play.of(A.SELL_DONE) == ()
+    assert play.bought == 5 and play.left == 5
 
 
 def test_a_failed_buy_is_not_reported_as_a_rejected_sell(monkeypatch):
@@ -262,3 +269,83 @@ def test_a_hand_written_close_carries_no_price(tmp_path, monkeypatch):
     assert row["fill_price"] is None
     assert row["side"] == A.trade_journal.SIDE_CLOSE
     assert row["timestamp"][:10] == "2026-08-18"
+
+
+# ------------------------------------ an exit called where we never got in
+
+"""GCTK and ARTL, 2026-08-31.
+
+Both exits named Chase and only Chase. All four Chase accounts had rejected the
+buy on 8/27 — "Security is pending a corporate action and is not available for
+online purchase at this time" — so there was no Chase position, the leg was
+dropped, and the card rendered "holding, no exit called yet: Public 20
+Robinhood 2". Every word of that is defensible and the sentence is still a flat
+contradiction of the feed the exit came from. The leg stays, in a state of its
+own: not sellable, not sold, but SAID.
+"""
+
+
+def attempts(monkeypatch, *rows):
+    """(symbol, broker, account, side, ok, msg) -> the attempts map."""
+    monkeypatch.setattr(A, "_load_trade_attempts", lambda: {
+        (s, b, a): {"ok": ok, "side": side, "msg": msg}
+        for s, b, a, side, ok, msg in rows})
+
+
+def test_an_exit_called_where_we_hold_nothing_is_reported_not_dropped(journal):
+    """The GCTK shape."""
+    journal([trade("GCTK", "public", "buy", 20, "p1"),
+             trade("GCTK", "robinhood", "buy", 2, "r1")])
+
+    play, = A._sell_plays([exit_alert("GCTK", "Chase", price=4.23)])
+
+    assert leg(play, "chase").state == A.SELL_NONE
+    assert {l.broker for l in play.of(A.SELL_WAIT)} == {"public", "robinhood"}
+    # It is context, not a position: it moves none of the arithmetic.
+    assert (play.bought, play.sold, play.left) == (22, 0, 22)
+    assert play.ready_value == 0
+    assert play.bucket == "holding"
+
+
+def test_a_leg_we_never_got_into_is_not_counted_as_sold(journal):
+    """The reason it was dropped in the first place — claiming an exit nobody
+    took is worse than saying nothing. Saying it plainly is better than both."""
+    journal([trade("X", "public", "buy", 5, "p1")])
+    play, = A._sell_plays([exit_alert("X", "Chase")])
+    assert play.of(A.SELL_DONE) == ()
+    assert leg(play, "chase").sold == 0
+
+
+def test_the_failed_buy_is_the_reason_we_hold_none_there(journal, monkeypatch):
+    """On a leg we hold, a stale failed buy is noise. On a leg we never got
+    into it is the entire explanation, so that is the one we surface."""
+    journal([trade("GCTK", "public", "buy", 20, "p1")])
+    attempts(monkeypatch,
+             ("GCTK", "chase", "0481", "buy", False,
+              "Rejected - Security is pending a corporate action"),
+             ("GCTK", "public", "p1", "buy", False, "some ancient buy failure"))
+
+    play, = A._sell_plays([exit_alert("GCTK", "Chase")])
+
+    ch = leg(play, "chase")
+    assert ch.failed_accounts == 1
+    assert "corporate action" in ch.fail_reason
+    # The held leg is untouched: its failed BUY stays out of the exit story.
+    assert leg(play, "public").fail_reason == ""
+
+
+def test_a_play_nobody_ever_filled_anywhere_reports_no_position(journal):
+    """No legs at all used to mean a blank card headed "all 0 shares sold"."""
+    journal([])
+    play, = A._sell_plays([exit_alert("GCTK", "Chase")])
+    assert play.bought == 0 and play.left == 0
+    assert [l.state for l in play.legs] == [A.SELL_NONE]
+
+
+def test_a_brokerage_nobody_called_and_nobody_traded_stays_off_the_play(journal):
+    """Only a CALLED brokerage earns the new state; a stray zero-quantity row
+    is still nothing to talk about."""
+    journal([trade("X", "public", "buy", 5, "p1"),
+             trade("X", "fennel", "buy", 0, "f1")])
+    play, = A._sell_plays([exit_alert("X", "Public")])
+    assert {l.broker for l in play.legs} == {"public"}
