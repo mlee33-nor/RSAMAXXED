@@ -980,6 +980,64 @@ def _sell_share_ledger() -> Dict[tuple, List[float]]:
     return out
 
 
+def _leg_open_accounts(broker: str, symbol: str) -> List[tuple]:
+    """(account_id, shares) still open at one brokerage, oldest account first.
+
+    Per ACCOUNT, because that is the granularity the journal records and the
+    only granularity a resolution can be written at: "LBGJ is done at
+    Robinhood" is three separate accounts that each have to stop counting.
+    """
+    symbol = str(symbol or "").upper()
+    net: Dict[str, float] = {}
+    try:
+        rows = trade_journal.split_adjusted()
+    except Exception:
+        return []
+    for t in rows:
+        if (str(t.get("symbol") or "").upper() != symbol
+                or str(t.get("broker") or "") != broker):
+            continue
+        try:
+            qty = float(t.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        acct = str(t.get("account_id") or "")
+        net[acct] = net.get(acct, 0.0) + (qty if t.get("side") == "buy" else -qty)
+    return [(a, q) for a, q in sorted(net.items()) if q > 1e-9]
+
+
+def _spread_over_accounts(accounts: List[tuple], qty: float) -> List[tuple]:
+    """Split `qty` shares across open accounts, filling each before the next.
+
+    Whole accounts first so the common case — "all of it" — writes one clean
+    row per account rather than an even smear that leaves every account holding
+    an odd fraction of a share.
+    """
+    out: List[tuple] = []
+    left = float(qty)
+    for acct, have in accounts:
+        if left <= 1e-9:
+            break
+        take = min(have, left)
+        out.append((acct, take))
+        left -= take
+    return out
+
+
+def _iso_at_noon(date_str: str) -> Optional[str]:
+    """'2026-08-18' -> an ISO timestamp on that day, or None if unparseable.
+
+    Noon UTC, not midnight: every date in this app is the first ten characters
+    of the timestamp, and midnight UTC is the previous evening in every US time
+    zone, so a sale reported for the 18th would file itself under the 17th.
+    """
+    try:
+        d = datetime.strptime(str(date_str).strip(), "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+    return d.replace(hour=12, tzinfo=timezone.utc).isoformat()
+
+
 def _sell_plays(sells: List[Dict[str, Any]]) -> List[SellPlay]:
     """Fold the exit feed and the journal into one row per ticker.
 
@@ -4131,6 +4189,19 @@ class App(ctk.CTk):
             act.bind("<Button-1>",
                      lambda e, sy=play.symbol, k=[leg.broker]:
                      self._sell_alert_trade(sy, k))
+            # The escape hatch, on every sellable leg rather than only the
+            # rejected ones: a leg the desk has never been pointed at is
+            # exactly as stuck when you already sold it by hand, and it is the
+            # rejected ones that prove the position can be gone without the
+            # journal hearing about it.
+            fix = tk.Label(line, text="Resolve", bg=row_bg, fg=TEXT_MUTED,
+                           font=(FONT_FAMILY, 8, "bold"), padx=8, pady=3,
+                           cursor="hand2")
+            fix.pack(side="right", padx=(0, 8))
+            fix.bind("<Button-1>",
+                     lambda e, pl=play, lg=leg: self._resolve_sell_leg(pl, lg))
+            fix.bind("<Enter>", lambda e, w=fix: w.configure(fg=TEXT_PRIMARY))
+            fix.bind("<Leave>", lambda e, w=fix: w.configure(fg=TEXT_MUTED))
             if leg.failed_accounts:
                 # The only thing worse than an exit you missed is one you think
                 # you took. Fidelity has rejected ONFO ten times.
@@ -4157,6 +4228,164 @@ class App(ctk.CTk):
             tk.Label(inner, text=f"{icon('check')}  sold:  {where}",
                      bg=row_bg, fg=GREEN, font=(FONT_FAMILY, 8),
                      justify="left", wraplength=740).pack(anchor="w", pady=(4, 0))
+
+    def _resolve_sell_leg(self, play, leg) -> None:
+        """Close one brokerage's leg by hand, when the tool cannot.
+
+        Two things end a position that this tool never sees, and both leave the
+        leg parked on Sell now forever. You sold it yourself, at a price only
+        you know. Or the shares are simply not there - a reverse split's
+        round-up collapsed two lots into one whole share, cash in lieu settled
+        it, the broker liquidated a stub. LBGJ is the second: six shares were
+        bought at Robinhood across two alerts, the round-up left one per
+        account, three sold on 2026-08-19, and the journal still believes three
+        are open, so the desk keeps asking and Robinhood keeps answering
+        "order rejected: Not enough shares to sell".
+
+        The two are offered as separate choices because they are not the same
+        claim. A sale has proceeds and belongs in realized P/L; a dissolved
+        position has none, and neither existing side can say so honestly -
+        writing it as a $0 sell books the whole cost basis as a loss, writing
+        it at the exit price invents money nobody was paid. That is what
+        `record_close` is for.
+        """
+        accounts = _leg_open_accounts(leg.broker, play.symbol)
+        if not accounts:
+            self._log(f"{play.symbol}: nothing open at {leg.label}", "warn")
+            return
+        open_qty = sum(q for _a, q in accounts)
+
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Resolve {play.symbol} at {leg.label}")
+        dlg.configure(bg=BG_CARD)
+        dlg.geometry("480x440")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text=f"{play.symbol} at {leg.label}", bg=BG_CARD,
+                 fg=TEXT_PRIMARY, font=(FONT_FAMILY, 13, "bold")).pack(
+                     anchor="w", padx=20, pady=(18, 2))
+        tk.Label(dlg,
+                 text=f"{_qty_text(open_qty)} share(s) still open across "
+                      f"{len(accounts)} account(s). Nothing is sent to "
+                      f"{leg.label} - this only corrects the journal.",
+                 bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9),
+                 justify="left", wraplength=430).pack(anchor="w", padx=20)
+        if leg.fail_reason:
+            tk.Label(dlg,
+                     text=f"{icon('warning')}  {leg.label} said: {leg.fail_reason}",
+                     bg=BG_CARD, fg=YELLOW, font=(FONT_FAMILY, 8),
+                     justify="left", wraplength=430).pack(anchor="w", padx=20,
+                                                          pady=(6, 0))
+
+        mode = tk.StringVar(value="sold")
+        for value, title, blurb in (
+            ("sold", "I sold these myself",
+             "Records a sell at the price you got. Counts as realized P/L."),
+            ("gone", "These shares are not there",
+             "Records a close: the position is gone, with no price. Never "
+             "becomes profit or loss."),
+        ):
+            row = tk.Frame(dlg, bg=BG_CARD)
+            row.pack(fill="x", padx=20, pady=(10, 0))
+            tk.Radiobutton(row, text=title, variable=mode, value=value,
+                           bg=BG_CARD, fg=TEXT_PRIMARY, selectcolor=BG_INPUT,
+                           activebackground=BG_CARD, activeforeground=TEXT_PRIMARY,
+                           font=(FONT_FAMILY, 10, "bold"), bd=0,
+                           highlightthickness=0, anchor="w").pack(anchor="w")
+            tk.Label(row, text=blurb, bg=BG_CARD, fg=TEXT_MUTED,
+                     font=(FONT_FAMILY, 8), justify="left",
+                     wraplength=410).pack(anchor="w", padx=(24, 0))
+
+        fields = tk.Frame(dlg, bg=BG_CARD)
+        fields.pack(fill="x", padx=20, pady=(14, 0))
+
+        def _field(col, label_text, default):
+            box = tk.Frame(fields, bg=BG_CARD)
+            box.grid(row=0, column=col, sticky="ew", padx=(0, 10))
+            fields.grid_columnconfigure(col, weight=1)
+            tk.Label(box, text=label_text, bg=BG_CARD, fg=TEXT_SECONDARY,
+                     font=(FONT_FAMILY, 8)).pack(anchor="w")
+            e = tk.Entry(box, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                         insertbackground=TEXT_PRIMARY, font=(FONT_MONO, 10),
+                         relief="flat", bd=0, highlightthickness=1,
+                         highlightbackground=BORDER, highlightcolor=ACCENT)
+            e.pack(fill="x")
+            e.insert(0, str(default))
+            return e
+
+        qty_e = _field(0, "Shares", _qty_text(open_qty))
+        price_e = _field(1, "Price you got ($)",
+                         f"{float(play.exit_price):.6f}".rstrip("0").rstrip(".")
+                         if play.exit_price else "")
+        date_e = _field(2, "Date (YYYY-MM-DD)",
+                        leg.alert_date or date.today().isoformat())
+
+        err = tk.Label(dlg, text="", bg=BG_CARD, fg=RED,
+                       font=(FONT_FAMILY, 8), justify="left", wraplength=430)
+        err.pack(anchor="w", padx=20, pady=(8, 0))
+
+        def _apply() -> None:
+            try:
+                qty = float(qty_e.get().replace(",", "").strip())
+            except ValueError:
+                err.configure(text="Shares must be a number.")
+                return
+            if qty <= 0 or qty > open_qty + 1e-9:
+                err.configure(text=f"Shares must be between 0 and "
+                                   f"{_qty_text(open_qty)}.")
+                return
+            when = _iso_at_noon(date_e.get())
+            if when is None:
+                err.configure(text="Date must look like 2026-08-18.")
+                return
+            sold = mode.get() == "sold"
+            price = None
+            if sold:
+                raw = price_e.get().replace("$", "").replace(",", "").strip()
+                try:
+                    price = float(raw)
+                except ValueError:
+                    err.configure(text="A sale needs the price you got. With no "
+                                       "price these shares are gone, not sold - "
+                                       "which is the other option.")
+                    return
+                if price <= 0:
+                    err.configure(text="Price must be above zero.")
+                    return
+
+            for acct, n in _spread_over_accounts(accounts, qty):
+                if sold:
+                    trade_journal.record_trade(
+                        broker=leg.broker, account_id=acct, side="sell",
+                        symbol=play.symbol, qty=n, fill_price=price,
+                        price_source=trade_journal.PRICE_MANUAL, when=when)
+                else:
+                    trade_journal.record_close(
+                        broker=leg.broker, account_id=acct, symbol=play.symbol,
+                        qty=n, reason=trade_journal.CLOSE_MANUAL,
+                        note="marked resolved by hand on the sells board",
+                        when=when)
+            dlg.destroy()
+
+            what = (f"sold at ${price:,.4f}".rstrip("0").rstrip(".") if sold
+                    else "gone - recorded with no price")
+            msg = (f"{play.symbol} at {leg.label}: {_qty_text(qty)} share(s) "
+                   f"marked {what}")
+            self._log(msg)
+            self._push_notification(msg, "success" if sold else "info")
+            self._render_sell_alerts()
+            self._apply_dashboard_summary()
+
+        btns = tk.Frame(dlg, bg=BG_CARD)
+        btns.pack(fill="x", padx=20, pady=(10, 14))
+        PillButton(btns, text="Record", command=_apply, width=110,
+                   height=32).pack(side="right")
+        PillButton(btns, text="Cancel", command=dlg.destroy, width=100,
+                   height=32, bg_color=BG_INPUT,
+                   fg_color=TEXT_SECONDARY).pack(side="right", padx=(0, 8))
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
 
     def _sell_alert_trade(self, symbol: str, brokers: List[str]) -> None:
         """Sell-alert row → Trade Desk, armed only where the alert says.
