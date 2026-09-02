@@ -71,3 +71,6 @@ etf_trades.tmp
 # backfill_basis.py generates (trades.<stamp>.bak.json); a copy named by hand
 # as trades.json.bak-<stamp> slipped through it and sat untracked in the repo.
 trades.json.bak*
+# Which closed plays the user has ticked off the board. Display state, but it
+# is a list of tickers they traded — same class as picks_done.json above.
+sells_confirmed.json

@@ -1086,6 +1086,44 @@ def _sell_plays(sells: List[Dict[str, Any]]) -> List[SellPlay]:
     return plays
 
 
+SELLS_CONFIRMED_FILE = ROOT_DIR / "sells_confirmed.json"
+
+
+def _sell_play_key(play) -> str:
+    """One closed play's identity, for the confirmed-and-hidden list.
+
+    The newest exit's timestamp is part of it on purpose. A ticker can come
+    back around for a second reverse split months later, and keying on the
+    symbol alone would silently swallow that second play — the user would tick
+    off BYAH once in July and never be shown the September exit at all.
+    """
+    return f"{play.symbol.upper()}:{play.last_alert or ''}"
+
+
+def _load_confirmed_sells() -> set:
+    """Closed plays the user has ticked off, so they stop taking up room.
+
+    Closed is the one bucket that only ever grows: every play we finish stays
+    on the board forever, and after a couple of months the section you act on
+    is buried under months of plays you are done with. Confirming is a display
+    decision and nothing else — no journal row is touched, no position is
+    changed, and unhiding puts it straight back.
+    """
+    try:
+        data = json.loads(SELLS_CONFIRMED_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {str(k) for k in data} if isinstance(data, list) else set()
+
+
+def _save_confirmed_sells(keys: set) -> None:
+    try:
+        SELLS_CONFIRMED_FILE.write_text(
+            json.dumps(sorted(keys), indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _sellnow_tasks(sells: List[Dict[str, Any]],
                    renames: Optional[Dict[str, str]] = None) -> List[Any]:
     """The Sell-now board, as things auto-sell can actually place.
@@ -1798,6 +1836,11 @@ class App(ctk.CTk):
         # sell behaved before exits drove it, and switching the trigger over
         # must not quietly retire the other half of the job.
         self._autosell_fracs = tk.BooleanVar(value=bool(_as.get("fractionals", True)))
+        # Closed plays ticked off, and whether we are peeking at them. The set
+        # persists; the peek does not — a session should open on the tidy view
+        # that was the point of confirming in the first place.
+        self._confirmed_sells: set = _load_confirmed_sells()
+        self._show_confirmed: bool = False
         self._autosell_sold: set = set(_as.get("sold") or [])
         self._autosell_queue: List[Any] = []
         self._autosell_waits: int = 0     # pump ticks spent behind a busy trade
@@ -4196,6 +4239,10 @@ class App(ctk.CTk):
         buckets = {"now": [], "holding": [], "closed": []}
         for play in _sell_plays(sells):
             buckets[play.bucket].append(play)
+        # Confirmed-and-hidden applies here too. The tab COUNT has to move with
+        # it: "Closed (41)" over a list of three is the summary card and the
+        # page disagreeing again, and this card is the one on the first screen.
+        buckets["closed"], hidden_closed = self._visible_closed(buckets["closed"])
 
         ready_cash = sum(p.ready_value for p in buckets["now"])
         ready_sh = sum(l.left for p in buckets["now"] for l in p.of(SELL_NOW))
@@ -4217,13 +4264,20 @@ class App(ctk.CTk):
             "holding": ("Nothing waiting",
                         "Plays you still hold, where no exit has been called "
                         "for those brokerages yet, wait here."),
-            "closed": ("Nothing closed yet",
+            "closed": ("Nothing left to confirm" if hidden_closed
+                       else "Nothing closed yet",
+                       f"All {len(hidden_closed)} closed plays are confirmed and "
+                       f"tucked away. The Exits tab can show them again."
+                       if hidden_closed else
                        "A play moves here once you are out of it everywhere."),
         }
         for name, rows in buckets.items():
+            if name == "closed" and (rows or hidden_closed):
+                self._closed_actions(grids[name], rows, hidden_closed, bg=BG_CARD)
             if rows:
                 for play in rows[:SELL_ALERTS_SHOWN]:
-                    self._sell_play_card(grids[name], play)
+                    self._sell_play_card(grids[name], play,
+                                         closed=(name == "closed"))
                 if len(rows) > SELL_ALERTS_SHOWN:
                     tk.Label(grids[name],
                              text=f"+{len(rows) - SELL_ALERTS_SHOWN} more - the "
@@ -4237,7 +4291,7 @@ class App(ctk.CTk):
 
         self._switch_sells_tab(getattr(self, "_sells_tab_active", "now"))
 
-    def _sell_play_card(self, parent, play, task=None) -> None:
+    def _sell_play_card(self, parent, play, task=None, closed=False) -> None:
         """One play: a headline, then a line per brokerage state.
 
         `task` is the SellTask for this play when the caller wants the
@@ -4245,6 +4299,10 @@ class App(ctk.CTk):
         summary card does not. It is what puts "Sell all" (read live balances,
         show the numbers, then fire) next to the per-leg buttons, which only
         prime the Trade Desk.
+
+        `closed` adds the Confirm control. Both boards pass it for the closed
+        bucket and nowhere else: a play you still hold must not be dismissable,
+        or a live position disappears off the only page that lists it.
         """
         row_bg = BG_INPUT
         ready = play.of(SELL_NOW)
@@ -4375,6 +4433,24 @@ class App(ctk.CTk):
                              text=f"      {l.label} never filled: {l.fail_reason}",
                              bg=row_bg, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
                              justify="left", wraplength=740).pack(anchor="w")
+
+        if closed:
+            done = _sell_play_key(play) in self._confirmed_sells
+            bar = tk.Frame(inner, bg=row_bg)
+            bar.pack(fill="x", pady=(8, 0))
+            btn = tk.Label(
+                bar, text="Confirmed — show again" if done else "Confirm",
+                bg=row_bg, fg=TEXT_MUTED if done else GREEN,
+                font=(FONT_FAMILY, 8, "bold"), padx=10, pady=3, cursor="hand2")
+            btn.pack(side="right")
+            btn.bind("<Button-1>", lambda e, pl=play, d=done: (
+                self._unconfirm_sell_play(pl) if d else self._confirm_sell_play(pl)))
+            btn.bind("<Enter>", lambda e, w=btn: w.configure(fg=TEXT_PRIMARY))
+            btn.bind("<Leave>", lambda e, w=btn, d=done:
+                     w.configure(fg=TEXT_MUTED if d else GREEN))
+            tk.Label(bar, text="tick it off — nothing is traded", bg=row_bg,
+                     fg=TEXT_MUTED, font=(FONT_FAMILY, 7)).pack(side="right",
+                                                                padx=(0, 8))
 
         if task is not None and ready:
             # The whole play in one go, sized off live balances. The per-leg
@@ -12397,15 +12473,53 @@ class App(ctk.CTk):
             for play in buckets["holding"]:
                 self._sell_play_card(self._exits_list, play)
 
-        if buckets["closed"]:
-            self._exits_group_header(
-                self._exits_list, "CLOSED",
-                "Out of these everywhere. Kept on the page because an exit "
-                "called at a brokerage you never filled belongs here too, and "
-                "dropping it read as 'no exit was ever called'.",
-                len(buckets["closed"]))
-            for play in buckets["closed"]:
-                self._sell_play_card(self._exits_list, play)
+        shown_closed, hidden_closed = self._visible_closed(buckets["closed"])
+        if shown_closed or hidden_closed:
+            sub = ("Out of these everywhere. Kept on the page because an exit "
+                   "called at a brokerage you never filled belongs here too, "
+                   "and dropping it read as 'no exit was ever called'.")
+            if hidden_closed and not self._show_confirmed:
+                sub += (f"  {len(hidden_closed)} confirmed and hidden.")
+            self._exits_group_header(self._exits_list, "CLOSED", sub,
+                                     len(shown_closed))
+            self._closed_actions(self._exits_list, shown_closed, hidden_closed)
+            for play in shown_closed:
+                self._sell_play_card(self._exits_list, play, closed=True)
+
+    def _closed_actions(self, parent, shown, hidden, bg: str = BG_PRIMARY) -> None:
+        """Confirm-all and the peek toggle, above the closed cards.
+
+        Bulk first, because the whole complaint is volume: ticking off two
+        months of finished plays one card at a time is the crowding, not the
+        cure.
+        """
+        if not shown and not hidden:
+            return
+        bar = tk.Frame(parent, bg=bg)
+        bar.pack(fill="x", pady=(0, 8))
+
+        unconfirmed = [p for p in shown
+                       if _sell_play_key(p) not in self._confirmed_sells]
+        if unconfirmed:
+            act = tk.Label(bar, text=f"Confirm all {len(unconfirmed)}",
+                           bg=_blend(GREEN, bg, 0.85), fg=GREEN,
+                           font=(FONT_FAMILY, 8, "bold"), padx=10, pady=3,
+                           cursor="hand2")
+            act.pack(side="left")
+            act.bind("<Button-1>",
+                     lambda e, pl=list(unconfirmed): self._confirm_all_closed(pl))
+
+        if hidden:
+            tog = tk.Label(
+                bar,
+                text=("Hide confirmed" if self._show_confirmed
+                      else f"Show {len(hidden)} confirmed"),
+                bg=bg, fg=TEXT_MUTED, font=(FONT_FAMILY, 8, "bold"),
+                padx=10, pady=3, cursor="hand2")
+            tog.pack(side="left", padx=(8, 0))
+            tog.bind("<Button-1>", lambda e: self._toggle_show_confirmed())
+            tog.bind("<Enter>", lambda e, w=tog: w.configure(fg=TEXT_PRIMARY))
+            tog.bind("<Leave>", lambda e, w=tog: w.configure(fg=TEXT_MUTED))
 
     def _exits_task_row(self, task) -> None:
         """One SellTask as a row: what it is, where, and the two actions.
@@ -13150,6 +13264,62 @@ class App(ctk.CTk):
         self._render_sell_queue()
         self._autosell_pump()
         return True
+
+    def _confirm_sell_play(self, play) -> None:
+        """Tick a closed play off the board. Display only — nothing is traded.
+
+        Deliberately offered on CLOSED plays only. A play you still hold is not
+        yours to dismiss: hiding one would take a live position off the only
+        page that lists it, which is how a position gets forgotten rather than
+        tidied. `_resolve_sell_leg` is the escape hatch for a leg that is
+        really gone but still reads as open — that writes a journal record;
+        this writes nothing.
+        """
+        self._confirmed_sells.add(_sell_play_key(play))
+        _save_confirmed_sells(self._confirmed_sells)
+        self._log(f"{play.symbol}: confirmed closed — hidden from the board. "
+                  f"'Show confirmed' brings it back.", "meta")
+        self._refresh_sell_views()
+
+    def _confirm_all_closed(self, plays) -> None:
+        """Tick off everything currently closed, in one go."""
+        keys = {_sell_play_key(p) for p in plays}
+        new = keys - self._confirmed_sells
+        if not new:
+            return
+        self._confirmed_sells |= keys
+        _save_confirmed_sells(self._confirmed_sells)
+        self._log(f"Confirmed {len(new)} closed play(s) — hidden from the "
+                  f"board. 'Show confirmed' brings them back.")
+        self._push_notification(
+            f"{len(new)} closed play(s) tidied away", "success")
+        self._refresh_sell_views()
+
+    def _unconfirm_sell_play(self, play) -> None:
+        """Put one back on the board."""
+        self._confirmed_sells.discard(_sell_play_key(play))
+        _save_confirmed_sells(self._confirmed_sells)
+        self._refresh_sell_views()
+
+    def _toggle_show_confirmed(self) -> None:
+        self._show_confirmed = not self._show_confirmed
+        self._refresh_sell_views()
+
+    def _visible_closed(self, plays) -> Tuple[List[Any], List[Any]]:
+        """(shown, hidden) for the closed bucket, honouring the peek toggle."""
+        hidden = [p for p in plays if _sell_play_key(p) in self._confirmed_sells]
+        if self._show_confirmed:
+            return list(plays), hidden
+        return [p for p in plays if _sell_play_key(p) not in self._confirmed_sells], hidden
+
+    def _refresh_sell_views(self) -> None:
+        """Repaint both places the board is drawn, so they cannot disagree."""
+        try:
+            self._render_sell_alerts()
+        except Exception:
+            pass
+        self._invalidate_page("exits")
+        self._render_exits()
 
     def _queue_sell_leg(self, play, leg) -> None:
         """Queue one brokerage's share of a play, leaving the rest of it alone.
