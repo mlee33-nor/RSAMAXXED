@@ -26,7 +26,7 @@ from zendriver import cdp, KeyPressEvent
 from zendriver.core.keys import KeyEvents
 
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow, find_browser_executable, cleanup_orphaned_chrome
-from modules._2fa_prompt import universal_2fa_prompt
+from modules import _2fa_prompt
 from modules.ui_keys import runtime_profile
 
 BROKER = "fidelity"
@@ -245,15 +245,47 @@ def _row_extras_from_csv_row(row: Dict[str, Any], *, max_items: int = 60) -> Dic
 # Terminal helpers
 # =============================================================================
 
-def _otp_provider_terminal() -> OtpProvider:
-    """OTP provider that prompts in the terminal."""
+#: Why the last login attempt failed, for the message the app puts on screen.
+#: "auth failed" was all a user ever got, which is exactly the wrong answer
+#: when what really happened is that nobody ever asked them for the code.
+_LAST_AUTH_DETAIL: Dict[str, str] = {}
+
+
+def _set_auth_detail(label: str, why: str) -> None:
+    _LAST_AUTH_DETAIL[str(label)] = why
+
+
+def _auth_detail(label: str, fallback: str = "auth failed") -> str:
+    return _LAST_AUTH_DETAIL.pop(str(label), "") or fallback
+
+
+def _otp_provider() -> OtpProvider:
+    """Where the SMS / authenticator code comes from.
+
+    Routed through `modules._2fa_prompt`, which asks whoever is driving -- the
+    GUI's on-screen dialog, or the terminal when nothing registered a hook.
+
+    This used to call `input()` directly and catch only EOFError. Two things
+    went wrong with that. Under `pyw -3.13` (RSAMAXXED.bat) there is no console
+    at all, and -- the one that actually bit -- `builtins.input` is process
+    global while brokers bootstrap CONCURRENTLY. Robinhood swaps it out twice
+    (a rehydrate guard that RAISES, and a login stub) and the two restores can
+    interleave so the raising one is left installed for the rest of the
+    session. That RuntimeError is not EOFError, so it escaped this provider,
+    escaped `_handle_2fa`, and was caught by the per-login `except Exception`
+    in `bootstrap()` -- which reported "auth failed" without ever putting a box
+    on screen. Fidelity had already texted the code.
+
+    See sessions/fidelity/fidelity_nav.log, 2026-09-02: three consecutive
+    logins go "2FA | otp input detected" -> "BROWSER | closed" nine seconds
+    later, with no prompt in between.
+    """
     def provider(label: str, timeout_s: int) -> Optional[str]:
-        try:
-            raw = input(universal_2fa_prompt(label) + " ").strip()
-            digits = "".join(c for c in raw if c.isdigit())
-            return digits if 6 <= len(digits) <= 8 else None
-        except (EOFError, KeyboardInterrupt):
-            return None
+        code = _2fa_prompt.request_code(label, timeout_s)
+        if not code:
+            _trace(f"2FA | no code supplied for {label} "
+                   f"(cancelled, or nothing is listening for the prompt)")
+        return code
     return provider
 
 
@@ -1006,8 +1038,11 @@ async def _handle_2fa(
     otp_input = await _safe_select(page, "#dom-otp-code-input", timeout_s=5.0)
     if otp_input is not None:
         _trace("2FA | otp input detected", notify=notify)
-        code = otp_provider(label, 300) if otp_provider else input("Enter Fidelity SMS code: ").strip()
+        code = (otp_provider(label, 300) if otp_provider
+                else _2fa_prompt.request_code(label, 300, "texted code"))
         if not code:
+            _set_auth_detail(label, "2FA code never entered — Fidelity texted a "
+                                    "code and nothing was typed in")
             return False
 
         try:
@@ -1054,8 +1089,11 @@ async def _handle_2fa(
                 code = None
 
         if not code:
-            code = otp_provider(label, 300) if otp_provider else input("Enter Fidelity authenticator code: ").strip()
+            code = (otp_provider(label, 300) if otp_provider
+                    else _2fa_prompt.request_code(label, 300, "authenticator app"))
         if not code:
+            _set_auth_detail(label, "2FA code never entered — no authenticator "
+                                    "code was supplied")
             return False
 
         try:
@@ -1126,6 +1164,7 @@ async def _login_on_page(
             break
     if not user_input:
         _trace("LOGIN | username field not found", notify=notify)
+        _set_auth_detail(label, "sign-on page did not load (no username field)")
         return False
 
     pass_input = None
@@ -1135,6 +1174,7 @@ async def _login_on_page(
             break
     if not pass_input:
         _trace("LOGIN | password field not found", notify=notify)
+        _set_auth_detail(label, "sign-on page did not load (no password field)")
         return False
 
     try:
@@ -1160,6 +1200,7 @@ async def _login_on_page(
     login_btn = await _safe_select(page, "#dom-login-button", timeout_s=5.0)
     if not login_btn:
         _trace("LOGIN | login button not found", notify=notify)
+        _set_auth_detail(label, "sign-on page did not load (no sign-in button)")
         return False
 
     _trace("LOGIN | click login button", notify=notify)
@@ -1199,11 +1240,15 @@ async def _login_on_page(
                 _trace("LOGIN | 2FA complete -> summary", notify=notify)
                 await _goto(page, SUMMARY_URL, "LOGIN | force summary post-2FA", notify=notify, settle_s=0.8)
                 return True
+            # _handle_2fa records the specific reason when it knows one; this
+            # covers the rest, including a 2FA screen shape we do not handle.
+            _set_auth_detail(label, _auth_detail(label, "2FA not completed"))
             return False
 
         await _settle(page, sleep_s=0.25)
 
     _trace("LOGIN | timeout", notify=notify)
+    _set_auth_detail(label, "timed out waiting for Fidelity after sign-in")
     return False
 
 
@@ -1215,7 +1260,11 @@ async def _ensure_logged_in(
     totp_secret: str,
     otp_provider: Optional[OtpProvider],
     notify: Optional[NotifyFn],
+    label: str = "Fidelity",
 ) -> bool:
+    """`label` is the login this is for ("Fidelity 2"), not decoration: it is
+    the key `_set_auth_detail` files the failure reason under, and the caller
+    reads it back by the same name to build the message the app shows."""
     if await _is_logged_in_soft(page):
         return True
     return await _login_on_page(
@@ -1225,6 +1274,7 @@ async def _ensure_logged_in(
         totp_secret=totp_secret,
         otp_provider=otp_provider,
         notify=notify,
+        label=label,
     )
 
 
@@ -3137,7 +3187,7 @@ def bootstrap(*args, **kwargs) -> BrokerOutput:
     Compatibility shim: run a session rehydrate for all configured Fidelity logins.
     Not required by user commands anymore.
     """
-    otp_provider = _otp_provider_terminal()
+    otp_provider = _otp_provider()
     notify = _notify_terminal()
     force_headed = bool(kwargs.get("debug") or False)
     creds = _load_creds()
@@ -3170,6 +3220,7 @@ def bootstrap(*args, **kwargs) -> BrokerOutput:
                     totp_secret=c.totp_secret,
                     otp_provider=otp_provider,
                     notify=notify,
+                    label=c.label,
                 )
                 # Enumerate the real destination accounts.
                 #
@@ -3212,7 +3263,8 @@ def bootstrap(*args, **kwargs) -> BrokerOutput:
                                 n_sub = len([a for a in sub_accounts if a.ok])
                         except Exception:
                             pass
-                    msg = f"ok ({n_sub} accounts)" if ok and n_sub > 1 else ("ok" if ok else "auth failed")
+                    msg = (f"ok ({n_sub} accounts)" if ok and n_sub > 1
+                           else ("ok" if ok else _auth_detail(c.label)))
                     outs.append(AccountOutput(account_id=c.label, ok=ok, message=msg))
                 any_ok = any_ok or ok
                 any_fail = any_fail or (not ok)
@@ -3241,7 +3293,7 @@ def get_holdings(*args, **kwargs) -> BrokerOutput:
             message="Cancelled",
         )
 
-    otp_provider = _otp_provider_terminal()
+    otp_provider = _otp_provider()
     notify = _notify_terminal()
     force_headed = bool(kwargs.get("debug") or False)
     creds = _load_creds()
@@ -3284,9 +3336,11 @@ def get_holdings(*args, **kwargs) -> BrokerOutput:
                     totp_secret=c.totp_secret,
                     otp_provider=otp_provider,
                     notify=notify,
+                    label=c.label,
                 )
                 if not ok:
-                    outs.append(AccountOutput(account_id=c.label, ok=False, message="auth failed", holdings=[]))
+                    outs.append(AccountOutput(account_id=c.label, ok=False,
+                                              message=_auth_detail(c.label), holdings=[]))
                     any_fail = True
                     broker_extra["csv_downloads_failed"] = int(broker_extra["csv_downloads_failed"]) + 1
                     continue
@@ -3346,7 +3400,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
             message="Cancelled",
         )
 
-    otp_provider = _otp_provider_terminal()
+    otp_provider = _otp_provider()
     notify = _notify_terminal()
     force_headed = bool(kwargs.get("debug") or False)
     creds = _load_creds()
@@ -3438,11 +3492,13 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                     totp_secret=c.totp_secret,
                     otp_provider=otp_provider,
                     notify=notify,
+                    label=c.label,
                 )
                 if not ok:
-                    outs.append(AccountOutput(account_id=c.label, ok=False, message="auth failed"))
+                    why = _auth_detail(c.label)
+                    outs.append(AccountOutput(account_id=c.label, ok=False, message=why))
                     if dry_run:
-                        log_lines.append(f"[{c.label}] ERROR: auth failed")
+                        log_lines.append(f"[{c.label}] ERROR: {why}")
                         log_lines.append("")
                     any_fail = True
                     continue
