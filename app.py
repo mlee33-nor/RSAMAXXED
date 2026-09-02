@@ -1793,6 +1793,11 @@ class App(ctk.CTk):
         _as = self._load_autosell_state()
         self._autosell_enabled = tk.BooleanVar(value=bool(_as.get("enabled")))
         self._autosell_dry_run = tk.BooleanVar(value=bool(_as.get("dry_run", True)))
+        # Fractionals do NOT wait for an exit alert, and that is the point of
+        # them — see _fractional_worklist. Defaults ON because it is how auto-
+        # sell behaved before exits drove it, and switching the trigger over
+        # must not quietly retire the other half of the job.
+        self._autosell_fracs = tk.BooleanVar(value=bool(_as.get("fractionals", True)))
         self._autosell_sold: set = set(_as.get("sold") or [])
         self._autosell_queue: List[Any] = []
         self._autosell_waits: int = 0     # pump ticks spent behind a busy trade
@@ -12184,6 +12189,9 @@ class App(ctk.CTk):
                        "asking. It does NOT guess from the split tracker — a "
                        "play going fractional is not an instruction to sell, and "
                        "an exit on a play the tracker still calls pending is. "
+                       "The ONE exception is the fractionals box below: a "
+                       "remnant decays whether or not anyone calls it, so "
+                       "nothing would ever come for those. "
                        f"Market hours only; at most {AUTOSELL_MAX_PER_PULL} plays "
                        "per batch; never the same play twice.")).pack(
                            fill="x", pady=(6, 10))
@@ -12195,7 +12203,10 @@ class App(ctk.CTk):
         opts = tk.Frame(body, bg=BG_CARD)
         opts.pack(fill="x")
         for var, text in ((self._autosell_enabled, "Arm auto-sell"),
-                          (self._autosell_dry_run, "Dry run (build the order, don't send it)")):
+                          (self._autosell_dry_run, "Dry run (build the order, don't send it)"),
+                          (self._autosell_fracs,
+                           "Fractionals too, without waiting for an exit "
+                           "(nobody calls an exit on a remnant)")):
             tk.Checkbutton(
                 opts, text=text, variable=var, command=self._autosell_toggled,
                 bg=BG_CARD, fg=TEXT_SECONDARY, activebackground=BG_CARD,
@@ -12215,6 +12226,17 @@ class App(ctk.CTk):
         btn_row = tk.Frame(body, bg=BG_CARD)
         btn_row.pack(anchor="w", pady=(10, 0))
         self._sweep_btn.pack(in_=btn_row, side="left")
+
+        # Its own button, not a wider exits sweep, because the two answer to
+        # different rules: one places orders someone asked for, the other
+        # clears remnants nobody will ever ask about.
+        self._frac_btn = tk.Button(
+            btn_row, text="Sell all fractionals now", command=self._fractional_sweep,
+            bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_CARD,
+            activeforeground=TEXT_PRIMARY, font=(FONT_FAMILY, 9, "bold"),
+            relief="flat", bd=0, padx=14, pady=7, cursor="hand2",
+        )
+        self._frac_btn.pack(side="left", padx=(8, 0))
 
         # "Sold once, ever" is what stops a re-pull selling twice, and it is
         # also what makes a play that FAILED disappear from the sweep for good.
@@ -12265,10 +12287,16 @@ class App(ctk.CTk):
         if save:
             self._save_autosell_state()
             if armed and not dry:
-                # Said once, plainly, at the moment it becomes true.
+                # Said once, plainly, at the moment it becomes true — and it
+                # has to name BOTH triggers, because "called exits" alone
+                # understates what is about to happen when the fractionals box
+                # is ticked, which is the default.
+                what = "called exits you still hold"
+                if self._autosell_fracs.get():
+                    what += " and fractional remnants"
                 self._push_notification(
-                    "Auto-sell is live — called exits you still hold will be "
-                    "sold without confirmation", "warning")
+                    f"Auto-sell is live — {what} will be sold without "
+                    f"confirmation", "warning")
 
     def _exits_group_header(self, parent, title: str, sub: str, count: int) -> None:
         box = tk.Frame(parent, bg=BG_PRIMARY)
@@ -12286,16 +12314,20 @@ class App(ctk.CTk):
     def _render_exits(self) -> None:
         """The full exit board: every play, grouped by what you can do about it.
 
-        The source is sells.json — the exits that were actually called — not
-        the split tracker. The tracker answers "what did the split do", which
-        is a different question from "have we been told to get out of this, and
-        are we still in it", and only the second one is an instruction.
+        Mostly sells.json — the exits that were actually called. The split
+        tracker answers "what did the split do", which is a different question
+        from "have we been told to get out, and are we still in", and only the
+        second one is an instruction.
 
-        Same three groups as the Sell now / Holding / Closed card on the
-        dashboard, and the same card renderer, because they are the same board:
-        this is just the untruncated version of it. Two renderers meant the
-        summary card and the page could disagree about a play, and the page is
-        where you act.
+        With ONE group that is not: FRACTIONAL. Nobody calls an exit on a
+        remnant, so a page built purely from called exits shows none of them —
+        and the 86 fractional rows on the board would sit there decaying with
+        nothing on screen about it. See _fractional_worklist.
+
+        The exit groups reuse the dashboard's card renderer, because they are
+        the same board and this is just the untruncated version of it. Two
+        renderers meant the summary card and the page could disagree about a
+        play, and the page is where you act.
         """
         if not hasattr(self, "_exits_list"):
             return
@@ -12305,15 +12337,18 @@ class App(ctk.CTk):
         sells = _load_sells()
         plays = _sell_plays(sells) if sells else []
         ready = self._autosell_worklist()
-        self._update_exits_summary(plays, ready)
+        fracs = self._fractional_worklist(ready)
+        self._update_exits_summary(plays, ready, fracs)
 
-        if not sells:
+        if not sells and not fracs:
+            # Both empty, so say so once rather than printing two empty states.
             self._empty_state(
-                self._exits_list, "info", "No exits called yet",
+                self._exits_list, "info", "Nothing to sell",
                 "Exits arrive with your subscription once this device is "
                 "linked — no Discord needed — and each one names the brokerage "
-                "it was called at. Until one lands there is nothing to sell: "
-                "holding a play is not a reason to exit it.").pack(fill="x")
+                "it was called at. Fractional remnants show up here on their "
+                "own off the split board. Neither has anything for you right "
+                "now.").pack(fill="x")
             return
 
         buckets: Dict[str, List[Any]] = {"now": [], "holding": [], "closed": []}
@@ -12340,6 +12375,18 @@ class App(ctk.CTk):
                 self._sell_play_card(self._exits_list, play,
                                      by_symbol.get(play.symbol.upper()))
 
+        if fracs:
+            self._exits_group_header(
+                self._exits_list, "FRACTIONAL — NO EXIT COMING",
+                "A fraction came back, which means the split did NOT round you "
+                "up. There is nothing to wait for and nobody calls an exit on a "
+                f"remnant, so these are yours to clear. Only "
+                f"{', '.join(rsa_feed.FRACTIONAL_BROKERS)} return one at all — "
+                "everyone else settled it to cash, so there is no share to sell "
+                "there.", len(fracs))
+            for t in fracs:
+                self._exits_task_row(t)
+
         if buckets["holding"]:
             self._exits_group_header(
                 self._exits_list, "HOLDING",
@@ -12359,6 +12406,65 @@ class App(ctk.CTk):
                 len(buckets["closed"]))
             for play in buckets["closed"]:
                 self._sell_play_card(self._exits_list, play)
+
+    def _exits_task_row(self, task) -> None:
+        """One SellTask as a row: what it is, where, and the two actions.
+
+        The play cards above render a SellPlay, which is built from called
+        exits and knows about per-brokerage legs. A fractional has no exit and
+        no leg structure — it is a position the split board told us about — so
+        it gets its own, plainer row rather than being forced through a card
+        whose whole shape is "which brokerage called this".
+        """
+        row = tk.Frame(self._exits_list, bg=BG_INPUT)
+        row.pack(fill="x", pady=(0, 6))
+        tk.Frame(row, bg=ACCENT, width=3).pack(side="left", fill="y")
+        body = tk.Frame(row, bg=BG_INPUT)
+        body.pack(side="left", fill="x", expand=True, padx=14, pady=10)
+
+        left = tk.Frame(body, bg=BG_INPUT)
+        left.pack(side="left")
+        sym_row = tk.Frame(left, bg=BG_INPUT)
+        sym_row.pack(anchor="w")
+        tk.Label(sym_row, text=task.symbol, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                 font=(FONT_FAMILY, 14, "bold")).pack(side="left")
+        if task.renamed:
+            # The journal knows the old ticker; only the new one can be traded.
+            badge = tk.Frame(sym_row, bg=BG_ELEVATED)
+            badge.pack(side="left", padx=(8, 0))
+            tk.Label(badge, text=f" was {task.alert_symbol} ", bg=BG_ELEVATED,
+                     fg=YELLOW, font=(FONT_FAMILY, 8, "bold")).pack()
+
+        meta = tk.Frame(left, bg=BG_INPUT)
+        meta.pack(anchor="w", pady=(2, 0))
+        tk.Label(meta, text=task.status.replace("_", " ").upper(), bg=BG_INPUT,
+                 fg=ACCENT, font=(FONT_FAMILY, 8, "bold")).pack(side="left")
+        tk.Label(meta, text=f"   ·   {task.alert_date}", bg=BG_INPUT,
+                 fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).pack(side="left")
+        tk.Label(meta,
+                 text=f"   ·   {task.accounts} acct(s) at {', '.join(task.brokers)}",
+                 bg=BG_INPUT, fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 8)).pack(side="left")
+        if task.skipped_brokers:
+            # Shown, not hidden: "why isn't Fidelity in the list" is the first
+            # question this row has to answer.
+            tk.Label(meta,
+                     text=f"   ·   cash-in-lieu at {', '.join(task.skipped_brokers)}",
+                     bg=BG_INPUT, fg=TEXT_MUTED,
+                     font=(FONT_FAMILY, 8)).pack(side="left")
+
+        act = tk.Frame(body, bg=BG_INPUT)
+        act.pack(side="right")
+        q = tk.Label(act, text="Queue", bg=BG_INPUT, fg=ACCENT,
+                     font=(FONT_FAMILY, 9, "bold"), padx=10, pady=4,
+                     cursor="hand2")
+        q.pack(side="right", padx=(10, 0))
+        q.bind("<Button-1>",
+               lambda e, t=task: self._queue_sell(t, source="queued from the board"))
+        q.bind("<Enter>", lambda e, w=q: w.configure(fg=TEXT_PRIMARY))
+        q.bind("<Leave>", lambda e, w=q: w.configure(fg=ACCENT))
+        PillButton(act, text="Sell", command=lambda t=task: self._exit_sell(t),
+                   width=76, height=30, font_size=9).pack(side="right")
 
     def _exit_trade(self, task) -> None:
         """Open the Trade Desk primed for this exit, without firing.
@@ -12649,13 +12755,14 @@ class App(ctk.CTk):
                 return json.loads(AUTOSELL_STATE_FILE.read_text(encoding="utf-8"))
             except Exception:
                 pass
-        return {"enabled": False, "dry_run": True, "sold": []}
+        return {"enabled": False, "dry_run": True, "fractionals": True, "sold": []}
 
     def _save_autosell_state(self) -> None:
         import json
         state = {
             "enabled": bool(self._autosell_enabled.get()),
             "dry_run": bool(self._autosell_dry_run.get()),
+            "fractionals": bool(self._autosell_fracs.get()),
             # Bounded: this only has to outlive a re-pull of the same feed, and
             # an unbounded list would grow for the life of the install.
             "sold": list(self._autosell_sold)[-500:],
@@ -12724,6 +12831,36 @@ class App(ctk.CTk):
         """Everything auto-sell would place right now, unclaimed ones first."""
         return _sellnow_tasks(_load_sells(), self._symbol_renames())
 
+    def _fractional_worklist(self, exits=None) -> List[Any]:
+        """Fractional remnants we hold, whether or not an exit was called.
+
+        THE ONE THING THAT IS NOT EXIT-DRIVEN, deliberately.
+
+        A fraction exists because a reverse split did NOT round the position
+        up. There is no round-up coming and nothing to wait for — only a thin
+        post-split stub that drifts down while it sits, at the three brokers
+        that return one at all (Public, Robinhood, SoFi; everyone else settled
+        it to cash and there is no share to sell). Nobody calls an exit on a
+        remnant, so a board built only from called exits cannot see them: all
+        86 fractional rows currently on the board would sit there forever.
+
+        That is why this still reads the TRACK board. It is not the exit
+        trigger creeping back — exits decide what gets SOLD ON INSTRUCTION,
+        and this decides what decays if left alone. Two different jobs, and
+        collapsing them is what lost this one.
+
+        Anything already on the Sell-now list is dropped: an exit was called
+        there, so it is that list's to place and the play must not be queued
+        twice under two different keys.
+        """
+        if not getattr(self, "_track_rows", None):
+            return []
+        claimed = {t.symbol.upper() for t in
+                   (exits if exits is not None else self._autosell_worklist())}
+        return [t for t in lifecycle.sell_worklist(self._track_rows)
+                if t.brokers and t.is_fractional
+                and t.symbol.upper() not in claimed]
+
     def _autosell_consider(self, reason: str = "new exits") -> None:
         """Queue the exits we have been told to take and still hold.
 
@@ -12748,7 +12885,14 @@ class App(ctk.CTk):
         if not getattr(self, "_autosell_enabled", None) or not self._autosell_enabled.get():
             return
 
-        tasks = [t for t in self._autosell_worklist()
+        exits = self._autosell_worklist()
+        tasks = list(exits)
+        # Fractionals ride along on the same tick rather than getting a timer
+        # of their own: they are sold through the same queue with the same
+        # guards, and one list keeps the per-batch cap honest across both.
+        if self._autosell_fracs.get():
+            tasks += self._fractional_worklist(exits)
+        tasks = [t for t in tasks
                  if self._autosell_key(t) not in self._autosell_sold]
         if not tasks:
             return
@@ -12853,11 +12997,62 @@ class App(ctk.CTk):
         self._sweep_progress()
         self._autosell_pump()
 
+    def _fractional_sweep(self) -> None:
+        """Clear the fractional backlog — the half no exit will ever cover.
+
+        Auto-sell picks these up as they appear, if the box is ticked. This is
+        for the ones already sitting there: a remnant that was fractional
+        before you armed it is not going to transition again, so nothing will
+        ever come for it on its own.
+
+        Same queue, same one-at-a-time pump, same sold-once record, same dry
+        run. And the same two-click confirm: it names the tickers and waits,
+        which protects as well as a modal without being dismissable by reflex.
+        """
+        if not self._track_rows:
+            self._sweep_say("Pull the board first", which="fractional")
+            self._push_notification(
+                "The fractional list comes off the split board — hit Refresh "
+                "Board first.", "warning")
+            return
+
+        # NOT filtered by the sold-once record. That record stops the AUTOMATIC
+        # path double-firing; applied to a button someone pressed on purpose it
+        # only buries plays. The real guards are underneath it: sell_worklist
+        # scopes brokers through held_accounts(), which nets sells and is split
+        # adjusted, and the order still reads live holdings before it is placed.
+        tasks = self._fractional_worklist()
+        if not tasks:
+            self._sweep_say("Nothing fractional to sell", which="fractional")
+            self._push_notification(
+                "No fractional positions this app has a record of holding.",
+                "info")
+            return
+
+        if not self._sweep_armed.get("fractional"):
+            self._sweep_armed["fractional"] = True
+            syms = ", ".join(t.symbol for t in tasks[:6])
+            more = f" +{len(tasks) - 6} more" if len(tasks) > 6 else ""
+            self._frac_btn.configure(
+                text=f"Confirm: sell {len(tasks)} — {syms}{more}", bg=RED)
+            self.after(20000, lambda: self._sweep_disarm("fractional"))
+            return
+
+        self._sweep_armed["fractional"] = False
+        # An explicit two-click instruction about named tickers outranks the
+        # sold-once record for those tickers, including a play that exhausted
+        # AUTOSELL_MAX_ATTEMPTS and would otherwise be stuck for good.
+        self._autosell_unclaim(tasks)
+        for t in tasks:
+            self._queue_sell(t, source="fractional sweep")
+        self._sweep_progress("fractional")
+
     # Both sweeps drive their button through one set of helpers: same states,
     # same timers, different widget and resting label. Duplicating them is how
     # one button ends up with a progress label the other never got.
     _SWEEP_BUTTONS = {
         "exits": ("_sweep_btn", "Sell every called exit now"),
+        "fractional": ("_frac_btn", "Sell all fractionals now"),
     }
 
     def _sweep_button(self, which: str):
@@ -13495,21 +13690,29 @@ class App(ctk.CTk):
         self._invalidate_page("exits")
         self._render_exits()
 
-    def _update_exits_summary(self, plays=None, ready=None) -> None:
+    def _update_exits_summary(self, plays=None, ready=None, fracs=None) -> None:
         """Counts along the top. Reuses the render's own lists when it has
         them: recomputing meant re-folding the whole trade journal twice per
-        paint, once here and once in _render_exits."""
+        paint, once here and once in _render_exits.
+
+        Fractionals are counted here too. A header that read "2 ready to sell"
+        over a page listing thirty-one fractional remnants is the same class of
+        contradiction the card and the page used to have — and the number in
+        the header is the one people act on."""
         if not hasattr(self, "_exits_summary"):
             return
         if plays is None:
             plays = _sell_plays(_load_sells())
         if ready is None:
             ready = self._autosell_worklist()
+        if fracs is None:
+            fracs = self._fractional_worklist(ready)
         open_plays = sum(1 for p in plays if p.left > 1e-9)
         shares = sum(l.left for p in plays for l in p.of(SELL_NOW))
         self._exits_summary.configure(
-            text=f"{len(ready)} ready to sell ({_qty_text(shares)} share(s))"
-                 f"   ·   {open_plays} still open   ·   {len(plays)} with an exit called")
+            text=f"{len(ready)} exit(s) ready ({_qty_text(shares)} share(s))"
+                 f"   ·   {len(fracs)} fractional"
+                 f"   ·   {open_plays} still open")
         self._exits_stamp.configure(
             text=f"updated {self._track_pulled_at}" if self._track_pulled_at else "")
 
