@@ -11,6 +11,7 @@ import os
 import random
 import shutil
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -19,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow
+from modules import _2fa_prompt
 from modules._2fa_prompt import universal_2fa_prompt
 from modules import broker_logging as BLOG
 
@@ -608,14 +610,54 @@ def _latest_price(rh, sym: str) -> Optional[float]:
 # Legacy-mimic session functions
 # =============================================================================
 
+# robin_stocks asks for the MFA code by calling input() from inside its own
+# login(), so the only way to answer it is to stand in front of builtins.input.
+# That is fine as long as it is done under a lock.
+#
+# IT WAS NOT. Two places here swapped builtins.input out (the rehydrate guard
+# below and bootstrap's login stub) and brokers bootstrap CONCURRENTLY, so a
+# rehydrate running inside a bootstrap produced this:
+#
+#     rehydrate : saved = <real input>  ; installed _blocked
+#     bootstrap : saved = _blocked      ; installed the login stub
+#     rehydrate : restored <real input>
+#     bootstrap : restored _blocked      <-- left installed, for the session
+#
+# From then on every module in the process that called input() got _blocked,
+# which RAISES. That is what stopped Fidelity ever showing its OTP box: the
+# RuntimeError escaped its provider and came back as a bare "auth failed" while
+# the texted code sat unused on the user's phone. See modules/_2fa_prompt.py.
+#
+# One lock, held for the whole patch, and every restore goes back to what was
+# genuinely there. Non-Robinhood modules ask through modules._2fa_prompt now
+# and never touch builtins at all.
+_INPUT_PATCH_LOCK = threading.RLock()
+
+
 @contextlib.contextmanager
+def _intercept_input(handler: Callable[[str], str]):
+    """Answer robin_stocks' interactive prompts with `handler`, safely."""
+    with _INPUT_PATCH_LOCK:
+        orig_input = builtins.input
+        orig_getpass = getpass.getpass
+        builtins.input = handler          # type: ignore[assignment]
+        getpass.getpass = handler         # type: ignore[assignment]
+        try:
+            yield
+        finally:
+            builtins.input = orig_input
+            getpass.getpass = orig_getpass  # type: ignore[assignment]
+
+
 def _block_interactive_prompts(*, context: str):
     """
     Prevent silent hangs when robin_stocks falls back to interactive input().
-    """
-    orig_input = builtins.input
-    orig_getpass = getpass.getpass
 
+    A rehydrate is meant to be non-interactive: it either refreshes the cached
+    token or it does not. Being asked for a password here means the pickle is
+    dead, and saying so immediately beats blocking a background refresh on a
+    dialog the user never asked for.
+    """
     def _blocked(prompt: str = "") -> str:
         prompt_txt = str(prompt or "").strip()
         hint = f" Prompt={prompt_txt!r}" if prompt_txt else ""
@@ -624,13 +666,7 @@ def _block_interactive_prompts(*, context: str):
             "Cached session appears expired/corrupt."
         )
 
-    builtins.input = _blocked
-    getpass.getpass = _blocked  # type: ignore[assignment]
-    try:
-        yield
-    finally:
-        builtins.input = orig_input
-        getpass.getpass = orig_getpass  # type: ignore[assignment]
+    return _intercept_input(_blocked)
 
 
 def login_with_cache(*, rh, pickle_name: str) -> None:
@@ -755,7 +791,6 @@ def bootstrap() -> BrokerOutput:
     requested_mfa = "auto"
     method_label = "auto (Robinhood decides SMS/email/app)"
 
-    otp_provider = None  # _input_stub naturally falls back to terminal input()
 
     login_fn = _get_login_callable(rh)
     if not callable(login_fn):
@@ -772,16 +807,28 @@ def bootstrap() -> BrokerOutput:
     except Exception:
         params = {}
 
-    orig_input = builtins.input
+    def _login_prompt(prompt: str = "") -> str:
+        """Answer whatever robin_stocks asks for during the login.
 
-    def _input_stub(prompt: str = "") -> str:
-        if otp_provider is None:
-            return orig_input(prompt)
-        code = otp_provider("Robinhood", 300)
-        return code or ""
+        Its text goes through verbatim, because the ask is not always the MFA
+        code -- a device-approval flow says "check your Robinhood app", and a
+        prompt relabelled by a library upgrade should still reach the user
+        rather than being guessed at here.
 
+        Returns "" rather than raising when the user declines. robin_stocks
+        turns an empty code into its own auth error, which is a far better
+        message than a traceback out of a monkey-patched builtin.
+        """
+        text = str(prompt or "").strip() or universal_2fa_prompt("Robinhood")
+        return _2fa_prompt.request_text("Robinhood", text, 300) or ""
+
+    # ExitStack rather than a `with` block: the interception has to cover the
+    # whole login body, and wrapping it would reindent a hundred lines for no
+    # behavioural gain. Closing the stack in the existing `finally` restores
+    # builtins.input exactly as the context manager would.
+    _prompts = contextlib.ExitStack()
     try:
-        builtins.input = _input_stub
+        _prompts.enter_context(_intercept_input(_login_prompt))
 
         # Build accounts by logging each profile (legacy-style, one pickle per profile)
         merged_accounts: List[Tuple[str, str, str]] = []
@@ -820,22 +867,21 @@ def bootstrap() -> BrokerOutput:
                 secrets=[username],
             )
 
-            # login (OTP happens here if needed)
-            # Keep prompts visible in terminal mode; suppress only for OTP-provider mode.
-            # Either way the console is teed to a transcript log — without it a
-            # GUI (pythonw) run gives no clue which challenge Robinhood issued.
+            # login (OTP happens here if needed — _login_prompt answers it)
+            #
+            # The console is teed to a transcript log unconditionally. It used
+            # to be skipped whenever an OTP provider was set, which was dead
+            # weather: the provider was hard-wired to None, so the branch never
+            # ran either way. Under pythonw there is no console at all, and the
+            # transcript is the only record of which challenge Robinhood
+            # actually issued — that is exactly when it is worth having.
             _console = io.StringIO()
             try:
-                if otp_provider is None:
-                    with _capture_console(_console, on_text=_device_approval_watcher()):
-                        login_fn(**call_kwargs)
-                else:
-                    with _suppress_console_noise():
-                        login_fn(**call_kwargs)
+                with _capture_console(_console, on_text=_device_approval_watcher()):
+                    login_fn(**call_kwargs)
             finally:
-                if otp_provider is None:
-                    _log_login_transcript(pickle_name, _console.getvalue(),
-                                          secrets=[username, password])
+                _log_login_transcript(pickle_name, _console.getvalue(),
+                                      secrets=[username, password])
 
             # immediately rehydrate from the cache (exact legacy habit)
             login_with_cache(rh=rh, pickle_name=pickle_name)
@@ -879,7 +925,7 @@ def bootstrap() -> BrokerOutput:
         )
 
     finally:
-        builtins.input = orig_input
+        _prompts.close()
 
 
 def _ensure_session() -> Tuple[bool, str]:
