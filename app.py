@@ -1113,38 +1113,54 @@ def _sellnow_tasks(sells: List[Dict[str, Any]],
     renames = renames or {}
     out: List[Any] = []
     for play in _sell_plays(sells):
-        ready = play.of(SELL_NOW)
-        if not ready:
-            continue
-        brokers: List[str] = []
-        accounts = 0
-        newest = ""
-        for leg in ready:
-            if lifecycle.app_key(leg.broker) not in BROKER_MODULES:
-                continue
-            brokers.append(rsa_feed.normalize_broker(leg.broker))
-            accounts += len(_leg_open_accounts(leg.broker, play.symbol))
-            newest = max(newest, leg.alert_date or "")
-        if not brokers:
-            continue
-        out.append(lifecycle.SellTask(
-            symbol=play.symbol,
-            # The journal may still know this position by its pre-split ticker.
-            # lifecycle.resolve looks under both, so handing it only the new
-            # name is how a renamed play reads as "no position anywhere".
-            alert_symbol=renames.get(play.symbol.upper(), play.symbol),
-            alert_date=newest or play.last_alert[:10],
-            status="exit_called",
-            brokers=tuple(dict.fromkeys(brokers)),
-            accounts=accounts,
-            skipped_brokers=tuple(
-                rsa_feed.normalize_broker(l.broker) for l in ready
-                if lifecycle.app_key(l.broker) not in BROKER_MODULES),
-        ))
+        task = _sellnow_task(play, renames=renames)
+        if task is not None:
+            out.append(task)
     # Biggest ready position first: if the cap or the market close cuts the run
     # short, the money that was left behind should be the smallest.
     out.sort(key=lambda t: t.accounts, reverse=True)
     return out
+
+
+def _sellnow_task(play, legs=None, renames: Optional[Dict[str, str]] = None):
+    """One play's ready legs as a SellTask, or None if none are placeable.
+
+    `legs` narrows it to a subset of the play's SELL_NOW legs — that is what
+    lets a single brokerage be queued on its own while the rest of the play
+    waits. Default is every ready leg, which is what auto-sell and the sweep
+    want.
+    """
+    renames = renames or {}
+    ready = tuple(legs) if legs is not None else play.of(SELL_NOW)
+    if not ready:
+        return None
+
+    brokers: List[str] = []
+    accounts = 0
+    newest = ""
+    for leg in ready:
+        if lifecycle.app_key(leg.broker) not in BROKER_MODULES:
+            continue
+        brokers.append(rsa_feed.normalize_broker(leg.broker))
+        accounts += len(_leg_open_accounts(leg.broker, play.symbol))
+        newest = max(newest, leg.alert_date or "")
+    if not brokers:
+        return None
+
+    return lifecycle.SellTask(
+        symbol=play.symbol,
+        # The journal may still know this position by its pre-split ticker.
+        # lifecycle.resolve looks under both, so handing it only the new name
+        # is how a renamed play reads as "no position anywhere".
+        alert_symbol=renames.get(play.symbol.upper(), play.symbol),
+        alert_date=newest or play.last_alert[:10],
+        status="exit_called",
+        brokers=tuple(dict.fromkeys(brokers)),
+        accounts=accounts,
+        skipped_brokers=tuple(
+            rsa_feed.normalize_broker(l.broker) for l in ready
+            if lifecycle.app_key(l.broker) not in BROKER_MODULES),
+    )
 
 
 PICKS_FILE = ROOT_DIR / "picks.json"
@@ -1780,6 +1796,10 @@ class App(ctk.CTk):
         self._autosell_sold: set = set(_as.get("sold") or [])
         self._autosell_queue: List[Any] = []
         self._autosell_waits: int = 0     # pump ticks spent behind a busy trade
+        # A holdings read is out for the task the pump just popped. Covers the
+        # window before _trade_in_flight goes up — see _autosell_pump.
+        self._queue_busy: bool = False
+        self._queue_held_said: bool = False
         # play key -> hand-backs so far. Not persisted: a restart is a fair
         # reason to try a broker again, and it is the WITHIN-session loop that
         # hammers a login.
@@ -4282,6 +4302,18 @@ class App(ctk.CTk):
             act.bind("<Button-1>",
                      lambda e, sy=play.symbol, k=[leg.broker]:
                      self._sell_alert_trade(sy, k))
+            # Queue THIS brokerage on its own. Orders at one broker have to run
+            # one at a time anyway — they share a browser profile — so lining
+            # them up is the only way to ask for several without sitting and
+            # watching each one finish before clicking the next.
+            q = tk.Label(line, text="Queue", bg=row_bg, fg=ACCENT,
+                         font=(FONT_FAMILY, 8, "bold"), padx=8, pady=3,
+                         cursor="hand2")
+            q.pack(side="right", padx=(0, 8))
+            q.bind("<Button-1>",
+                   lambda e, pl=play, lg=leg: self._queue_sell_leg(pl, lg))
+            q.bind("<Enter>", lambda e, w=q: w.configure(fg=TEXT_PRIMARY))
+            q.bind("<Leave>", lambda e, w=q: w.configure(fg=ACCENT))
             # The escape hatch, on every sellable leg rather than only the
             # rejected ones: a leg the desk has never been pointed at is
             # exactly as stuck when you already sold it by hand, and it is the
@@ -4348,6 +4380,14 @@ class App(ctk.CTk):
             PillButton(act, text=f"Sell all {_qty_text(sum(l.left for l in ready))}",
                        command=lambda t=task: self._exit_sell(t),
                        width=120, height=30, font_size=9).pack(side="left")
+            qall = tk.Label(act, text="Queue all", bg=row_bg, fg=ACCENT,
+                            font=(FONT_FAMILY, 9, "bold"), padx=10, pady=4,
+                            cursor="hand2")
+            qall.pack(side="left", padx=(8, 0))
+            qall.bind("<Button-1>", lambda e, t=task: self._queue_sell(
+                t, source="queued from the board"))
+            qall.bind("<Enter>", lambda e, w=qall: w.configure(fg=TEXT_PRIMARY))
+            qall.bind("<Leave>", lambda e, w=qall: w.configure(fg=ACCENT))
             desk = tk.Label(act, text=f"  {icon('trade')}  ticket", bg=row_bg,
                             fg=TEXT_MUTED, font=(ICON_FONT, 9), cursor="hand2")
             desk.pack(side="left", padx=(10, 0))
@@ -12078,10 +12118,43 @@ class App(ctk.CTk):
         self._exits_stamp.pack(side="right")
 
         self._build_autosell_card(frame)
+        self._build_queue_strip(frame)
 
         outer, self._exits_list = self._make_vscroll(frame)
+        self._exits_scroll = outer
         outer.pack(fill="both", expand=True)
+        self._render_sell_queue()
         self._render_exits()
+
+    def _build_queue_strip(self, parent) -> None:
+        """What is waiting to be sold, above the board it was queued from.
+
+        Packed and unpacked by _render_sell_queue rather than left showing an
+        empty row: a permanent "0 waiting" strip is a line of furniture, and
+        the whole point of this one is that it appears when it has something to
+        say.
+        """
+        self._queue_strip = RoundedFrame(parent, bg_color=BG_ELEVATED,
+                                         border_color=ACCENT, radius=RAD_MD)
+        body = tk.Frame(self._queue_strip.inner, bg=BG_ELEVATED)
+        body.pack(fill="x", padx=SP_XL, pady=SP_MD)
+
+        tk.Label(body, text=icon("clock"), bg=BG_ELEVATED, fg=ACCENT,
+                 font=(ICON_FONT, 11)).pack(side="left", padx=(0, 8))
+        tk.Label(body, text="SELL QUEUE", bg=BG_ELEVATED, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 8, "bold")).pack(side="left", padx=(0, 12))
+        self._queue_label = tk.Label(body, text="", bg=BG_ELEVATED,
+                                     fg=TEXT_PRIMARY, font=(FONT_FAMILY, 9),
+                                     justify="left", anchor="w", wraplength=620)
+        self._queue_label.pack(side="left", fill="x", expand=True)
+
+        clear = tk.Label(body, text="Clear", bg=BG_ELEVATED, fg=TEXT_MUTED,
+                         font=(FONT_FAMILY, 9, "bold"), padx=10, pady=3,
+                         cursor="hand2")
+        clear.pack(side="right")
+        clear.bind("<Button-1>", lambda e: self._clear_sell_queue())
+        clear.bind("<Enter>", lambda e, w=clear: w.configure(fg=RED))
+        clear.bind("<Leave>", lambda e, w=clear: w.configure(fg=TEXT_MUTED))
 
     def _build_autosell_card(self, parent) -> None:
         """The arming switch, and the sentence that says what arming it means.
@@ -12830,6 +12903,124 @@ class App(ctk.CTk):
             return
         btn.configure(text=resting, bg=BG_INPUT)
 
+    # ---- The sell queue ----------------------------------------------------
+    #
+    # One queue, drained one order at a time by _autosell_pump, fed from three
+    # places: auto-sell, the sweep, and the Queue buttons on the board.
+    #
+    # WHY A BUTTON AND NOT JUST "SELL"
+    #
+    # _exit_fire refuses to start while another trade is in flight, and it has
+    # to: brokers are driven through one browser profile apiece, so two orders
+    # at the same brokerage would fight over the same session. That refusal is
+    # correct and it was also the whole problem — clicking Sell on a second
+    # play while the first was running got you "a trade is already running" and
+    # nothing else. The work was not deferred, it was dropped, and you had to
+    # sit and watch a ten-account Fidelity leg finish before you could ask for
+    # the next one. Queue defers it instead.
+
+    def _queue_sell(self, task, *, source: str = "queued by hand") -> bool:
+        """Add one sell to the queue. Returns False if it was already there."""
+        key = self._autosell_key(task)
+        if any(self._autosell_key(t) == key for t in self._autosell_queue):
+            self._push_notification(
+                f"{task.symbol} at {', '.join(task.brokers)} is already in the "
+                f"queue", "info")
+            return False
+
+        # An explicit click outranks the sold-once record, exactly as a sweep
+        # does — see _autosell_unclaim. Safe because nothing here decides what
+        # is sold: the leg is only on the board while the journal shows it
+        # open, and the live holdings read still refuses an empty account.
+        if key in self._autosell_sold:
+            self._autosell_unclaim([task])
+            self._log(f"Queue: {task.symbol} had been attempted before — "
+                      f"trying it again because you asked.", "meta")
+
+        self._autosell_queue.append(task)
+        dry = " [DRY RUN]" if self._autosell_dry_run.get() else ""
+        self._log(f"Queue: {task.symbol} at {', '.join(task.brokers)} "
+                  f"({task.accounts} acct(s)) — {source}{dry}")
+        # Said out loud, not just written to the Activity log. The queue strip
+        # lives on the Exits page and these buttons are on the dashboard card
+        # too, so from there a click would otherwise have no visible effect at
+        # all — which reads as a dead button.
+        ahead = len(self._autosell_queue) - 1
+        where = ", ".join(task.brokers)
+        self._push_notification(
+            f"Queued {task.symbol} at {where}"
+            + (f" — {ahead} ahead of it" if ahead else " — next up")
+            + (" [dry run]" if dry else ""),
+            "info")
+        self._render_sell_queue()
+        self._autosell_pump()
+        return True
+
+    def _queue_sell_leg(self, play, leg) -> None:
+        """Queue one brokerage's share of a play, leaving the rest of it alone.
+
+        Built here rather than looked up, because the whole-play task carries
+        every ready brokerage and this is the case where you want one of them:
+        ONFO at Wells Fargo now, the ten Fidelity accounts later.
+        """
+        task = _sellnow_task(play, [leg], self._symbol_renames())
+        if task is None:
+            self._push_notification(
+                f"{play.symbol} at {leg.label}: no credentials for that broker "
+                f"on this machine, so there is nothing to place.", "warning")
+            return
+        self._queue_sell(task, source=f"queued from {leg.label}")
+
+    def _clear_sell_queue(self) -> None:
+        """Drop everything still waiting. Whatever is already running finishes.
+
+        Nothing is unclaimed here: the claim is taken when a task is POPPED, so
+        anything still in the queue was never claimed, and the one that was
+        popped is already in flight and must stay claimed.
+        """
+        n = len(self._autosell_queue)
+        if not n:
+            return
+        left = ", ".join(t.symbol for t in self._autosell_queue)
+        self._autosell_queue.clear()
+        self._log(f"Queue: cleared {n} waiting sell(s) — {left}. Anything "
+                  f"already placed is not affected.", "warn")
+        self._render_sell_queue()
+
+    def _render_sell_queue(self) -> None:
+        """Keep the queue strip on the Exits page honest."""
+        strip = getattr(self, "_queue_strip", None)
+        if strip is None:
+            return
+        queued = list(self._autosell_queue)
+        busy = getattr(self, "_trade_in_flight", False)
+        if not queued and not busy:
+            strip.pack_forget()
+            return
+        # `before` keeps the strip above the scrolling board when it is
+        # re-packed. Guarded, because pack(before=None) is a TclError and the
+        # strip can be asked to show itself from the dashboard card, which is
+        # reachable before the Exits page has finished laying itself out.
+        anchor = getattr(self, "_exits_scroll", None)
+        if anchor is not None and anchor.winfo_manager():
+            strip.pack(fill="x", pady=(0, 12), before=anchor)
+        else:
+            strip.pack(fill="x", pady=(0, 12))
+        state, label, _ = _market_status()
+        held = state != "open"
+        names = ", ".join(f"{t.symbol} ({', '.join(t.brokers)})" for t in queued[:5])
+        more = f"  +{len(queued) - 5} more" if len(queued) > 5 else ""
+        if busy and not queued:
+            text = "Selling now — nothing else waiting"
+        elif busy:
+            text = f"Selling now, then {len(queued)} waiting:  {names}{more}"
+        elif held:
+            text = f"{len(queued)} waiting for the open ({label}):  {names}{more}"
+        else:
+            text = f"{len(queued)} waiting:  {names}{more}"
+        self._queue_label.configure(
+            text=text, fg=YELLOW if held else TEXT_PRIMARY)
+
     def _autosell_pump(self) -> None:
         """Start the next play once the previous one has finished.
 
@@ -12837,10 +13028,43 @@ class App(ctk.CTk):
         flight, so firing the queue in parallel would place the first order and
         silently discard the rest.
         """
+        self._render_sell_queue()
         if not self._autosell_queue:
             self._autosell_waits = 0
             return
-        if getattr(self, "_trade_in_flight", False):
+
+        # Out of hours the queue HOLDS rather than drains. Auto-sell and the
+        # sweep already refuse to queue when the book is shut, but a hand-queued
+        # sell is exactly the case where you line orders up the evening before
+        # and expect them at the open — so this is checked here, where the order
+        # is actually placed, rather than only at the door. Deliberately not on
+        # the _autosell_waits counter below: that one gives up after ten
+        # minutes, and a closed market is not a stuck trade.
+        state, label, _ = _market_status()
+        if state != "open":
+            if not getattr(self, "_queue_held_said", False):
+                self._queue_held_said = True
+                left = ", ".join(t.symbol for t in self._autosell_queue)
+                self._log(f"Queue: {label.lower()} — holding {left} until the "
+                          f"open.", "meta")
+                self._push_notification(
+                    f"{len(self._autosell_queue)} sell(s) queued for the open",
+                    "info")
+            self.after(60000, self._autosell_pump)
+            return
+        self._queue_held_said = False
+
+        # _queue_busy as well as _trade_in_flight, and it is load bearing. The
+        # pop below hands the task to a HOLDINGS READ on a thread; nothing sets
+        # _trade_in_flight until _exit_fire, several seconds later. Every add
+        # calls this pump, so without a flag covering that window two clicks in
+        # quick succession pop two tasks and drive two concurrent reads —
+        # possibly at the same broker, through the one browser profile they
+        # share, which is the exact contention the queue exists to prevent.
+        # _autosell_fire's "another trade started mid-read" guard would catch
+        # it afterwards, but recovering from a race is not the same as not
+        # having one.
+        if getattr(self, "_trade_in_flight", False) or getattr(self, "_queue_busy", False):
             # Wait, but not forever. A broker that hangs holds _trade_in_flight
             # true, and without a ceiling the rest of the list waits behind it
             # in silence for the life of the process — which reads exactly like
@@ -12851,6 +13075,10 @@ class App(ctk.CTk):
                 left = ", ".join(t.symbol for t in self._autosell_queue)
                 self._autosell_waits = 0
                 self._autosell_queue.clear()
+                # Released too: a read that never called back would otherwise
+                # keep the gate shut for the life of the process, and the next
+                # thing queued would sit behind a task nobody is waiting for.
+                self._queue_busy = False
                 self._log(f"Auto-sell: a trade has been running for "
                           f"{AUTOSELL_WAIT_TICKS * 5 // 60} minutes — giving up on "
                           f"{left}. They stay on the Exits tab to sell by hand.",
@@ -12877,6 +13105,8 @@ class App(ctk.CTk):
 
         self._log(f"Auto-sell: reading {task.symbol} holdings at "
                   f"{', '.join(task.brokers)}…")
+        self._queue_busy = True
+        self._render_sell_queue()
         self._run_in_thread(self._autosell_resolve, task)
 
     def _autosell_resolve(self, task) -> None:
@@ -12899,6 +13129,7 @@ class App(ctk.CTk):
 
     def _autosell_abandon(self, task, why: str) -> None:
         """Give up on one play, say so, and keep going."""
+        self._queue_busy = False                # the read is over, however badly
         self._autosell_retry(task, why)         # unclaim: nothing was placed
         self._log(f"Auto-sell: {task.symbol} failed — {why}", "error")
         self._push_notification(f"Auto-sell couldn't handle {task.symbol}: {why}",
@@ -12965,6 +13196,9 @@ class App(ctk.CTk):
     def _autosell_fire(self, resolved) -> None:
         """Place the resolved sell — the one step a human would have clicked."""
         task = resolved.task
+        # The holdings read is done. From here the gate is _trade_in_flight,
+        # which _exit_fire owns.
+        self._queue_busy = False
 
         # Something else started while we were reading holdings. _exit_fire
         # would refuse, and the play was claimed before the read — so without
