@@ -31,7 +31,8 @@ _METHODS = [
     "_render_trade_broker_chips", "_broker_empty_hint", "_toggle_broker_chip",
     "_render_mirror_broker_chips", "_toggle_mirror_broker",
     "_refresh_linked_brokers", "_render_linked_count",
-    "_save_account_creds",
+    "_save_account_creds", "_login_model", "_collect_login_rows",
+    "_render_login_editor", "_add_login", "_remove_login",
     "_make_chip", "_style_chip",
 ]
 
@@ -143,21 +144,43 @@ def test_saving_credentials_is_what_triggers_the_refresh(page, monkeypatch):
     written = {}
     monkeypatch.setattr(A, "_save_env_file", written.update)
 
-    entry = tk.Entry(page)
-    entry.insert(0, "someone@example.com")
     page._account_widgets = {"fidelity": {
         "dot": type("D", (), {"set_color": lambda self, c: None})(),
         "status": tk.Label(page),
-        "entries": {"FIDELITY_USERNAME": entry},
+        "box": tk.Frame(page),
+        "model": [{"username": "someone@example.com", "password": "pw"}],
     }}
     page._broker_status_labels = {}
     page.linked.add("fidelity")
 
     page._save_account_creds("fidelity")
 
-    assert written == {"FIDELITY_USERNAME": "someone@example.com"}
+    assert written["FIDELITY"] == "someone@example.com:pw"
     assert set(page._mirror_broker_chips) == {"fidelity"}
     assert set(page._trade_broker_chips) == {"fidelity"}
+
+
+def test_a_second_login_is_saved_alongside_the_first(page, monkeypatch):
+    """The editor holds as many logins as the household has. Login 1 keeps the
+    keys it has always used so nothing existing moves."""
+    written = {}
+    monkeypatch.setattr(A, "_save_env_file", written.update)
+
+    page._account_widgets = {"chase": {
+        "dot": type("D", (), {"set_color": lambda self, c: None})(),
+        "status": tk.Label(page),
+        "box": tk.Frame(page),
+        "model": [{"username": "first-login", "password": "pw1", "tag": "myles"},
+                  {"username": "other", "password": "pw2", "tag": "the other one"}],
+    }}
+    page._broker_status_labels = {}
+    page.linked.add("chase")
+
+    page._save_account_creds("chase")
+
+    assert written["CHASE_USERNAME"] == "first-login"          # unchanged key
+    assert written["CHASE_USERNAME_2"] == "other"          # additive
+    assert written["CHASE_TAG_1"] == "myles"
 
 
 def test_a_selection_survives_the_rebuild(page):

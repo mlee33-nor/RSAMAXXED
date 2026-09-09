@@ -1354,6 +1354,75 @@ async def _download_positions_csv(page, *, idx_1based: int, notify: Optional[Not
 
     raise RuntimeError("CSV download timed out")
 
+# -----------------------------------------------------------------------------
+# Column names
+#
+# Fidelity re-cases the positions export without notice: the September 2026
+# file renamed "Account Number" to "Account number" and "Last Price" to "Last
+# price". Every row was then dropped for having no account number, the parser
+# handed back a clean "(no positions)", and auto-sell reported "SMTK — no
+# position at Fidelity" while ten accounts held the stock.
+#
+# So no column is ever read by its literal header again. Names are normalised
+# (case, spaces and punctuation removed) and looked up through the header this
+# particular file happens to use.
+# -----------------------------------------------------------------------------
+
+#: Spellings we know how to read, canonical first. Alternates are ones that
+#: have actually been seen, not guesses.
+_COL_ACCT_NUM = ("Account Number", "Account #", "Acct #")
+_COL_ACCT_NAME = ("Account Name",)
+_COL_SYMBOL = ("Symbol", "Ticker")
+_COL_DESC = ("Description", "Security Description")
+_COL_QTY = ("Quantity", "Shares")
+_COL_PRICE = ("Last Price", "Price")
+_COL_VALUE = ("Current Value", "Market Value")
+
+
+def _norm_col(name: Any) -> str:
+    """'Account Number' / 'Account number' / 'account_number' -> 'accountnumber'."""
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+
+
+def _column_map(fieldnames: Any) -> Dict[str, str]:
+    """{normalised name: the header exactly as this file writes it}."""
+    out: Dict[str, str] = {}
+    for name in (fieldnames or []):
+        key = _norm_col(name)
+        if key and key not in out:
+            out[key] = str(name)
+    return out
+
+
+def _cell(row: Dict[str, Any], colmap: Dict[str, str], *names: str) -> str:
+    """This row's value for the first of `names` the file actually carries."""
+    for name in names:
+        actual = colmap.get(_norm_col(name))
+        if actual is None:
+            continue
+        val = row.get(actual)
+        if val not in (None, ""):
+            return str(val)
+    return ""
+
+
+def _check_positions_columns(colmap: Dict[str, str], path: Path, fieldnames: Any) -> None:
+    """Refuse to parse an export whose key columns are not there.
+
+    A header we cannot read is NOT an empty portfolio, and the whole cost of
+    the SMTK miss was reporting one as the other. Raising here puts Fidelity in
+    the "could not read" bucket, which auto-sell hands back for another try,
+    instead of the "no position" bucket, which it believes and moves on from.
+    """
+    missing = [names[0] for names in (_COL_ACCT_NUM, _COL_SYMBOL, _COL_QTY)
+               if not any(_norm_col(n) in colmap for n in names)]
+    if missing:
+        have = ", ".join(str(f) for f in (fieldnames or [])) or "(no header)"
+        raise RuntimeError(
+            f"{path.name}: positions export has no {' / '.join(missing)} "
+            f"column — headers are: {have}")
+
+
 def _parse_positions_csv(path: Path, *, label_prefix: str = "") -> List[AccountOutput]:
     def clean_num(v) -> float:
         if v is None:
@@ -1379,11 +1448,26 @@ def _parse_positions_csv(path: Path, *, label_prefix: str = "") -> List[AccountO
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         fieldnames = [str(x) for x in (reader.fieldnames or []) if x]
+        colmap = _column_map(fieldnames)
+        _check_positions_columns(colmap, path, fieldnames)
+
+        # A position row with no account number is the fingerprint of a header
+        # we are reading wrongly — see _check_positions_columns. The column
+        # check catches a rename we can NAME; this catches the same damage
+        # arriving some way nobody thought of, because the damage always looks
+        # the same: rows carrying a symbol that we cannot file under an account.
+        # Footers and disclaimers never reach it (no symbol), and a genuinely
+        # empty portfolio has no position rows to count.
+        orphaned = 0
 
         for row in reader:
-            acc_num = (row.get("Account Number") or "").strip()
-            acct_name = (row.get("Account Name") or "Account").strip()
-            if not acc_num or "and" in acc_num:
+            acc_num = _cell(row, colmap, *_COL_ACCT_NUM).strip()
+            acct_name = (_cell(row, colmap, *_COL_ACCT_NAME) or "Account").strip()
+            if not acc_num:
+                if _cell(row, colmap, *_COL_SYMBOL).strip():
+                    orphaned += 1
+                continue
+            if "and" in acc_num:
                 continue
             # Skip junk rows: date footers, non-Fidelity employer plans
             if acc_num.lower().startswith("date "):
@@ -1405,14 +1489,14 @@ def _parse_positions_csv(path: Path, *, label_prefix: str = "") -> List[AccountO
                     "parsed_rows": 0,
                 }
 
-            symbol_raw = (row.get("Symbol") or "").strip()
-            desc = (row.get("Description") or "").strip()
-            if not row.get("Symbol"):
+            symbol_raw = _cell(row, colmap, *_COL_SYMBOL).strip()
+            desc = _cell(row, colmap, *_COL_DESC).strip()
+            if not symbol_raw:
                 continue
 
-            qty = clean_num(row.get("Quantity"))
-            last_price = clean_num(row.get("Last Price"))
-            current_val = clean_num(row.get("Current Value"))
+            qty = clean_num(_cell(row, colmap, *_COL_QTY))
+            last_price = clean_num(_cell(row, colmap, *_COL_PRICE))
+            current_val = clean_num(_cell(row, colmap, *_COL_VALUE))
 
             if not symbol_raw and "Cash" in desc:
                 symbol_raw = "CASH"
@@ -1434,10 +1518,12 @@ def _parse_positions_csv(path: Path, *, label_prefix: str = "") -> List[AccountO
             if symbol and (qty > 0 or current_val > 0):
                 # holding-level discovery extras: safe columns from the CSV row
                 hextra = _row_extras_from_csv_row(row, max_items=70)
-                # never persist full account number
-                hextra.pop("Account Number", None)
-                hextra.pop("Account #", None)
-                hextra.pop("Account Name", None)
+                # never persist full account number — by normalised name, so
+                # a re-cased header cannot smuggle one through
+                for k in [k for k in hextra
+                          if _norm_col(k) in ("accountnumber", "acct", "acctnumber",
+                                              "accountname", "account")]:
+                    hextra.pop(k, None)
 
                 # useful computed helpers
                 try:
@@ -1462,6 +1548,12 @@ def _parse_positions_csv(path: Path, *, label_prefix: str = "") -> List[AccountO
                     )
                 )
                 buckets[bucket_key]["parsed_rows"] += 1
+
+    if orphaned:
+        raise RuntimeError(
+            f"{path.name}: {orphaned} position row(s) carry no account number — "
+            f"the export is not being read correctly. Headers are: "
+            f"{', '.join(fieldnames) or '(no header)'}")
 
     outs: List[AccountOutput] = []
     csv_name = path.name
@@ -1529,19 +1621,21 @@ def _parse_sell_targets_csv(path: Path, *, symbol: str) -> Dict[Tuple[str, str],
     out: Dict[Tuple[str, str], Dict[str, Any]] = {}
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
+        colmap = _column_map(reader.fieldnames)
+        _check_positions_columns(colmap, path, reader.fieldnames)
         for row in reader:
-            sym = _clean_symbol((row.get("Symbol") or "").strip().upper())
+            sym = _clean_symbol(_cell(row, colmap, *_COL_SYMBOL).strip().upper())
             if sym != target_sym:
                 continue
 
-            acct_num = (row.get("Account Number") or "").strip()
-            acct_name = (row.get("Account Name") or "Account").strip()
+            acct_num = _cell(row, colmap, *_COL_ACCT_NUM).strip()
+            acct_name = (_cell(row, colmap, *_COL_ACCT_NAME) or "Account").strip()
             if not acct_num:
                 continue
             d = _digits_only(acct_num)
             if not d:
                 continue
-            qty = _num_from_csv(row.get("Quantity"))
+            qty = _num_from_csv(_cell(row, colmap, *_COL_QTY))
             if qty <= 0:
                 continue
 

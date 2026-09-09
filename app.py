@@ -29,6 +29,7 @@ import urllib.request
 import urllib.error
 
 import customtkinter as ctk
+import broker_logins
 from dotenv import load_dotenv
 
 from modules.outputs import BrokerOutput, log_event
@@ -113,7 +114,7 @@ def _load_custom_accounts() -> List[Dict[str, Any]]:
 
 def _save_custom_accounts(accounts: List[Dict[str, Any]]) -> None:
     import json
-    CUSTOM_ACCOUNTS_FILE.write_text(json.dumps(accounts, indent=2), encoding="utf-8")
+    _write_json(CUSTOM_ACCOUNTS_FILE, accounts)
 
 BROKER_MODULES = {
     "bbae": "bbae",
@@ -346,7 +347,7 @@ def _load_watchlist() -> List[str]:
 
 def _save_watchlist(symbols: List[str]) -> None:
     try:
-        WATCHLIST_FILE.write_text(json.dumps(symbols, indent=2), encoding="utf-8")
+        _write_json(WATCHLIST_FILE, symbols)
     except Exception:
         pass
 
@@ -557,7 +558,7 @@ def _load_discord_state() -> Dict[str, Any]:
 
 def _save_discord_state(state: Dict[str, Any]) -> None:
     try:
-        DISCORD_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        _write_json(DISCORD_STATE_FILE, state)
     except Exception:
         pass
 
@@ -593,15 +594,45 @@ def _env(key: str) -> str:
 
 
 def _broker_has_creds(broker: str) -> bool:
-    keys = BROKER_ENV_KEYS.get(broker, [])
-    return any(_env(k) for k in keys)
+    """Is there at least one usable login at this broker?
+
+    Asks broker_logins rather than a fixed key list, so a broker configured
+    only at login 2 (CHASE_USERNAME_2, nothing bare) still counts as linked.
+    The old list could not see those keys at all, which would have shown a
+    fully configured broker as "not connected".
+    """
+    if broker_logins.logins(broker):
+        return True
+    return any(_env(k) for k in BROKER_ENV_KEYS.get(broker, []))
 
 
 def _public_token_indices() -> List[int]:
-    """Indices (1..3) of configured (non-blank) Public API secret tokens.
-    Public runs one independent login per token, so each becomes its own
-    P1/P2/P3 row in the Command Center broker-status card."""
-    return [i for i in (1, 2, 3) if _env(f"PUBLIC_SECRET_TOKEN_{i}")]
+    """Indices of configured Public logins — one row each on the status card.
+
+    No longer capped at three. A household running two people's accounts needs
+    more than three Public logins, and the old `(1, 2, 3)` meant a fourth token
+    could be saved and then read by nothing, which on screen is indistinguishable
+    from a broken login.
+    """
+    return [login.idx for login in broker_logins.logins("public")]
+
+
+def _write_json(path: Path, data: Any, *, indent: int = 2) -> None:
+    """Write one of the app's state files so a crash cannot leave it half-done.
+
+    `write_text` truncates first and writes second. Force-quit the app, lose
+    power, or fill the disk in between and the file is empty or cut in half —
+    and every one of these files is read back with json.loads, which turns a
+    truncated file into an exception and, in most of these call sites, into a
+    silently empty state. An empty picks.json looks like "no plays today"; an
+    empty mirror_state.json looks like a mirror that has never run.
+
+    Same shape as trade_journal._save and lifecycle: temp file beside the real
+    one, then an atomic rename over it.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=indent), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _save_env_file(updates: Dict[str, str]) -> None:
@@ -775,7 +806,7 @@ def _load_sells() -> List[Dict[str, Any]]:
 
 def _save_sells(sells: List[Dict[str, Any]]) -> None:
     try:
-        SELLS_FILE.write_text(json.dumps(sells, indent=2), encoding="utf-8")
+        _write_json(SELLS_FILE, sells)
     except OSError:
         pass
 
@@ -1701,7 +1732,7 @@ def _fetch_quick_picks() -> List[Dict[str, str]]:
         data, removed = _prune_stale_picks(local)
         if removed:
             try:
-                PICKS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                _write_json(PICKS_FILE, data)
             except Exception:
                 pass
         return data
@@ -1710,7 +1741,7 @@ def _fetch_quick_picks() -> List[Dict[str, str]]:
         data = _merge_picks(remote, local_bought)
         data, _ = _prune_stale_picks(data)
         try:
-            PICKS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            _write_json(PICKS_FILE, data)
         except Exception:
             pass
         return data
@@ -1719,7 +1750,7 @@ def _fetch_quick_picks() -> List[Dict[str, str]]:
     data, removed = _prune_stale_picks(local)
     if removed:
         try:
-            PICKS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            _write_json(PICKS_FILE, data)
         except Exception:
             pass
     return data
@@ -10029,7 +10060,7 @@ class App(ctk.CTk):
             "max_age_days": self._mirror_max_age_days(),
         }
         try:
-            MIRROR_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            _write_json(MIRROR_STATE_FILE, state)
         except Exception as e:
             self._log(f"Mirror: could not save state — {e}", "warn")
 
@@ -11574,7 +11605,7 @@ class App(ctk.CTk):
         """Write picks locally + best-effort remote sync, then re-render."""
         all_picks, _ = _prune_stale_picks(all_picks)  # never persist stale picks
         try:
-            PICKS_FILE.write_text(json.dumps(all_picks, indent=2), encoding="utf-8")
+            _write_json(PICKS_FILE, all_picks)
         except Exception:
             pass
         _push_picks_remote(all_picks)
@@ -12691,6 +12722,11 @@ class App(ctk.CTk):
             self._push_notification(
                 f"{task.symbol}: nothing to sell — {'; '.join(why) or 'no balances found'}",
                 "warning")
+            disputed = self._journal_disputes(task, resolved.missing)
+            if disputed:
+                self._log(f"Exits: {task.symbol} read as empty, but the journal says "
+                          f"we hold {'; '.join(disputed)}. Check the position at the "
+                          f"broker before believing the read.", "warn")
             return
 
         dlg = tk.Toplevel(self)
@@ -12882,7 +12918,7 @@ class App(ctk.CTk):
             "sold": list(self._autosell_sold)[-500:],
         }
         try:
-            AUTOSELL_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            _write_json(AUTOSELL_STATE_FILE, state)
         except OSError as exc:
             self._log(f"Auto-sell: could not save state — {exc}", "warn")
 
@@ -13558,6 +13594,66 @@ class App(ctk.CTk):
         self._log(f"Auto-sell: {task.symbol} put back — {why} "
                   f"(attempt {n} of {AUTOSELL_MAX_ATTEMPTS})", "meta")
 
+    def _journal_disputes(self, task, missing) -> List[str]:
+        """Brokers that reported no position where our own journal says we hold.
+
+        Every broker on a Sell-now task is there BECAUSE the journal shows open
+        shares at it, so "no position at Fidelity" is never just news — it is
+        the broker read and our own record contradicting each other. Usually the
+        record is the stale one: sold by hand, or a fraction swept to cash.
+
+        Once it was not. Fidelity re-cased a column in its positions export
+        ("Account Number" -> "Account number"), the parser dropped every row for
+        having no account, and the CSV came back as a clean, believable "(no
+        positions)". Ten accounts were holding SMTK. Auto-sell was told there
+        was nothing to sell, marked the play attempted, and moved on — and the
+        only sign anything was wrong was one line in the Activity log that read
+        exactly like a position sold by hand yesterday.
+
+        Naming the disagreement is what stops that being silent. It decides
+        nothing on its own: the caller hands the play back instead of claiming
+        it sold, and AUTOSELL_MAX_ATTEMPTS still ends the retrying.
+        """
+        out: List[str] = []
+        for broker in (missing or ()):
+            n = 0
+            for sym in {task.symbol, task.alert_symbol}:
+                try:
+                    n = max(n, len(_leg_open_accounts(broker, sym)))
+                except Exception:
+                    pass
+            if n:
+                out.append(f"{broker} ({n} account{'s' if n != 1 else ''})")
+        return out
+
+    def _journal_shortfalls(self, resolved) -> List[str]:
+        """Brokers where the read found FEWER accounts than the journal knows of.
+
+        The quiet half of the same bug. "No position at Fidelity" is loud enough
+        to notice once you know to look; three of ten accounts silently missing
+        from the export is not, because the order still goes out, the receipt
+        still says sold, and only the account count — which nobody reads — is
+        short. The seven sell, the three sit there, and the play drops off the
+        board as done.
+
+        A mismatch is NOT proof of a bug and never blocks the order: a fraction
+        settled to cash in some accounts, or a leg sold by hand, both land here
+        honestly. It is written to the Activity log so a systematic gap has
+        somewhere to show up before it costs another exit.
+        """
+        out: List[str] = []
+        for leg in resolved.legs:
+            open_n = 0
+            for sym in {resolved.task.symbol, resolved.task.alert_symbol}:
+                try:
+                    open_n = max(open_n, len(_leg_open_accounts(leg.broker, sym)))
+                except Exception:
+                    pass
+            if open_n > leg.accounts:
+                out.append(f"{leg.broker}: journal says {open_n} account(s) open, "
+                           f"the read found {leg.accounts}")
+        return out
+
     def _autosell_fire(self, resolved) -> None:
         """Place the resolved sell — the one step a human would have clicked."""
         task = resolved.task
@@ -13583,13 +13679,29 @@ class App(ctk.CTk):
             # A broker we could not READ is unknown, not empty — a dead session
             # or a timeout says nothing about whether the shares are there, so
             # hand it back and let the next pull look again. An empty position
-            # is a real answer (already sold by hand) and stays claimed.
+            # is a real answer (already sold by hand) and stays claimed —
+            # UNLESS the journal says otherwise, which is a disagreement and
+            # not an answer at all. See _journal_disputes.
+            disputed = self._journal_disputes(task, resolved.missing)
             if resolved.errors:
                 self._autosell_retry(task, f"couldn't read {', '.join(resolved.errors)}")
+            elif disputed:
+                self._autosell_retry(task, "the broker reported no position where "
+                                           "the journal says we hold")
             self._log(f"Auto-sell: {task.symbol} — nothing to sell "
                       f"({'; '.join(why) or 'no balances found'})", "warn")
-            self._push_notification(f"Auto-sell skipped {task.symbol}: "
-                                    f"{'; '.join(why) or 'nothing to sell'}", "warning")
+            if disputed:
+                self._log(f"Auto-sell: {task.symbol} — but the journal says we hold "
+                          f"{'; '.join(disputed)}. NOT marking it sold. Check the "
+                          f"position at the broker; if it really is gone, tick the "
+                          f"leg off on the Exits tab.", "warn")
+                self._push_notification(
+                    f"{task.symbol}: {', '.join(resolved.missing)} reported no "
+                    f"position but the journal says we hold — check it", "warning")
+            else:
+                self._push_notification(f"Auto-sell skipped {task.symbol}: "
+                                        f"{'; '.join(why) or 'nothing to sell'}",
+                                        "warning")
             self.after(1000, self._autosell_pump)
             return
 
@@ -13598,6 +13710,9 @@ class App(ctk.CTk):
             f"Auto-selling {task.symbol} — {resolved.describe()}"
             + (" [DRY RUN]" if dry else ""),
             "info" if dry else "success")
+        for short in self._journal_shortfalls(resolved):
+            self._log(f"Auto-sell: {task.symbol} — {short}. Selling what the read "
+                      f"found; check the rest at the broker.", "warn")
         try:
             self._exit_fire(resolved, dry_run=dry)
         except Exception as exc:                # noqa: BLE001
@@ -13947,31 +14062,128 @@ class App(ctk.CTk):
             # separator
             tk.Frame(card, bg=BORDER, height=1).pack(fill="x", padx=16)
 
-            # credential fields
+            # One block per login, however many there are — see
+            # _render_login_editor.
             fields_frame = tk.Frame(card, bg=BG_CARD)
             fields_frame.pack(fill="x", padx=16, pady=(10, 14))
 
-            entries: Dict[str, ttk.Entry] = {}
-            for i, key in enumerate(BROKER_ENV_KEYS.get(broker, [])):
-                tk.Label(fields_frame, text=key, bg=BG_CARD, fg=TEXT_SECONDARY,
-                         font=(FONT_MONO, 8)).grid(row=i, column=0, sticky="w", pady=3)
-                is_secret = any(s in key.lower() for s in ("password", "secret", "token"))
-                entry = ttk.Entry(fields_frame, width=32,
-                                  show="\u2022" if is_secret else "",
-                                  font=(FONT_MONO, 10))
-                entry.insert(0, _env(key))
-                entry.grid(row=i, column=1, sticky="w", padx=(12, 0), pady=3)
-                entries[key] = entry
-
-            save_frame = tk.Frame(fields_frame, bg=BG_CARD)
-            save_frame.grid(row=len(entries), column=1, sticky="w", padx=(12, 0), pady=(8, 0))
-            PillButton(save_frame, text="Save", bg_color=BG_CARD_ALT, hover_color=ACCENT,
-                       command=lambda b=broker: self._save_account_creds(b),
-                       width=80, height=28, font_size=9).pack(side="left")
-
             self._account_widgets[broker] = {
-                "dot": dot, "status": status_lbl, "entries": entries,
+                "dot": dot, "status": status_lbl, "box": fields_frame,
             }
+            self._render_login_editor(broker)
+
+    # ---- Logins: as many per broker as the household needs ----------------
+
+    def _login_model(self, broker: str) -> List[Dict[str, str]]:
+        """The rows the editor is currently showing for one broker.
+
+        Held in memory rather than re-read from .env on every keystroke, so a
+        half-typed second login survives pressing Add or Remove on another row.
+        """
+        ed = self._account_widgets[broker]
+        if ed.get("model") is None:
+            # A broker with nothing configured still gets one empty block to
+            # type into. Rendering only the Add button would put an extra click
+            # between a new user and the first credential they came here for.
+            ed["model"] = broker_logins.as_rows(broker) or [{}]
+        return ed["model"]
+
+    def _collect_login_rows(self, broker: str) -> None:
+        """Read the on-screen entries back into the model."""
+        ed = self._account_widgets[broker]
+        for row, widgets in zip(ed.get("model") or [], ed.get("rows") or []):
+            for name, entry in widgets.items():
+                row[name] = entry.get().strip()
+
+    def _render_login_editor(self, broker: str) -> None:
+        """Draw one block per login: its name, its fields, and a way out.
+
+        Rebuilt from scratch on every add and remove because the alternative —
+        patching a grid in place — is where off-by-one row indexes live, and an
+        off-by-one here would put one login's password in another login's box.
+        """
+        ed = self._account_widgets[broker]
+        box = ed["box"]
+        for child in box.winfo_children():
+            child.destroy()
+        ed["rows"] = []
+
+        schema = broker_logins.SCHEMAS.get(broker)
+        rows = self._login_model(broker)
+        if schema is None:
+            return
+
+        for n, row in enumerate(rows):
+            block = tk.Frame(box, bg=BG_CARD)
+            block.pack(fill="x", pady=(0, 10))
+
+            head = tk.Frame(block, bg=BG_CARD)
+            head.pack(fill="x")
+            idx = str(row.get("idx") or "").strip()
+            tk.Label(head, text=f"{schema.display} {idx or n + 1}", bg=BG_CARD,
+                     fg=TEXT_SECONDARY, font=(FONT_FAMILY, 9, "bold")).pack(side="left")
+            # The tag is what makes a second set of accounts legible: "myles"
+            # rather than "Public 4". It names the LOGIN only — it never
+            # reaches an account id, an order, or the journal.
+            tk.Label(head, text="  tag", bg=BG_CARD, fg=TEXT_MUTED,
+                     font=(FONT_MONO, 8)).pack(side="left", padx=(10, 4))
+            tag = ttk.Entry(head, width=16, font=(FONT_MONO, 9))
+            tag.insert(0, str(row.get("tag", "") or ""))
+            tag.pack(side="left")
+
+            if len(rows) > 1:
+                PillButton(head, text="Remove", bg_color=BG_CARD_ALT,
+                           hover_color=RED, fg_color=TEXT_MUTED,
+                           command=lambda b=broker, i=n: self._remove_login(b, i),
+                           width=70, height=24, font_size=8).pack(side="right")
+
+            grid = tk.Frame(block, bg=BG_CARD)
+            grid.pack(fill="x", pady=(4, 0))
+            widgets: Dict[str, Any] = {"tag": tag}
+            for r, f in enumerate(schema.fields):
+                tk.Label(grid, text=f.label, bg=BG_CARD, fg=TEXT_SECONDARY,
+                         font=(FONT_MONO, 8)).grid(row=r, column=0, sticky="w", pady=3)
+                entry = ttk.Entry(grid, width=32, show="\u2022" if f.secret else "",
+                                  font=(FONT_MONO, 10))
+                entry.insert(0, str(row.get(f.name, "") or ""))
+                entry.grid(row=r, column=1, sticky="w", padx=(12, 0), pady=3)
+                widgets[f.name] = entry
+            ed["rows"].append(widgets)
+
+        actions = tk.Frame(box, bg=BG_CARD)
+        actions.pack(fill="x", pady=(4, 0))
+        PillButton(actions, text="Save", bg_color=BG_CARD_ALT, hover_color=ACCENT,
+                   command=lambda b=broker: self._save_account_creds(b),
+                   width=80, height=28, font_size=9).pack(side="left")
+        PillButton(actions, text="+ Add login", bg_color=BG_CARD_ALT,
+                   hover_color=ACCENT, fg_color=TEXT_SECONDARY,
+                   command=lambda b=broker: self._add_login(b),
+                   width=100, height=28, font_size=9).pack(side="left", padx=(8, 0))
+        if len(rows) > 1:
+            tk.Label(actions, text=f"{len(rows)} logins", bg=BG_CARD,
+                     fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).pack(side="left", padx=(10, 0))
+
+    def _add_login(self, broker: str) -> None:
+        """One more set of credentials at this broker. No ceiling."""
+        self._collect_login_rows(broker)
+        self._login_model(broker).append({})
+        self._render_login_editor(broker)
+
+    def _remove_login(self, broker: str, n: int) -> None:
+        """Drop a login from the editor. Nothing is written until Save.
+
+        The number the remaining logins carry does NOT shift up: their account
+        labels are built from it and the journal nets buys against sells on
+        those labels, so closing the gap would orphan every open position at
+        every login below the one removed.
+        """
+        self._collect_login_rows(broker)
+        rows = self._login_model(broker)
+        if 0 <= n < len(rows):
+            gone = rows.pop(n)
+            self._log(f"Accounts: removed {broker} login "
+                      f"{gone.get('idx') or n + 1} — press Save to apply it")
+        self._render_login_editor(broker)
 
     def _refresh_linked_brokers(self) -> None:
         """Re-read .env into everything built from it.
@@ -14002,15 +14214,31 @@ class App(ctk.CTk):
                 text=f"OPERATIONAL   ·   {n} BROKER{plural.upper()} LINKED")
 
     def _save_account_creds(self, broker: str) -> None:
+        """Write every login at this broker, in one pass.
+
+        broker_logins.env_updates picks the keys: login 1 keeps the plain
+        CHASE_USERNAME it has always used, later logins take the numbered form,
+        and a removed login's variables are written EMPTY rather than merely
+        left out — a delete that only stops writing a key leaves the old
+        password on disk and the broker still logging in with it.
+        """
         widgets = self._account_widgets[broker]
-        updates = {}
-        for key, entry in widgets["entries"].items():
-            updates[key] = entry.get().strip()
+        self._collect_login_rows(broker)
+        updates = broker_logins.env_updates(broker, self._login_model(broker))
         _save_env_file(updates)
-        has = any(v for v in updates.values())
+
+        # Re-read from disk so the editor shows what was actually stored —
+        # including the index a brand-new login just landed on.
+        widgets["model"] = None
+        self._render_login_editor(broker)
+        n = broker_logins.login_count(broker)
+        has = n > 0
         widgets["dot"].set_color(GREEN if has else TEXT_MUTED)
-        widgets["status"].configure(text="saved", fg=GREEN)
-        self._log(f"Accounts: saved credentials for {broker}")
+        widgets["status"].configure(
+            text="saved" if n <= 1 else f"saved · {n} logins", fg=GREEN)
+        named = ", ".join(l.display for l in broker_logins.logins(broker))
+        self._log(f"Accounts: saved {n} login(s) for {broker}"
+                  + (f" — {named}" if named else ""))
         # The desk, the mirror card and both "N brokers linked" readouts are all
         # built from .env at startup, so without this a broker linked now stayed
         # invisible to every one of them until the app was restarted -- and

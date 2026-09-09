@@ -82,7 +82,11 @@ def _save(data: Dict[str, Any]) -> None:
     data["runs"] = data["runs"][-MAX_RUNS:]
     data["scans"] = data["scans"][-MAX_SCANS:]
     try:
-        _FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # Atomic, for the same reason trade_journal is: a half-written file
+        # reads as a mirror that has never run and re-buys everything.
+        tmp = _FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(_FILE)
     except OSError:
         pass          # a read-only disk must not take the trade down with it
 

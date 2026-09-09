@@ -8,6 +8,8 @@ EXE packaging: pip install pyinstaller && pyinstaller --onefile --windowed app.p
 from __future__ import annotations
 
 import json
+import shutil
+import os
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -57,7 +59,40 @@ def _load_shared() -> List[Dict[str, Any]]:
 
 
 def _save(trades: List[Dict[str, Any]]) -> None:
-    _FILE.write_text(json.dumps(trades, indent=2), encoding="utf-8")
+    """Write the journal so that a crash cannot cost it.
+
+    THIS FILE IS THE PRODUCT. Every share this tool ever bought or sold, the
+    cost basis under every open position, and the whole realized-P/L figure are
+    5,000-odd rows in one JSON file that nothing else can reconstruct — the
+    brokers do not know which of your shares came from here, and the cloud feed
+    carries plays, not your fills.
+
+    It used to be written with a plain `write_text`, which truncates the file
+    and then writes. Pull the plug, force-quit the GUI, or hit a full disk in
+    the middle of that and the journal is gone or half-written; the app would
+    then open on an empty portfolio and every open position would look closed.
+    etf_journal has written atomically since the day it was added, with a
+    docstring pointing at this function as the one that had not been fixed.
+
+    Temp file in the same directory (so `replace` is a rename inside one
+    filesystem, which is atomic), fsync before the rename so the bytes are
+    really on disk, and the previous good copy kept as `.bak` — the cheapest
+    possible insurance on the one file with no other source.
+    """
+    tmp = _FILE.with_suffix(".tmp")
+    payload = json.dumps(trades, indent=2)
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    if _FILE.exists():
+        try:
+            shutil.copy2(_FILE, _FILE.with_suffix(".bak"))
+        except OSError:
+            # A missing backup is worth a save; a failed save is not worth a
+            # backup. Never let this stop the write below.
+            pass
+    os.replace(tmp, _FILE)
     # Refresh rather than merely invalidate: we already hold the rows, and the
     # very next thing a writer does is re-render off them.
     _cache["rows"] = list(trades)
