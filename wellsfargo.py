@@ -14,6 +14,9 @@ from pathlib import Path
 from queue import Queue
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
+import sys
+
+import broker_logins
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow, find_browser_executable, cleanup_orphaned_chrome
 from modules._2fa_prompt import universal_2fa_prompt
 from modules import broker_logging as BLOG
@@ -139,7 +142,17 @@ def _root_dir() -> Path:
 
 
 def _sessions_dir() -> Path:
+    """This login's session directory — the browser profile and cookie jar.
+
+    Login 1 keeps the original path, so upgrading an install reuses the Chrome
+    profile that is already signed in rather than putting everyone through 2FA
+    again. Login 2 and up get their own directory: two logins sharing one
+    profile would fight over the same cookies and neither would stay signed in.
+    """
     d = _root_dir() / "sessions" / "wellsfargo"
+    suffix = broker_logins.active_suffix(BROKER)
+    if suffix:
+        d = d / f"login{suffix}"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -1891,21 +1904,22 @@ def _dispatch(command: str, *, timeout_s: int = 1200, **kwargs) -> BrokerOutput:
 # Broker interface (RSAMAXXED calls these)
 # =============================================================================
 
-def bootstrap(*args, **kwargs) -> BrokerOutput:
+def _bootstrap_one(*args, **kwargs) -> BrokerOutput:
     # compatibility shim; not required by user commands anymore
     return _dispatch("login", timeout_s=900, **kwargs)
 
 
-def get_holdings(*args, **kwargs) -> BrokerOutput:
+def _get_holdings_one(*args, **kwargs) -> BrokerOutput:
     # Legacy-style: positions triggers auth inline (profile persists)
     return _dispatch("positions", timeout_s=1200, **kwargs)
 
 
 def get_accounts(*args, **kwargs) -> BrokerOutput:
+    # Deliberately calls the WRAPPED get_holdings: one fan-out, not two.
     return get_holdings(*args, **kwargs)
 
 
-def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **kwargs) -> BrokerOutput:
+def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = False, **kwargs) -> BrokerOutput:
     return _dispatch("trade", timeout_s=1200, side=side, qty=qty, symbol=symbol, dry_run=dry_run, **kwargs)
 
 
@@ -1920,3 +1934,28 @@ def healthcheck(*args, **kwargs) -> BrokerOutput:
         accounts=[AccountOutput(account_id="Wells Fargo", ok=False, message="Probe unsupported. Run positions/trade to authenticate inline.")],
         message="Probe unsupported",
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-login entry points
+#
+# Everything above still handles exactly one login, which is how it has always
+# worked and how it is still tested. These wrappers run it once per configured
+# login — see broker_logins.fan_out. With one login configured they are a
+# straight pass-through, and each login gets its own browser profile and cookie
+# jar because _sessions_dir() below is per-login.
+# ---------------------------------------------------------------------------
+
+
+def bootstrap(*args, **kwargs) -> BrokerOutput:
+    return broker_logins.fan_out(BROKER, _MODULE, _bootstrap_one, *args, **kwargs)
+
+def get_holdings(*args, **kwargs) -> BrokerOutput:
+    return broker_logins.fan_out(BROKER, _MODULE, _get_holdings_one, *args, **kwargs)
+
+def execute_trade(**kwargs) -> BrokerOutput:
+    return broker_logins.fan_out(BROKER, _MODULE, _execute_trade_one, **kwargs)
+
+#: Handed to fan_out so it can reach BrokerOutput/AccountOutput and the
+#: _on_login_switch hook without importing this module back.
+_MODULE = sys.modules[__name__]

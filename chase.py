@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from modules import broker_logging as BLOG
+import broker_logins
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow, find_browser_executable, cleanup_orphaned_chrome
 from modules._2fa_prompt import universal_2fa_prompt
 from modules.brokers.chase.chase_normalizer import normalize as chase_normalize
@@ -55,6 +56,26 @@ API_EXECUTE_SELL = (
 
 # In-memory cookie cache (disk persists via cookies.json)
 _COOKIES: Optional[Dict[str, str]] = None
+
+#: In-memory session per login, parked here while another login is served.
+_SESSION_BY_LOGIN: Dict[int, Any] = {}
+_CUR_LOGIN: int = 1
+
+
+def _on_login_switch(idx: int) -> None:
+    """Park this login's cached session and pick up the incoming one.
+
+    broker_logins.fan_out calls this when it moves between logins. Without it
+    login 2 would be handed the cookies already held for login 1 and would
+    quietly read the first person's accounts twice.
+    """
+    global _COOKIES, _CUR_LOGIN
+    if idx == _CUR_LOGIN:
+        return
+    _SESSION_BY_LOGIN[_CUR_LOGIN] = (_COOKIES,)
+    _COOKIES = _SESSION_BY_LOGIN.get(idx, (None,))
+    _CUR_LOGIN = idx
+
 
 OtpProvider = Callable[[str, int], Optional[str]]
 _ET = ZoneInfo("America/New_York")
@@ -210,7 +231,17 @@ def _root_dir() -> Path:
 
 
 def _sessions_dir() -> Path:
+    """This login's session directory — the browser profile and cookie jar.
+
+    Login 1 keeps the original path, so upgrading an install reuses the Chrome
+    profile that is already signed in rather than putting everyone through 2FA
+    again. Login 2 and up get their own directory: two logins sharing one
+    profile would fight over the same cookies and neither would stay signed in.
+    """
     d = _root_dir() / "sessions" / "chase"
+    suffix = broker_logins.active_suffix(BROKER)
+    if suffix:
+        d = d / f"login{suffix}"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -944,7 +975,7 @@ def _write_dry_run_log(*, content: str) -> str:
 # =============================================================================
 # Public interface expected by RSAMAXXED
 # =============================================================================
-def bootstrap(*args, **kwargs) -> BrokerOutput:
+def _bootstrap_one(*args, **kwargs) -> BrokerOutput:
     """
     Kept for compatibility only. Not intended as a required bot-level flow.
     """
@@ -953,10 +984,11 @@ def bootstrap(*args, **kwargs) -> BrokerOutput:
 
 
 def get_accounts(*args, **kwargs) -> BrokerOutput:
+    # Deliberately calls the WRAPPED get_holdings: one fan-out, not two.
     return get_holdings(*args, **kwargs)
 
 
-def get_holdings(*args, **kwargs) -> BrokerOutput:
+def _get_holdings_one(*args, **kwargs) -> BrokerOutput:
     if _is_cancelled(kwargs):
         return BrokerOutput(
             broker=BROKER,
@@ -1205,7 +1237,7 @@ def get_holdings(*args, **kwargs) -> BrokerOutput:
     return chase_normalize(out1)
 
 
-def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **kwargs) -> BrokerOutput:
+def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = False, **kwargs) -> BrokerOutput:
     if _is_cancelled(kwargs):
         return BrokerOutput(
             broker=BROKER,
@@ -1674,3 +1706,28 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
         return chase_normalize(_attempt_trade())
 
     return chase_normalize(out1)
+
+
+# ---------------------------------------------------------------------------
+# Multi-login entry points
+#
+# Everything above still handles exactly one login, which is how it has always
+# worked and how it is still tested. These wrappers run it once per configured
+# login — see broker_logins.fan_out. With one login configured they are a
+# straight pass-through, and each login gets its own browser profile and cookie
+# jar because _sessions_dir() below is per-login.
+# ---------------------------------------------------------------------------
+
+
+def bootstrap(*args, **kwargs) -> BrokerOutput:
+    return broker_logins.fan_out(BROKER, _MODULE, _bootstrap_one, *args, **kwargs)
+
+def get_holdings(*args, **kwargs) -> BrokerOutput:
+    return broker_logins.fan_out(BROKER, _MODULE, _get_holdings_one, *args, **kwargs)
+
+def execute_trade(**kwargs) -> BrokerOutput:
+    return broker_logins.fan_out(BROKER, _MODULE, _execute_trade_one, **kwargs)
+
+#: Handed to fan_out so it can reach BrokerOutput/AccountOutput and the
+#: _on_login_switch hook without importing this module back.
+_MODULE = sys.modules[__name__]

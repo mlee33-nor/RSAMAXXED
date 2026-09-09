@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import broker_logins
 from modules.broker_logging import log_exception, write_log
 from modules.outputs import AccountOutput, BrokerOutput, HoldingRow
 
@@ -87,19 +88,23 @@ def _as_float(v: Any) -> Optional[float]:
 
 
 def _load_public_secrets() -> List[Tuple[int, str]]:
+    """Every configured Public login, as (idx, token), skipping blanks.
+
+    Numbered tokens: PUBLIC_SECRET_TOKEN_1, _2, _3, _4, ...
+
+    THE COUNT USED TO BE THREE, spelled `for i in (1, 2, 3)`, and a household
+    running two people's accounts hit that ceiling immediately — a fourth token
+    could be saved and was then read by nothing, which looks exactly like a
+    broken login. broker_logins scans the whole range instead.
+
+    It also PRESERVES THE INDEX rather than closing gaps: a blank token 2 with
+    a token 3 set still yields 3, because Public builds its account labels out
+    of this number ("Public 3 BROKERAGE (1234)") and that string is the key
+    trades.json nets buys against sells on. Renumbering here would orphan every
+    open position at the renumbered login.
     """
-    Loads numbered tokens:
-      PUBLIC_SECRET_TOKEN_1
-      PUBLIC_SECRET_TOKEN_2
-      PUBLIC_SECRET_TOKEN_3
-    Returns list of (idx, token) skipping blanks.
-    """
-    out: List[Tuple[int, str]] = []
-    for i in (1, 2, 3):
-        s = _env(f"PUBLIC_SECRET_TOKEN_{i}")
-        if s:
-            out.append((i, s))
-    return out
+    return [(login.idx, login.get("token"))
+            for login in broker_logins.logins("public")]
 
 
 def _state_from_counts(ok_ct: int, fail_ct: int) -> str:
@@ -264,7 +269,7 @@ def _ensure_clients() -> Tuple[bool, str, List[Tuple[int, _PublicClient, List[Di
     """
     pairs = _load_public_secrets()
     if not pairs:
-        return False, "Missing PUBLIC_SECRET_TOKEN_1/2/3 in credentials/brokers.env", []
+        return False, "Missing PUBLIC_SECRET_TOKEN_1 (and _2, _3, ... for more logins)", []
 
     ready: List[Tuple[int, _PublicClient, List[Dict[str, Any]]]] = []
     last_err = ""

@@ -19,7 +19,7 @@ import pathlib
 import re
 import sys
 import tempfile
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -188,6 +188,13 @@ def test_a_logged_out_visitor_is_told_the_board_exists(anon):
 
 # ------------------------------------------------------- what the board shows
 
+#: The board only renders exits inside playsfeed.EXIT_WINDOW_DAYS. Pinning a
+#: literal date here made these tests rot: they passed when written and started
+#: failing the day that date aged out, which is a false alarm arriving on a
+#: calendar rather than on a commit. Relative to today, they test the rule.
+RECENT_SELL_DATE = (date.today() - timedelta(days=5)).isoformat()
+
+
 @pytest.fixture()
 def board(anon):
     """Publish one alert of each outcome, then open the board."""
@@ -204,7 +211,7 @@ def board(anon):
              "alert_date": "2026-07-03", "last_buy_date": "2026-07-05"},
         ],
         "sells": [
-            {"source_id": "t:s1", "symbol": "AGAE", "sell_date": "2026-07-20",
+            {"source_id": "t:s1", "symbol": "AGAE", "sell_date": RECENT_SELL_DATE,
              "exit_price": 6.1, "proceeds_low": 47.5, "proceeds_high": 61.0,
              "legs": [{"broker": "Robinhood", "accounts_low": 3, "accounts_high": 3}],
              "note": "sold across every account"},
@@ -282,7 +289,10 @@ def test_the_dashboard_reads_before_javascript_runs(board):
     blocked still gets real figures and a table."""
     flat = re.sub(r"\s+", " ", board)
     assert "Theoretical profit" in flat
-    assert "1 account at each broker" in flat
+    # The wording of this line has changed once already; what matters is that
+    # the basis is SERVER-rendered, so a reader with JS blocked is never shown
+    # a profit figure with no stated basis.
+    assert 'id="basis-note"' in flat
     assert 'id="monthly-table"' in board          # the table view twin
     assert "never a forecast" in flat             # and it says what it isn't
 
@@ -360,7 +370,7 @@ def test_exits_say_which_symbol_and_day_they_closed(board):
     bought — and the date is what stops it flagging the ticker's PREVIOUS
     reverse split, which you never held."""
     assert 'data-sym="AGAE"' in board
-    assert 'data-sold="2026-07-20"' in board
+    assert f'data-sold="{RECENT_SELL_DATE}"' in board
 
 
 def test_the_open_list_is_addressable_apart_from_the_closed_one(board):

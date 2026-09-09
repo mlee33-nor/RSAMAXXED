@@ -7,6 +7,9 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import uuid
 
+import sys
+
+import broker_logins
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow
 from modules._2fa_prompt import universal_2fa_prompt
 
@@ -15,6 +18,28 @@ BROKER = "bbae"
 _CLIENT: Any = None
 _ACCOUNT_LABEL: str = ""
 _ACCOUNT_NUMBER: str = ""
+
+#: One signed-in client per login, parked here while another login is served.
+_SESSION_BY_LOGIN: Dict[int, Any] = {}
+_CUR_LOGIN: int = 1
+
+
+def _on_login_switch(idx: int) -> None:
+    """Park the current login's session and pick up the incoming one.
+
+    broker_logins.fan_out calls this when it moves between logins. Without it
+    the in-memory check at the top of _ensure_session would hand login 2 the
+    client already signed in as login 1 — the fan-out would read the first set
+    of accounts twice and never touch the second.
+    """
+    global _CLIENT, _ACCOUNT_LABEL, _ACCOUNT_NUMBER, _CUR_LOGIN
+    if idx == _CUR_LOGIN:
+        return
+    _SESSION_BY_LOGIN[_CUR_LOGIN] = (_CLIENT, _ACCOUNT_LABEL, _ACCOUNT_NUMBER)
+    _CLIENT, _ACCOUNT_LABEL, _ACCOUNT_NUMBER = _SESSION_BY_LOGIN.get(
+        idx, (None, "", ""))
+    _CUR_LOGIN = idx
+
 
 
 # =============================================================================
@@ -107,7 +132,17 @@ def _root_dir() -> Path:
 
 
 def _sessions_dir() -> Path:
+    """This login's session directory.
+
+    Login 1 keeps the original path, so upgrading an install reuses the pkl
+    that is already there rather than asking for a fresh OTP. Login 2 and up
+    get their own directory — two logins sharing one session file would each
+    overwrite the other's.
+    """
     d = _root_dir() / "sessions" / "bbae"
+    suffix = broker_logins.active_suffix(BROKER)
+    if suffix:
+        d = d / f"login{suffix}"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -288,7 +323,7 @@ def _ensure_session() -> Tuple[bool, str]:
         return False, f"Login failed: {e}"
 
 
-def bootstrap(*args, **kwargs):
+def _bootstrap_one(*args, **kwargs):
     """
     Kept for compatibility, but NOT required.
     It simply forces an inline session ensure.
@@ -309,7 +344,7 @@ def bootstrap(*args, **kwargs):
     )
 
 
-def get_holdings(*args, **kwargs) -> BrokerOutput:
+def _get_holdings_one(*args, **kwargs) -> BrokerOutput:
     ok, why = _ensure_session()
     if not ok:
         return BrokerOutput(
@@ -408,6 +443,7 @@ def get_holdings(*args, **kwargs) -> BrokerOutput:
 
 
 def get_accounts(*args, **kwargs) -> BrokerOutput:
+    # Deliberately calls the WRAPPED get_holdings: one fan-out, not two.
     return get_holdings(*args, **kwargs)
 
 
@@ -434,7 +470,7 @@ def _ticket_lines(**kv) -> str:
     return "\n".join(lines)
 
 
-def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **kwargs) -> BrokerOutput:
+def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = False, **kwargs) -> BrokerOutput:
     ok, why = _ensure_session()
     if not ok:
         return BrokerOutput(
@@ -654,7 +690,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
         )
 
 
-def healthcheck(*args, **kwargs) -> BrokerOutput:
+def _healthcheck_one(*args, **kwargs) -> BrokerOutput:
     """
     Deprecated in orchestration (no longer used).
     Keep as non-interactive probe for manual/testing usage.
@@ -673,3 +709,34 @@ def healthcheck(*args, **kwargs) -> BrokerOutput:
         accounts=[AccountOutput(account_id="BBAE", ok=False, message=why)],
         message=why,
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-login entry points
+#
+# The functions above still know about exactly one login, which is how they
+# have always worked and how they are still tested. These wrappers run them
+# once per configured login — see broker_logins.fan_out. With a single login
+# configured they are a straight pass-through, so nothing about an existing
+# install changes.
+# ---------------------------------------------------------------------------
+
+def bootstrap(*args, **kwargs):
+    return broker_logins.fan_out(BROKER, _MODULE, _bootstrap_one, *args, **kwargs)
+
+
+def get_holdings(*args, **kwargs) -> BrokerOutput:
+    return broker_logins.fan_out(BROKER, _MODULE, _get_holdings_one, *args, **kwargs)
+
+
+def execute_trade(**kwargs) -> BrokerOutput:
+    return broker_logins.fan_out(BROKER, _MODULE, _execute_trade_one, **kwargs)
+
+
+def healthcheck(*args, **kwargs) -> BrokerOutput:
+    return broker_logins.fan_out(BROKER, _MODULE, _healthcheck_one, *args, **kwargs)
+
+
+#: Handed to fan_out so it can reach BrokerOutput/AccountOutput and the
+#: _on_login_switch hook without importing this module back.
+_MODULE = sys.modules[__name__]

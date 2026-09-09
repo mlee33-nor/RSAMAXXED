@@ -74,3 +74,8 @@ trades.json.bak*
 # Which closed plays the user has ticked off the board. Display state, but it
 # is a list of tickers they traded — same class as picks_done.json above.
 sells_confirmed.json
+
+# Atomic writes stage through <file>.tmp beside the real file and rename
+# over it. A crash between the two leaves one behind; it is never content
+# anyone should commit.
+*.tmp
