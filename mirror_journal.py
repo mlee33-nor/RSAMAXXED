@@ -46,6 +46,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from modules import atomic
+
 _FILE = Path(__file__).resolve().parent / "mirror_runs.json"
 _lock = threading.RLock()
 
@@ -86,7 +88,7 @@ def _save(data: Dict[str, Any]) -> None:
         # reads as a mirror that has never run and re-buys everything.
         tmp = _FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        tmp.replace(_FILE)
+        atomic.replace(tmp, _FILE)
     except OSError:
         pass          # a read-only disk must not take the trade down with it
 

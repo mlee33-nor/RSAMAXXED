@@ -35,6 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from modules import atomic
+
 ROOT_DIR = Path(__file__).resolve().parent
 ETF_FILE = ROOT_DIR / "etf_trades.json"
 
@@ -69,7 +71,7 @@ def _save(trades: List[Dict[str, Any]]) -> None:
     try:
         tmp = ETF_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(trades, indent=2), encoding="utf-8")
-        tmp.replace(ETF_FILE)
+        atomic.replace(tmp, ETF_FILE)
     except OSError:
         pass
 

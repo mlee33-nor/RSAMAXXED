@@ -34,6 +34,7 @@ from dotenv import load_dotenv
 
 from modules.outputs import BrokerOutput, log_event
 from modules import _2fa_prompt
+from modules import atomic
 import balances
 import discord_feed
 import etf_journal
@@ -632,7 +633,7 @@ def _write_json(path: Path, data: Any, *, indent: int = 2) -> None:
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=indent), encoding="utf-8")
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
 
 
 def _save_env_file(updates: Dict[str, str]) -> None:
@@ -7734,6 +7735,7 @@ class App(ctk.CTk):
 
             ok_accounts = 0
             fail_accounts = 0
+            unjournaled: List[str] = []
             for acct in output.accounts:
                 status = "OK" if acct.ok else "FAIL"
                 lines.append(f"  [{status}] {acct.account_id}: {acct.message}")
@@ -7764,27 +7766,46 @@ class App(ctk.CTk):
                     # trades.json, and trades.json is what cloud_sync uploads
                     # to the public Plays board -- see etf_journal's module
                     # docstring. Tested in tests/test_etf_journal.py.
-                    if batch.get("origin") == "etf":
-                        etf_journal.record_trade(
-                            broker=broker, account_id=acct.account_id,
-                            side=side, symbol=symbol, qty=float(qty),
-                            fill_price=fill_price,
-                            order_id=getattr(acct, "order_id", None),
-                            price_source=etf_journal.PRICE_QUOTE,
-                            exposure=str(batch.get("exposure") or ""),
-                            plan_id=str(batch.get("plan_id") or ""),
-                        )
-                    else:
-                        trade_journal.record_trade(
-                            broker=broker, account_id=acct.account_id,
-                            side=side, symbol=symbol, qty=float(qty),
-                            fill_price=fill_price,
-                            order_id=getattr(acct, "order_id", None),
-                            price_source=trade_journal.PRICE_QUOTE,
-                        )
+                    #
+                    # The order is already placed by the time we get here, so a
+                    # journal write that fails must cost one row, loudly -- not
+                    # escape this loop. It used to: a WinError 5 on one account
+                    # of a 21-account Public buy dropped the rows for every
+                    # fill after it and reported the whole broker as failed.
+                    try:
+                        if batch.get("origin") == "etf":
+                            etf_journal.record_trade(
+                                broker=broker, account_id=acct.account_id,
+                                side=side, symbol=symbol, qty=float(qty),
+                                fill_price=fill_price,
+                                order_id=getattr(acct, "order_id", None),
+                                price_source=etf_journal.PRICE_QUOTE,
+                                exposure=str(batch.get("exposure") or ""),
+                                plan_id=str(batch.get("plan_id") or ""),
+                            )
+                        else:
+                            trade_journal.record_trade(
+                                broker=broker, account_id=acct.account_id,
+                                side=side, symbol=symbol, qty=float(qty),
+                                fill_price=fill_price,
+                                order_id=getattr(acct, "order_id", None),
+                                price_source=trade_journal.PRICE_QUOTE,
+                            )
+                    except Exception as jerr:
+                        unjournaled.append(
+                            f"{acct.account_id} (order "
+                            f"{getattr(acct, 'order_id', None) or '?'}): {jerr}")
 
             if fill_price is not None:
                 lines.append(f"  Quoted price: ${fill_price:.2f}")
+            if unjournaled:
+                lines.append(f"  !! {len(unjournaled)} filled order(s) NOT saved to "
+                             f"the journal - add them by hand:")
+                lines.extend(f"     {u}" for u in unjournaled)
+                _msg = (f"{broker.capitalize()} {symbol}: {len(unjournaled)} filled "
+                        f"order(s) could not be saved to the journal - see Activity")
+                self.after(0, lambda m=_msg: self._push_notification(m, "error"))
+                self.after(0, lambda m=_msg: self._log(m, "error"))
 
             # Persist the full per-account result (fills AND failures with their
             # reason) so "which accounts didn't buy, and why" is always
@@ -7800,6 +7821,8 @@ class App(ctk.CTk):
                     for acct in output.accounts:
                         _fh.write(f"  [{'OK' if acct.ok else 'FAIL'}] "
                                   f"{acct.account_id}: {acct.message}\n")
+                    for u in unjournaled:
+                        _fh.write(f"  [NOT JOURNALED] {u}\n")
                     _fh.write("\n")
             except Exception:
                 pass

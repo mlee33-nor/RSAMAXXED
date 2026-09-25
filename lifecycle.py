@@ -38,6 +38,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
+from modules import atomic
+
 import discord_feed
 import rsa_feed
 import trade_journal
@@ -86,7 +88,7 @@ def save_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
     try:
         tmp = p.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        tmp.replace(p)
+        atomic.replace(tmp, p)
     except OSError:
         pass
 
