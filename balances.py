@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from modules import atomic
+
 ROOT_DIR = Path(__file__).resolve().parent
 BALANCES_FILE = ROOT_DIR / "balances.json"
 
@@ -110,7 +112,7 @@ def save(state: Dict[str, Any]) -> None:
     try:
         tmp = BALANCES_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        tmp.replace(BALANCES_FILE)
+        atomic.replace(tmp, BALANCES_FILE)
     except OSError:
         pass
 

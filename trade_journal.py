@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from modules import atomic
+
 _FILE = Path(__file__).resolve().parent / "trades.json"
 _lock = threading.Lock()
 
@@ -92,7 +94,9 @@ def _save(trades: List[Dict[str, Any]]) -> None:
             # A missing backup is worth a save; a failed save is not worth a
             # backup. Never let this stop the write below.
             pass
-    os.replace(tmp, _FILE)
+    # atomic.replace, not os.replace: Google Drive syncs this folder and holds
+    # the journal open mid-upload, which a bare rename reports as WinError 5.
+    atomic.replace(tmp, _FILE)
     # Refresh rather than merely invalidate: we already hold the rows, and the
     # very next thing a writer does is re-render off them.
     _cache["rows"] = list(trades)

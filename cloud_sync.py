@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from modules import atomic
+
 import requests
 
 # Where the hosted dashboard lives. Override with RSAMAXXED_CLOUD_URL for local
@@ -120,7 +122,7 @@ def _read_state() -> dict[str, Any]:
 def _write_state(state: dict[str, Any]) -> None:
     tmp = _STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(_STATE_FILE)  # atomic; a crash mid-write can't corrupt the token
+    atomic.replace(tmp, _STATE_FILE)  # atomic; a crash mid-write can't corrupt the token
 
 
 class CloudSync:

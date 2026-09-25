@@ -32,6 +32,8 @@ import json
 import sys
 from pathlib import Path
 
+from modules import atomic
+
 ROOT = Path(__file__).resolve().parent
 ARCHIVE = ROOT / "feed_archive.json"
 
@@ -70,7 +72,7 @@ def _load() -> dict:
 def _save(store: dict) -> None:
     tmp = ARCHIVE.with_suffix(".tmp")
     tmp.write_text(json.dumps(store, indent=1, sort_keys=True), encoding="utf-8")
-    tmp.replace(ARCHIVE)          # atomic; a crash mid-write can't truncate it
+    atomic.replace(tmp, ARCHIVE)          # atomic; a crash mid-write can't truncate it
 
 
 def _key(row: dict, stream: str) -> str:
