@@ -2,7 +2,7 @@
 """Pull the RSA alert channels and publish them to the cloud feed. Headless.
 
 This is the daily job that feeds every subscriber. It does the same thing the
-desktop app's Feed auto-import does, minus the GUI — so plays keep arriving
+desktop app's auto-import does, minus the GUI — so plays keep arriving
 when the operator's machine is asleep, which was the single biggest reason a
 customer would open the terminal to an empty Quick Picks list.
 
@@ -98,7 +98,7 @@ def _warn_unparsed(sell_msgs: list, buy_msgs: list) -> None:
     broker with no account count, two tickers sharing one total, an alert typed
     out instead of sent as an embed. Each one cost real money off the board, and
     each stayed invisible until somebody happened to compare a month against
-    Feed by hand.
+    the channel by hand.
 
     The formats will drift again. This cannot parse the next one, but it can
     refuse to be quiet about it — which turns "June looks low" into a line in
@@ -176,13 +176,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="parse and report, but publish nothing")
     args = ap.parse_args(argv)
 
-    # Above 100 we page instead of clamping. Feed rejects a single request
+    # Above 100 we page instead of clamping. The API rejects a single request
     # over 100, but the whole point of a big --limit is repairing history: a
     # parser fix only reaches messages that get read again, so a cap of 100 left
     # everything older permanently wrong. See feed_client.fetch_back.
     if args.limit > 100:
         print(f"reading back {args.limit} messages per channel (paged)")
-    # Feed rejects a limit above 100 outright. Clamping (loudly) beats
+    # The API rejects a limit above 100 outright. Clamping (loudly) beats
     # handing back a 400 that reads like the channel is broken — and a run that
     # silently fetched nothing is exactly how a day's alerts go missing.
     args.limit = max(1, args.limit)
@@ -227,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     batch = rsa_feed.parse_messages(buy_msgs, sell_msgs)
 
     # The TRACK board is what tells a subscriber whether their own position
-    # resolved, and they cannot read it themselves — it needs a Feed token
+    # resolved, and they cannot read it themselves — it needs a feed token
     # with channel access. Publishing it is the only way they ever see it.
     lifecycle = []
     track_cid, track_err = _resolve(token, _channel("lifecycle"), server, "TRACK")

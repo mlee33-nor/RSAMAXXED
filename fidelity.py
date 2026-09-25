@@ -26,6 +26,7 @@ from zendriver import cdp, KeyPressEvent
 from zendriver.core.keys import KeyEvents
 
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow, find_browser_executable, cleanup_orphaned_chrome
+from modules import quiet
 from modules import _2fa_prompt
 from modules.ui_keys import runtime_profile
 
@@ -93,7 +94,8 @@ def cleanup_stale_startup() -> Dict[str, int]:
     # Kill only processes that clearly reference the Fidelity automation profile path.
     try:
         # Use a broadly portable ps invocation and parse PID + command tail.
-        out = subprocess.check_output(["ps", "aux"], text=True, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(["ps", "aux"], text=True, stderr=subprocess.DEVNULL,
+                                     **quiet.no_window_kwargs())
         for line in (out or "").splitlines()[1:]:
             s = line.rstrip()
             if not s:
@@ -834,6 +836,10 @@ async def _start_browser_for_login(idx_1based: int, *, notify: Optional[NotifyFn
             "--no-first-run",
         ]
 
+    # Headed (debug / dry-run) still runs in the background: --start-maximized
+    # is dropped and the window is parked off the visible desktop.
+    browser_args = quiet.browser_args(browser_args, headless=is_headless)
+
     # Kill any orphaned Chrome still using this profile
     cleanup_orphaned_chrome(profile)
 
@@ -841,6 +847,8 @@ async def _start_browser_for_login(idx_1based: int, *, notify: Optional[NotifyFn
 
     try:
         browser = await uc.start(browser_args=browser_args, user_data_dir=str(profile), browser_executable_path=find_browser_executable())
+        if not is_headless:
+            quiet.tame_windows(browser)
         setattr(browser, "_fidelity_lock_path", str(lock))
         setattr(browser, "_fidelity_idx", idx_1based)
 

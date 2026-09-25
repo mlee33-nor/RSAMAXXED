@@ -16,6 +16,7 @@ import pytz
 
 import broker_logins
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow, display_path, find_browser_executable, cleanup_orphaned_chrome
+from modules import quiet
 from modules._2fa_prompt import universal_2fa_prompt
 from modules import broker_logging as BLOG
 
@@ -1246,8 +1247,14 @@ async def _async_login(
     if headless:
         browser_args.insert(0, "--headless=new")
 
+    # The headed retry (a human check cannot be cleared headless) is parked
+    # off-screen so it never lands on top of what the user is doing.
+    browser_args = quiet.browser_args(browser_args, headless=headless)
+
     cleanup_orphaned_chrome(_profile_dir())
     browser = await uc.start(browser_args=browser_args, user_data_dir=str(_profile_dir()), browser_executable_path=find_browser_executable())
+    if not headless:
+        quiet.tame_windows(browser)
     try:
         page = browser.tabs[0] if browser.tabs else await browser()
 

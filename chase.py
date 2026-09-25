@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from modules import broker_logging as BLOG
 import broker_logins
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow, find_browser_executable, cleanup_orphaned_chrome
+from modules import quiet
 from modules._2fa_prompt import universal_2fa_prompt
 from modules.brokers.chase.chase_normalizer import normalize as chase_normalize
 
@@ -695,8 +696,14 @@ async def _async_login(
     if headless:
         browser_args.insert(0, "--headless=new")
 
+    # A headed retry (headless login hit 2FA) must still stay off the user's
+    # desktop -- parked off-screen here, taskbar button dropped below.
+    browser_args = quiet.browser_args(browser_args, headless=headless)
+
     cleanup_orphaned_chrome(_profile_dir())
     browser = await uc.start(browser_args=browser_args, user_data_dir=str(_profile_dir()), browser_executable_path=find_browser_executable())
+    if not headless:
+        quiet.tame_windows(browser)
     try:
         page = browser.tabs[0] if browser.tabs else await browser()
         _stage("browser_ready", f"headless={headless} profile={_profile_dir()}")

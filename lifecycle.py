@@ -577,7 +577,7 @@ def fetch_cloud() -> tuple[list[LifecycleRow], str]:
     """The board from the cloud feed. (rows, error).
 
     The route that works for an actual customer, and it needs no account.
-    Reading TRACK off Feed needs a personal user token with access to a
+    Reading TRACK off the alert channels needs a personal user token with a
     private channel, which is something only the operator has — everyone else
     gets the board from the cloud, linked or not.
     """
@@ -617,11 +617,11 @@ def pull(channel_id: str = "", token: str = "",
 
     Source order depends on which machine this is, and it has to:
 
-      OPERATOR (a TRACK channel is configured) reads Feed first. Feed is
+      OPERATOR (a TRACK channel is configured) reads the channel first. It is
         the source of truth for the board, and this machine is the one that
         publishes it. Reading the cloud first here was a feedback loop — we'd
         read back what we last published, find rows, never fall through to
-        Feed, and the board would freeze at whatever it said the first time.
+        the channel, and the board would freeze at whatever it first said.
       EVERYONE ELSE reads the cloud, which is the only source they have. There
         is no account needed for it; see fetch_cloud.
 

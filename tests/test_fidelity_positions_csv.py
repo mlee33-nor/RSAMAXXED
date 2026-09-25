@@ -184,6 +184,7 @@ class Auto:
     _autosell_key = A.App._autosell_key
     _journal_disputes = A.App._journal_disputes
     _journal_shortfalls = A.App._journal_shortfalls
+    _queue_extend = A.App._queue_extend
 
     def __init__(self):
         self._queue_busy = True
@@ -197,6 +198,9 @@ class Auto:
 
     def after(self, ms, cb=None, *a):
         return "after#1"
+
+    def _pump_later(self, ms):
+        pass
 
     def _log(self, msg, *_a, **_k):
         self.logs.append(msg)

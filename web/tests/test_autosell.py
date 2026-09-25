@@ -156,7 +156,8 @@ class _App:
         self._frac_btn = _Button()
 
         cls = desktop_app.App
-        for name in ("_autosell_consider", "_autosell_key", "_save_autosell_state"):
+        for name in ("_autosell_consider", "_autosell_key", "_save_autosell_state",
+                     "_queue_extend", "_pump_later", "_pump_tick"):
             setattr(self, name, types.MethodType(getattr(cls, name), self))
 
     # the bits _autosell_consider leans on
@@ -181,6 +182,9 @@ class _App:
 
     def after(self, ms, fn=None):
         return None
+
+    def after_cancel(self, _id):
+        pass
 
 
 @pytest.fixture()

@@ -63,6 +63,7 @@ class Sweeps:
     _fractional_sweep = A.App._fractional_sweep
     _autosell_unclaim = A.App._autosell_unclaim
     _autosell_key = A.App._autosell_key
+    _queue_extend = A.App._queue_extend
 
     def __init__(self, exits=(), fracs=(), rows=("board",), sold=()):
         self._exits = list(exits)
