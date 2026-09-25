@@ -18,6 +18,7 @@ import sys
 
 import broker_logins
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow, find_browser_executable, cleanup_orphaned_chrome
+from modules import quiet
 from modules._2fa_prompt import universal_2fa_prompt
 from modules import broker_logging as BLOG
 
@@ -494,22 +495,13 @@ async def _start_browser(*, headless: Optional[bool] = None):
             "--disable-default-apps",
             "--disable-extensions",
         ]
-        if _offscreen():
-            # Headed but parked far off the visible desktop so WF runs in the
-            # background. An off-screen window still renders fully (a minimized
-            # one gets throttled by Chrome and breaks automation timing); CDP
-            # mouse clicks use viewport coords, so they are unaffected by the
-            # window position.
-            browser_args.extend([
-                "--window-position=-32000,-32000",
-                "--window-size=1400,1000",
-                *common_headed,
-            ])
-        else:
-            browser_args.extend([
-                "--start-maximized",
-                *common_headed,
-            ])
+        # Headed but parked far off the visible desktop (see modules/quiet.py)
+        # so WF runs in the background. An off-screen window still renders fully
+        # (a minimized or hidden one gets throttled by Chrome and breaks
+        # automation timing); CDP mouse clicks use viewport coords, so they are
+        # unaffected by the window position. WELLSFARGO_OFFSCREEN=false puts the
+        # window back on screen for debugging.
+        browser_args.extend(common_headed if _offscreen() else ["--start-maximized", *common_headed])
 
     browser_args.extend([
         "--force-device-scale-factor=0.8",
@@ -517,8 +509,15 @@ async def _start_browser(*, headless: Optional[bool] = None):
         "--disable-gpu",
     ])
 
+    # _offscreen() is the WF-specific "keep it out of sight" switch; quiet
+    # applies the same parking to every broker that has to run headed.
+    browser_args = quiet.browser_args(browser_args, headless=use_headless,
+                                      background=_offscreen())
+
     try:
         browser = await uc.start(browser_args=browser_args, user_data_dir=str(profile), browser_executable_path=find_browser_executable())
+        if not use_headless and _offscreen():
+            quiet.tame_windows(browser)
         setattr(browser, "_wf_lock_path", str(lock))
         page = browser.tabs[0] if getattr(browser, "tabs", None) else await browser()
         return browser, page

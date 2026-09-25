@@ -51,7 +51,7 @@ MAX_HOLDING_ROWS_PER_SNAPSHOT = 2000
 SNAPSHOTS_RETAINED_PER_USER = 30
 
 # The shared secret that lets ONE machine — the operator's, the only one with
-# Discord access — publish the play feed. Customers never hold this and never
+# Upstream access — publish the play feed. Customers never hold this and never
 # need it: they read the feed, they don't write it.
 #
 # Unset means the ingest endpoint refuses everything. That is the correct
@@ -93,7 +93,7 @@ if not os.path.exists(_default_picks):
 PICKS_FILE = os.environ.get("PICKS_FILE", _default_picks).strip()
 
 # How often the web app re-reads PICKS_FILE in the background, so the free feed
-# tracks the desktop app's daily Discord pull even when nobody opens the page.
+# tracks the desktop app's daily feed pull even when nobody opens the page.
 # Hourly by default (the import is idempotent and cheap, so a frequent poll costs
 # almost nothing and keeps it near-live); set to 0 to disable the loop.
 try:

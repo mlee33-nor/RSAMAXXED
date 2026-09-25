@@ -11,7 +11,8 @@ import sys
 
 import broker_logins
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow
-from modules._2fa_prompt import universal_2fa_prompt
+from modules._2fa_prompt import request_text, universal_2fa_prompt
+from modules import quiet
 
 BROKER = "dspac"
 
@@ -155,36 +156,32 @@ def _sessions_dir() -> Path:
 
 
 def _local_otp_prompt(broker: str, prompt: str) -> Optional[str]:
-    """Prompt for OTP code in the terminal."""
-    try:
-        code = input(f"{prompt} ").strip()
-        digits = "".join(c for c in code if c.isdigit())
-        return digits if digits else None
-    except (EOFError, KeyboardInterrupt):
-        return None
+    """Ask for an OTP code through whoever is driving the app.
+
+    request_text goes to the GUI's modal when one is registered and falls back
+    to input() for runner.py. It used to call input() directly, which under
+    pythonw (no stdin, no console) raised instead of asking anyone.
+    """
+    code = request_text(broker, prompt) or ""
+    digits = "".join(c for c in code if c.isdigit())
+    return digits if digits else None
 
 
 def _local_captcha(broker: str, img) -> Optional[str]:
-    """Save CAPTCHA image to disk and prompt for code in terminal."""
-    import subprocess, sys
+    """Save the CAPTCHA image, show it, and ask what it says.
+
+    quiet.open_path instead of `start` through the shell: cmd.exe is a console
+    program, so the old route flashed a black window just to open a picture.
+    The image itself has to be visible -- it is the one thing here the user is
+    meant to look at.
+    """
     sess_dir = _sessions_dir()
     path = sess_dir / "captcha.png"
     img.save(str(path))
-    # Try to auto-open the image
-    try:
-        if sys.platform == "win32":
-            subprocess.Popen(["start", "", str(path)], shell=True)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(path)])
-        else:
-            subprocess.Popen(["xdg-open", str(path)])
-    except Exception:
-        pass
-    try:
-        code = input(f"CAPTCHA saved to {path}. Enter code: ").strip()
-        return code if code else None
-    except (EOFError, KeyboardInterrupt):
-        return None
+    quiet.open_path(path)
+    code = request_text(broker, f"CAPTCHA saved to {path}. Enter code:") or ""
+    code = code.strip()
+    return code or None
 
 
 def _set_account_identity_from_info(info: dict) -> None:

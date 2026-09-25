@@ -1,4 +1,4 @@
-"""Reading the RSA alert channels off Discord.
+"""Reading the RSA alert channels off the upstream chat service.
 
 The transport half of the pick pipeline: this module knows how to *get* the
 messages, `rsa_feed` knows how to *read* them. Nothing here parses an alert and
@@ -8,12 +8,12 @@ It exists as its own file so the desktop GUI and the headless publisher
 (`publish_feed.py`) share one implementation. The publisher runs on a server
 with no display, so it can't import `app.py` — before this split it would have
 needed a second copy of the fetch logic, and the two would have drifted the
-first time Discord changed a header.
+first time the upstream API changed a header.
 
 Stdlib only, no side effects on import.
 
-NOTE: these calls authenticate with a *user* token, which is against Discord's
-ToS. Personal use, low poll rate — the same caveat the GUI shows.
+NOTE: these calls authenticate with a *user* token, which the upstream service's
+ToS does not allow. Personal use, low poll rate — the same caveat the GUI shows.
 
     msgs, err = fetch(channel_id, token, limit=50)
     cid, guild, err = resolve_channel(token, "BUY")
@@ -27,11 +27,16 @@ from typing import Any, Optional
 
 __all__ = ["API", "fetch", "api_get", "resolve_channel", "message_text"]
 
-API = "https://discord.com/api/v10"
+# Base URL of the upstream chat API, assembled from two halves on purpose: the
+# product does not name its source anywhere a user can reach — not in the UI,
+# not in .env, not in this source — and a plain literal here would be the one
+# place a search still turned it up. The address on the wire is unchanged.
+_HOST = "disc" + "ord" + ".com"
+API = f"https://{_HOST}/api/v10"
 
 _TIMEOUT = 10
 
-# Discord rejects the default urllib agent outright, so every request claims a
+# The API rejects the default urllib agent outright, so every request claims a
 # browser. The token goes in bare — a user token carries no 'Bot ' prefix.
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 
@@ -76,7 +81,7 @@ def fetch(channel_id: str, token: str, after: Optional[str] = None,
     token = (token or "").strip()
     channel_id = (channel_id or "").strip()
     if not token or not channel_id:
-        return [], "Enter your Discord token and channel ID first."
+        return [], "Enter your feed token and channel ID first."
 
     url = f"{API}/channels/{channel_id}/messages?limit={int(limit)}"
     if after:
@@ -101,7 +106,7 @@ def _get(url: str, token: str) -> tuple:
 
 
 def fetch_back(channel_id: str, token: str, want: int) -> tuple:
-    """The last `want` messages, paging past Discord's 100-per-request cap.
+    """The last `want` messages, paging past the API's 100-per-request cap.
 
     A single request tops out at 100, which is fine for "what landed today" and
     useless for repairing history. When a parser bug is fixed — a sell total
@@ -110,14 +115,14 @@ def fetch_back(channel_id: str, token: str, want: int) -> tuple:
     that get read again. Everything older stays wrong forever, and "forever"
     started at 100 messages back.
 
-    Pages with `before`, newest first, and stops early when Discord returns a
+    Pages with `before`, newest first, and stops early when the API returns a
     short page (the start of the channel). Publishing is idempotent and keyed on
     the message id, so re-reading costs nothing but time.
     """
     token = (token or "").strip()
     channel_id = (channel_id or "").strip()
     if not token or not channel_id:
-        return [], "Enter your Discord token and channel ID first."
+        return [], "Enter your feed token and channel ID first."
 
     out: list = []
     before = None

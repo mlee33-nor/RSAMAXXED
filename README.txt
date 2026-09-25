@@ -198,7 +198,7 @@ CONTENTS
 
 ┌─ 8. THE FEED — WHERE THE PLAYS COME FROM ───────────────────────────────────
 │
-│  You do not hunt for splits and you do not need Discord. Put your
+│  You do not hunt for splits and there is nothing to join. Put your
 │  plays password in .env and three streams arrive on their own,
 │  refreshed every hour:
 │
@@ -299,7 +299,7 @@ CONTENTS
 │
 │     4.  THE PLAYS ARE ALREADY ON. There is nothing to turn on and
 │         nothing to enter — no account, no sign-up, no password, no
-│         key, no Discord. The terminal downloads the buy alerts, the
+│         key, nothing to join. The terminal downloads the buy alerts, the
 │         exits and the round-up (fractional) board on launch, then
 │         refreshes every hour while it is open.
 │

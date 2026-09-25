@@ -153,7 +153,7 @@ def _money_range(value: str) -> tuple[float | None, float | None]:
 
 
 def _iso(ts: str | None) -> str:
-    """Discord hands back RFC3339. Keep it as a plain UTC ISO string."""
+    """The API hands back RFC3339. Keep it as a plain UTC ISO string."""
     if not ts:
         return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     return str(ts)
@@ -640,7 +640,7 @@ def parse_sell_message(msg: dict) -> tuple[list[SellAlert], list[RoundUp]]:
         if _BARE_MONEY.match(line):
             continue
         if line.startswith("*") or len(line) > 40:
-            # Discord bold/italic is markup, not content. Left in, a note reads
+            # Bold/italic is markup, not content. Left in, a note reads
             # as "**mind the fraction**" on a page that renders no markdown.
             notes.append(line.strip("*_` ").strip())
 
@@ -941,7 +941,7 @@ def parse_messages(
 
 
 def _oldest_first(messages: Iterable[dict]) -> list[dict]:
-    """Discord returns newest-first; every consumer here wants the reverse."""
+    """The API returns newest-first; every consumer here wants the reverse."""
     msgs = list(messages or [])
     try:
         return sorted(msgs, key=lambda m: int(m.get("id") or 0))

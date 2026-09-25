@@ -2,7 +2,7 @@
 """Pull the RSA alert channels and publish them to the cloud feed. Headless.
 
 This is the daily job that feeds every subscriber. It does the same thing the
-desktop app's Discord auto-import does, minus the GUI — so plays keep arriving
+desktop app's auto-import does, minus the GUI — so plays keep arriving
 when the operator's machine is asleep, which was the single biggest reason a
 customer would open the terminal to an empty Quick Picks list.
 
@@ -13,10 +13,10 @@ customer would open the terminal to an empty Quick Picks list.
 
 Environment (a .env beside this file is loaded automatically):
 
-    DISCORD_TOKEN               required   the user token that reads the channels
-    DISCORD_CHANNEL             required   BUY channel: a name ('BUY') or numeric id
-    DISCORD_SELL_CHANNEL        optional   SELL channel; omit and exits are skipped
-    DISCORD_SERVER              optional   narrows a name lookup to one server
+    FEED_TOKEN               required   the user token that reads the channels
+    FEED_CHANNEL             required   BUY channel: a name ('BUY') or numeric id
+    FEED_SELL_CHANNEL        optional   SELL channel; omit and exits are skipped
+    FEED_SERVER              optional   narrows a name lookup to one server
     RSAMAXXED_FEED_KEY          required   operator ingest key; without it nothing publishes
     RSAMAXXED_CLOUD_URL         optional   override the cloud base URL
 
@@ -47,7 +47,7 @@ try:
 except Exception:      # dotenv is optional — a scheduler usually injects real env vars
     pass
 
-import discord_feed
+import feed_client
 import rsa_feed
 from cloud_sync import CloudError, CloudSync
 
@@ -64,8 +64,8 @@ def _channel(role: str) -> str:
     is often unresolvable on its own — the real channels are named with styled
     unicode ('📫│𝙱𝚄𝚈'), so a plain 'BUY' matches nothing.
     """
-    prefix = {"buy": "DISCORD_CHANNEL", "sell": "DISCORD_SELL_CHANNEL",
-              "lifecycle": "DISCORD_LIFECYCLE_CHANNEL"}[role]
+    prefix = {"buy": "FEED_CHANNEL", "sell": "FEED_SELL_CHANNEL",
+              "lifecycle": "FEED_LIFECYCLE_CHANNEL"}[role]
     return _env(f"{prefix}_ID") or _env(prefix)
 
 
@@ -73,7 +73,7 @@ def _resolve(token: str, raw: str, server: str, label: str) -> tuple[str, str]:
     """(channel_id, error). A numeric id passes straight through."""
     if not raw:
         return "", f"{label} channel not configured"
-    cid, guild, err = discord_feed.resolve_channel(token, raw, server)
+    cid, guild, err = feed_client.resolve_channel(token, raw, server)
     if err or not cid:
         return "", f"{label} channel '{raw}': {err or 'not found'}"
     if guild:
@@ -98,7 +98,7 @@ def _warn_unparsed(sell_msgs: list, buy_msgs: list) -> None:
     broker with no account count, two tickers sharing one total, an alert typed
     out instead of sent as an embed. Each one cost real money off the board, and
     each stayed invisible until somebody happened to compare a month against
-    Discord by hand.
+    the channel by hand.
 
     The formats will drift again. This cannot parse the next one, but it can
     refuse to be quiet about it — which turns "June looks low" into a line in
@@ -176,20 +176,20 @@ def main(argv: list[str] | None = None) -> int:
                     help="parse and report, but publish nothing")
     args = ap.parse_args(argv)
 
-    # Above 100 we page instead of clamping. Discord rejects a single request
+    # Above 100 we page instead of clamping. The API rejects a single request
     # over 100, but the whole point of a big --limit is repairing history: a
     # parser fix only reaches messages that get read again, so a cap of 100 left
-    # everything older permanently wrong. See discord_feed.fetch_back.
+    # everything older permanently wrong. See feed_client.fetch_back.
     if args.limit > 100:
         print(f"reading back {args.limit} messages per channel (paged)")
-    # Discord rejects a limit above 100 outright. Clamping (loudly) beats
+    # The API rejects a limit above 100 outright. Clamping (loudly) beats
     # handing back a 400 that reads like the channel is broken — and a run that
     # silently fetched nothing is exactly how a day's alerts go missing.
     args.limit = max(1, args.limit)
 
-    token = _env("DISCORD_TOKEN")
+    token = _env("FEED_TOKEN")
     if not token:
-        print("DISCORD_TOKEN is not set", file=sys.stderr)
+        print("FEED_TOKEN is not set", file=sys.stderr)
         return 1
 
     cloud = CloudSync()
@@ -198,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
               "feed. Set it, or pass --dry-run.", file=sys.stderr)
         return 1
 
-    server = _env("DISCORD_SERVER")
+    server = _env("FEED_SERVER")
     buy_cid, err = _resolve(token, _channel("buy"), server, "BUY")
     if err:
         print(err, file=sys.stderr)
@@ -210,14 +210,14 @@ def main(argv: list[str] | None = None) -> int:
     if sell_err:
         print(f"note: {sell_err} — exits will be skipped")
 
-    buy_msgs, err = discord_feed.fetch_back(buy_cid, token, args.limit)
+    buy_msgs, err = feed_client.fetch_back(buy_cid, token, args.limit)
     if err:
         print(f"BUY channel: {err}", file=sys.stderr)
         return 2
 
     sell_msgs: list = []
     if sell_cid:
-        sell_msgs, serr = discord_feed.fetch_back(sell_cid, token, args.limit)
+        sell_msgs, serr = feed_client.fetch_back(sell_cid, token, args.limit)
         if serr:
             # A readable BUY channel is worth publishing on its own; don't lose
             # today's plays because the sell channel was rate limited.
@@ -227,14 +227,14 @@ def main(argv: list[str] | None = None) -> int:
     batch = rsa_feed.parse_messages(buy_msgs, sell_msgs)
 
     # The TRACK board is what tells a subscriber whether their own position
-    # resolved, and they cannot read it themselves — it needs a Discord token
+    # resolved, and they cannot read it themselves — it needs a feed token
     # with channel access. Publishing it is the only way they ever see it.
     lifecycle = []
     track_cid, track_err = _resolve(token, _channel("lifecycle"), server, "TRACK")
     if track_err:
         print(f"note: {track_err} — the board will not be published")
     else:
-        track_msgs, terr = discord_feed.fetch(track_cid, token, limit=5)
+        track_msgs, terr = feed_client.fetch(track_cid, token, limit=5)
         if terr:
             print(f"TRACK channel: {terr} — continuing without the board",
                   file=sys.stderr)

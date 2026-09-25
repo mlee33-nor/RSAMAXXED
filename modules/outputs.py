@@ -69,7 +69,7 @@ def cleanup_orphaned_chrome(profile_dir: Path) -> int:
 
     Returns the number of processes killed.
     """
-    import subprocess
+    from modules import quiet
     killed = 0
     profile_str = str(profile_dir.resolve()).replace("/", "\\").lower()
     try:
@@ -79,7 +79,11 @@ def cleanup_orphaned_chrome(profile_dir: Path) -> int:
             "Select-Object ProcessId, CommandLine | "
             "ForEach-Object { $_.ProcessId.ToString() + '|' + $_.CommandLine }"
         )
-        result = subprocess.run(
+        # quiet.run, not subprocess.run: the GUI runs under pythonw with no
+        # console, so a plain subprocess of a console program (powershell) makes
+        # Windows allocate a new one -- a black window flashing on the user's
+        # desktop for every single browser start.
+        result = quiet.run(
             ["powershell", "-NoProfile", "-Command", ps_cmd],
             capture_output=True, text=True, timeout=15
         )

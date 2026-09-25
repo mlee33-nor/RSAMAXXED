@@ -171,7 +171,7 @@ class HoldingRow(Base):
 
 # ============================================================== THE PLAY FEED
 # Catalog data, shared by every subscriber. No `user_id` — see the module
-# docstring. `source_id` is the Discord message id (plus an index when one
+# docstring. `source_id` is the upstream message id (plus an index when one
 # message carries several alerts), which is what makes re-ingesting the same
 # pull a no-op instead of a duplicate.
 

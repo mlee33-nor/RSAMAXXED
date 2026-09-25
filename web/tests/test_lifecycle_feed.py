@@ -1,6 +1,6 @@
 """The TRACK board over the cloud feed, driven through the real desktop client.
 
-The point of this path: reading the board off Discord needs a personal user
+The point of this path: reading the board off the alert channel needs a personal user
 token with access to a private channel. A paying subscriber has neither, so
 without these endpoints their Exits page is permanently empty. These tests pin
 the two things that make it work — the board is published by the operator, and
@@ -157,7 +157,7 @@ def test_the_board_is_not_public(client):
     assert client.get("/api/v1/plays/lifecycle").status_code == 401
 
 
-def test_a_subscriber_reads_the_board_without_any_discord_access(client):
+def test_a_subscriber_reads_the_board_without_any_upstream_access(client):
     """The whole point. No token, no channel membership, still gets the board."""
     _ingest(client, [_row("CSAI", "fractional", date="2026-07-30"),
                      _row("CLDI", "rounded_up", date="2026-07-30")])

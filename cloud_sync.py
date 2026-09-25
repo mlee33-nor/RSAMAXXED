@@ -28,7 +28,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from modules import atomic
+try:
+    from modules import atomic
+    _replace = atomic.replace
+except ImportError:
+    # The web tests load this file by path, where the repo root cannot go on
+    # sys.path (its app.py would shadow the web app's `app` package). The
+    # desktop app always has `modules`; this fallback only serves that test.
+    _replace = os.replace
 
 import requests
 
@@ -122,7 +129,7 @@ def _read_state() -> dict[str, Any]:
 def _write_state(state: dict[str, Any]) -> None:
     tmp = _STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    atomic.replace(tmp, _STATE_FILE)  # atomic; a crash mid-write can't corrupt the token
+    _replace(tmp, _STATE_FILE)  # atomic; a crash mid-write can't corrupt the token
 
 
 class CloudSync:
@@ -389,7 +396,7 @@ class CloudSync:
 
         The third stream a customer cannot get on their own. Rows carry a
         source_id so the terminal can merge them into whatever it already has
-        instead of replacing it — an install that once read Discord keeps its
+        instead of replacing it — an install that once read the feed keeps its
         history when it switches to the feed.
         """
         data = self._get("/plays")
@@ -397,10 +404,10 @@ class CloudSync:
         return rows if isinstance(rows, list) else []
 
     def fetch_lifecycle(self) -> list[dict]:
-        """The TRACK board, for a subscriber who is not in the alert Discord.
+        """The TRACK board, for a subscriber with no access to the alert channels.
 
         This is the whole point of putting the board in the cloud: reading it
-        from Discord needs a personal user token with access to the channel, and
+        from the channels needs a personal user token with access to them, and
         a paying customer has neither. Without this their Exits page is empty
         and they have no way to know which of their positions resolved.
         """

@@ -19,7 +19,7 @@ This module is the missing record. It stores two streams:
            message.
 
 Both are written by the desktop app on the machine that runs the automation, so
-nothing here needs Discord, a subscription, or the network.
+nothing here needs the alert feed, a subscription, or the network.
 
 Shape (mirror_runs.json):
 

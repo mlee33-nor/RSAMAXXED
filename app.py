@@ -16,6 +16,7 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import tkinter as tk
 import winsound
@@ -36,7 +37,7 @@ from modules.outputs import BrokerOutput, log_event
 from modules import _2fa_prompt
 from modules import atomic
 import balances
-import discord_feed
+import feed_client
 import etf_journal
 import etf_plan
 import lifecycle
@@ -81,13 +82,22 @@ AUTOSELL_STATE_FILE = ROOT_DIR / "autosell_state.json"
 # a human, which is the right way round.
 AUTOSELL_MAX_PER_PULL = 4
 
-# The queue polls every 5s while a trade is in flight. 120 ticks = 10 minutes,
-# after which it stops waiting and says which plays it abandoned. A browser
-# broker can genuinely take minutes, so this is well past slow — it is the
-# ceiling on "something is wedged", and the alternative is a queue that waits
-# in silence for the life of the process, which looks exactly like auto-sell
-# being switched off.
-AUTOSELL_WAIT_TICKS = 120
+# How long the gate may go WITHOUT PROGRESS before the queue calls it wedged.
+#
+# Measured from the last sign of life — a broker reporting its leg, or the
+# holdings read starting — and NOT from when the wait began. That distinction
+# is the whole point. A sell of one play across ten brokerages, each driving a
+# browser through ten or twenty accounts, routinely runs longer than ten
+# minutes end to end while reporting a broker every minute or two. An elapsed
+# clock calls that healthy trade a stall and stands the queue down mid-drain;
+# a progress clock only fires when nothing has moved at all, which is the
+# thing we actually wanted to catch.
+AUTOSELL_STALL_SECS = 600
+
+# How often to look again once the gate HAS been declared stalled. The queue is
+# kept, not dropped — a wedge usually ends (the broker times out, the batch
+# lands late) and the sells are still wanted when it does.
+AUTOSELL_STALL_POLL_MS = 60000
 
 # How many times one play may be handed back before auto-sell stops trying.
 #
@@ -101,6 +111,74 @@ AUTOSELL_MAX_ATTEMPTS = 3
 
 
 load_dotenv(ENV_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Why the window vanished
+#
+# RSAMAXXED.bat launches this with `pyw`, which has no console. That is right
+# for a desktop app and wrong for diagnosing one: an unhandled exception, an
+# error inside a Tk callback, a raise on a worker thread and a native abort all
+# end the process with nothing on screen and nothing written down. "It keeps
+# randomly closing" is unanswerable in that state, and it closed mid-sell.
+#
+# So every one of those paths now writes to logs/crash.log before the process
+# goes, including a plain exit (which distinguishes "the user closed it" from
+# "it died"). faulthandler covers the one case Python cannot catch — a
+# segfault or Tcl_Panic inside a C extension — by dumping every thread's stack
+# straight to the same file.
+# ---------------------------------------------------------------------------
+CRASH_LOG = LOG_DIR / "crash.log"
+
+
+def _crash_note(kind: str, body: str = "") -> None:
+    """Append one entry to logs/crash.log. Never raises — it runs while dying."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(CRASH_LOG, "a", encoding="utf-8") as fh:
+            fh.write(f"\n[{stamp}] {kind}\n")
+            if body:
+                fh.write(body.rstrip() + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception:
+        pass
+
+
+def _install_crash_log() -> None:
+    import atexit
+    import faulthandler
+    import traceback as _tb
+
+    # Held open for the life of the process: faulthandler writes to the raw
+    # file descriptor from a signal handler, so it cannot be a closed handle.
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        global _CRASH_FH
+        _CRASH_FH = open(CRASH_LOG, "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=_CRASH_FH, all_threads=True)
+    except Exception:
+        pass
+
+    def on_uncaught(exc_type, exc, tb):
+        _crash_note("UNCAUGHT EXCEPTION (main thread)",
+                    "".join(_tb.format_exception(exc_type, exc, tb)))
+
+    def on_thread_error(args):
+        _crash_note(f"UNCAUGHT EXCEPTION (thread {args.thread and args.thread.name})",
+                    "".join(_tb.format_exception(args.exc_type, args.exc_value,
+                                                 args.exc_traceback)))
+
+    sys.excepthook = on_uncaught
+    threading.excepthook = on_thread_error
+    atexit.register(lambda: _crash_note(
+        "PROCESS EXIT", "".join(_tb.format_stack())))
+    _crash_note("START", f"pid={os.getpid()} python={sys.version.split()[0]}")
+
+
+_CRASH_FH = None
+_install_crash_log()
 
 
 def _load_custom_accounts() -> List[Dict[str, Any]]:
@@ -524,10 +602,10 @@ def _mirror_skip_reason(note: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Discord pick feed — read the RSA-alert channels with the user's own token and
+# Alert feed — read the RSA-alert channels with the user's own token and
 # auto-extract plays (no bot/webhook needed; you just have to be a member).
-# NOTE: automating a *user* token is against Discord ToS — personal use, low
-# poll rate. Stored in .env (DISCORD_TOKEN / DISCORD_CHANNEL_ID).
+# NOTE: automating a *user* token is against the upstream service's ToS —
+# personal use, low poll rate. Stored in .env (FEED_TOKEN / FEED_CHANNEL_ID).
 #
 # TWO channels, because the feed reports a play's life in two places:
 #   BUY   rich 'RSA Alert' embeds  -> what to open   -> Quick Picks / Mirror
@@ -537,29 +615,29 @@ def _mirror_skip_reason(note: str) -> str:
 # which channels to read and what to do with the result.
 # ---------------------------------------------------------------------------
 #
-# The HTTP half lives in discord_feed.py so the headless publisher can share it
+# The HTTP half lives in feed_client.py so the headless publisher can share it
 # (see publish_feed.py); these names are kept as aliases because every call
 # site below already uses them.
-DISCORD_API = discord_feed.API
-_discord_fetch = discord_feed.fetch
-_discord_api_get = discord_feed.api_get
-_discord_resolve_channel = discord_feed.resolve_channel
+FEED_API = feed_client.API
+_feed_fetch = feed_client.fetch
+_feed_api_get = feed_client.api_get
+_feed_resolve_channel = feed_client.resolve_channel
 
-DISCORD_STATE_FILE = ROOT_DIR / "discord_state.json"
+FEED_STATE_FILE = ROOT_DIR / "feed_state.json"
 
 
-def _load_discord_state() -> Dict[str, Any]:
+def _load_feed_state() -> Dict[str, Any]:
     try:
-        if DISCORD_STATE_FILE.exists():
-            return json.loads(DISCORD_STATE_FILE.read_text(encoding="utf-8"))
+        if FEED_STATE_FILE.exists():
+            return json.loads(FEED_STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
         pass
     return {"enabled": False, "last_id": None, "last_sell_id": None}
 
 
-def _save_discord_state(state: Dict[str, Any]) -> None:
+def _save_feed_state(state: Dict[str, Any]) -> None:
     try:
-        _write_json(DISCORD_STATE_FILE, state)
+        _write_json(FEED_STATE_FILE, state)
     except Exception:
         pass
 
@@ -767,19 +845,24 @@ class StatusDot(tk.Canvas):
         self.create_oval(p, p, p + s, p + s, fill=color, outline="")
 
 
-# Access code that unlocks the Discord Pick Feed settings. The feed ships
-# pre-configured so a downloaded copy just works; the lock keeps a stray
-# edit from breaking it. It is a fumble-guard, not a secret — the values it
-# protects sit in .env in plain text next to this file.
+# Access code that reveals the Alert Feed settings. The feed ships
+# pre-configured so a downloaded copy just works, and the settings panel stays
+# hidden behind this code — both so a stray edit cannot break the feed and so
+# nothing about where the alerts come from is on screen for a customer.
 #
-# Because it is NOT a secret, the default below must never be a real
-# credential. This file is committed to a public repository, so anything
-# literal here is published to everyone who clones it. A broker password was
-# once used as this code; that published the password. Override the value with
-# RSAMAXXED_CONFIG_UNLOCK in .env if you want a different one — and pick a
-# string you do not use to log in anywhere.
-DISCORD_CONFIG_UNLOCK = os.environ.get(
-    "RSAMAXXED_CONFIG_UNLOCK", "").strip() or "unlock-feed-settings"
+# It is a curtain, not a secret. The values it hides sit in .env in plain text
+# next to this file, so the default below must never be a real credential —
+# this file is committed to a public repository, and anything literal here is
+# published to everyone who clones it. A broker password was once used as this
+# code; that published the password. Override with RSAMAXXED_CONFIG_UNLOCK in
+# .env to change it, and pick a string you do not use to log in anywhere.
+FEED_CONFIG_UNLOCK = os.environ.get(
+    "RSAMAXXED_CONFIG_UNLOCK", "").strip() or "1591"
+
+# Shown on the lock bar whenever the settings are hidden. It says the feed is
+# working rather than that something is missing, because for everyone except
+# the operator there is genuinely nothing to do here.
+FEED_LOCKED_HINT = "Feed settings are hidden — plays load automatically"
 
 SELLS_FILE = ROOT_DIR / "sells.json"
 
@@ -816,7 +899,7 @@ def _merge_sells(existing: List[Dict[str, Any]],
                  incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Union on source_id, newest first, aged out past SELL_MAX_AGE_DAYS.
 
-    Discord pulls overlap (the same message can arrive twice after a re-import),
+    Feed pulls overlap (the same message can arrive twice after a re-import),
     so dedup on the feed's own message id rather than symbol — the same ticker
     legitimately exits more than once.
     """
@@ -1794,6 +1877,11 @@ class App(ctk.CTk):
         # same time is two independent sessions and perfectly safe, while a second
         # order at a broker already working is the duplicate that must be refused.
         self._brokers_in_flight: set = set()
+        # Last sign of life from whatever holds the gate: a batch starting, or
+        # a broker reporting its leg. The sell queue's stall watchdog measures
+        # from HERE rather than from when it started waiting, so a long healthy
+        # trade is never mistaken for a wedged one.
+        self._trade_progress_at: Optional[datetime] = None
         self._live_batches: List[dict] = []   # batches currently shown live
         self._live_anim_id: Optional[str] = None
         self._live_frame: int = 0
@@ -1875,11 +1963,17 @@ class App(ctk.CTk):
         self._show_confirmed: bool = False
         self._autosell_sold: set = set(_as.get("sold") or [])
         self._autosell_queue: List[Any] = []
-        self._autosell_waits: int = 0     # pump ticks spent behind a busy trade
         # A holdings read is out for the task the pump just popped. Covers the
         # window before _trade_in_flight goes up — see _autosell_pump.
         self._queue_busy: bool = False
+        self._queue_busy_at: Optional[datetime] = None
         self._queue_held_said: bool = False
+        self._queue_stalled_said: bool = False
+        # The ONE pending pump tick. Every feeder calls the pump and the pump
+        # re-arms itself, so without a single id to cancel, an hourly pull
+        # landing mid-wait left two timer chains running and a sweep click a
+        # third — see _pump_later.
+        self._pump_after_id: Optional[str] = None
         # play key -> hand-backs so far. Not persisted: a restart is a fair
         # reason to try a broker again, and it is the WITHIN-session loop that
         # hammers a login.
@@ -1904,7 +1998,7 @@ class App(ctk.CTk):
         self.after(300, self._start_quote_loop)
         # Auto-refresh non-browser brokers on startup (browser brokers need manual bootstrap)
         self.after(700, self._startup_refresh)
-        # TRACK board: runs on its own hourly timer, not the Discord toggle.
+        # TRACK board: runs on its own hourly timer, not the alert-feed toggle.
         self.after(2500, self._track_loop)
         # Mirror was armed when we last closed: bring it back, and say so. Late
         # enough that the activity log and the notification centre exist to
@@ -2045,6 +2139,39 @@ class App(ctk.CTk):
         self.after(0, _hide)
 
     # ---- GUI input hook (replaces terminal input() for 2FA/OTP) -----------
+
+    def destroy(self) -> None:
+        """Record who closed the window.
+
+        The app has been closing on its own mid-trade. Tk gives no hint whether
+        that is the user, a stray teardown in this code, or the window manager,
+        and `pyw` swallows anything printed. Whoever calls this gets their call
+        stack written down first; after that the close proceeds untouched.
+        """
+        import traceback as _tb
+        _crash_note("ROOT DESTROY", "".join(_tb.format_stack()))
+        super().destroy()
+
+    def report_callback_exception(self, exc, val, tb) -> None:
+        """A raise inside a Tk callback must not take the window with it.
+
+        tkinter's default hands the traceback to sys.stderr, which under `pyw`
+        is nowhere — so a failing timer or button left the app half-updated
+        with no sign anything had gone wrong, and any second failure inside
+        that reporting path can end the event loop outright.
+
+        Log it, say so on screen, and keep running. Losing one refresh is
+        survivable; losing the window in the middle of a sell is not.
+        """
+        import traceback as _tb
+        _crash_note("TK CALLBACK EXCEPTION",
+                    "".join(_tb.format_exception(exc, val, tb)))
+        try:
+            self._push_notification(
+                f"Internal error: {type(val).__name__}: {val} — see logs/crash.log",
+                "error")
+        except Exception:
+            pass
 
     def _ask_inline(self, title: str, prompt: str, *,
                     show: Optional[str] = None) -> Optional[str]:
@@ -4174,7 +4301,7 @@ class App(ctk.CTk):
                                         fg=TEXT_MUTED,
                                         font=(FONT_FAMILY, 9))
         self._sell_count_lbl.pack(side="left", padx=(10, 0))
-        tk.Label(sell_header, text="FROM DISCORD · NEVER AUTO-TRADED", bg=BG_CARD,
+        tk.Label(sell_header, text="FROM THE ALERT FEED · NEVER AUTO-TRADED", bg=BG_CARD,
                  fg=TEXT_MUTED, font=(FONT_FAMILY, 7, "bold")).pack(side="right")
 
         sell_body = tk.Frame(sell_card.inner, bg=BG_CARD)
@@ -4263,7 +4390,7 @@ class App(ctk.CTk):
             self._empty_state(
                 grids["now"], "info", "No exits yet",
                 "Exits arrive with your subscription once this device is "
-                "linked - no Discord needed - and name the brokerage each one "
+                "linked - nothing else to set up - and name the brokerage each one "
                 "was called at.",
                 bg=BG_CARD, pad=16).pack(fill="x")
             return
@@ -5207,8 +5334,8 @@ class App(ctk.CTk):
         self._log(f"Quick Pick: {symbol} loaded — select brokers and execute")
 
     @staticmethod
-    def _parse_discord_picks(raw: str) -> List[Dict[str, str]]:
-        """Parse raw Discord-style messages into pick entries.
+    def _parse_alert_picks(raw: str) -> List[Dict[str, str]]:
+        """Parse raw alert messages into pick entries.
 
         Strips emojis, usernames, @Premium, timestamps, etc.
         Extracts tickers from (TICKER) pattern and classifies note type.
@@ -5319,7 +5446,7 @@ class App(ctk.CTk):
             if not raw:
                 preview_lbl.configure(text="")
                 return
-            parsed = self._parse_discord_picks(raw)
+            parsed = self._parse_alert_picks(raw)
             if parsed:
                 lines = [f"  {p['symbol']}  —  {p['note']}" for p in parsed]
                 preview_lbl.configure(
@@ -5341,7 +5468,7 @@ class App(ctk.CTk):
                 return
 
             date_str = f"{year_var.get()}-{month_var.get()}-{day_var.get()}"
-            parsed = self._parse_discord_picks(raw)
+            parsed = self._parse_alert_picks(raw)
             if not parsed:
                 status_lbl.configure(text="No tickers found.", fg=RED)
                 return
@@ -5368,8 +5495,9 @@ class App(ctk.CTk):
                 try:
                     PICKS_FILE.write_text(_json.dumps(all_picks, indent=2), encoding="utf-8")
                 except Exception as ex:
+                    err = str(ex)
                     self.after(0, lambda: status_lbl.configure(
-                        text=f"Local save failed: {ex}", fg=RED))
+                        text=f"Local save failed: {err}", fg=RED))
                     return
 
                 # Publishing to the shared feed is best-effort, and only happens
@@ -5398,8 +5526,9 @@ class App(ctk.CTk):
                     try:
                         PICKS_FILE.write_text("[]", encoding="utf-8")
                     except Exception as ex:
+                        err = str(ex)
                         self.after(0, lambda: status_lbl.configure(
-                            text=f"Failed: {ex}", fg=RED))
+                            text=f"Failed: {err}", fg=RED))
                         return
                     self.after(0, lambda: self._render_quick_picks([]))
                     self.after(0, lambda: status_lbl.configure(
@@ -7894,6 +8023,10 @@ class App(ctk.CTk):
             return
         batch["results"].append(summary)
         batch["pending"].discard(summary["broker"])
+        # A leg landing is the gate's proof of life. Ten brokerages at a couple
+        # of minutes each is a twenty-minute batch and perfectly healthy; this
+        # is what stops the sell queue calling it a stall halfway through.
+        self._trade_progress_at = datetime.now()
         # Free this broker the moment IT lands, not when the slowest one does:
         # Robinhood taking 4s shouldn't wait on Fidelity's browser to finish
         # before it can take the next ticket.
@@ -9961,8 +10094,9 @@ class App(ctk.CTk):
                     price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
                     self.after(0, lambda: self._sim_set_price(price))
             except Exception as ex:
+                err = str(ex)
                 self.after(0, lambda: self._sim_result.configure(
-                    text=f"Could not fetch price for {ticker}: {ex}", fg=RED))
+                    text=f"Could not fetch price for {ticker}: {err}", fg=RED))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -10301,8 +10435,8 @@ class App(ctk.CTk):
         # Paint dot / label / button from the restored toggle.
         self._mirror_sync_toggle_ui()
 
-        # ---- Discord auto-import card (feeds the picks Mirror Trading buys) ----
-        self._build_discord_card(scroll_frame)
+        # ---- Alert feed auto-import card (feeds the picks Mirror Trading buys) ----
+        self._build_alerts_card(scroll_frame)
 
         # Account linking now lives on the Brokers page — see _build_accounts.
 
@@ -10340,7 +10474,8 @@ class App(ctk.CTk):
         tk.Label(info, text="Optional — your plays already work without this",
                  bg=BG_INPUT, fg=TEXT_PRIMARY, font=(FONT_FAMILY, 10, "bold")).pack(anchor="w")
         tk.Label(info, text="Buy alerts, exits and the round-up board arrive on their own, "
-                 "refreshed every hour, with no account and no Discord. Linking is only for "
+                 "refreshed every hour, with no account and nothing to connect. Linking is "
+                 "only for "
                  "seeing your realized P/L, positions and trade history on the website — handy "
                  "from your phone, and nothing else depends on it. Broker logins, cookies and "
                  "2FA secrets never leave this computer.",
@@ -10413,7 +10548,8 @@ class App(ctk.CTk):
             try:
                 pending = client.begin_pairing()
             except Exception as ex:
-                self.after(0, lambda: self._cloud_fail(str(ex)))
+                err = str(ex)
+                self.after(0, lambda: self._cloud_fail(err))
                 return
             self.after(0, lambda: self._cloud_show_code(pending))
 
@@ -10473,7 +10609,8 @@ class App(ctk.CTk):
             result = client.push_trades(force=force)
         except Exception as ex:
             # A dead network must never interrupt trading. Log and move on.
-            self.after(0, lambda: self._log(f"Cloud sync failed: {ex}"))
+            err = str(ex)
+            self.after(0, lambda: self._log(f"Cloud sync failed: {err}"))
             return
         if result.get("inserted"):
             self.after(0, lambda: self._log(
@@ -11287,11 +11424,11 @@ class App(ctk.CTk):
 
         self._save_mirror_state()
 
-    # ---- Discord pick feed ------------------------------------------------
+    # ---- Alert feed --------------------------------------------------------
 
-    def _build_discord_card(self, parent) -> None:
-        self._discord_state = _load_discord_state()
-        self._discord_poll_id: Optional[str] = None
+    def _build_alerts_card(self, parent) -> None:
+        self._alerts_state = _load_feed_state()
+        self._alerts_poll_id: Optional[str] = None
 
         card = RoundedFrame(parent, bg_color=BG_CARD, border_color=BORDER, radius=14)
         card.pack(fill="x", pady=(0, 16))
@@ -11300,192 +11437,195 @@ class App(ctk.CTk):
         header.pack(fill="x", padx=20, pady=(16, 8))
         tk.Label(header, text=icon("bell"), bg=BG_CARD, fg=ACCENT,
                  font=(ICON_FONT, 13)).pack(side="left", padx=(0, 9))
-        tk.Label(header, text="Discord Pick Feed", bg=BG_CARD, fg=TEXT_PRIMARY,
+        tk.Label(header, text="Alert Feed", bg=BG_CARD, fg=TEXT_PRIMARY,
                  font=(FONT_FAMILY, 14, "bold")).pack(side="left")
         status_wrap = tk.Frame(header, bg=BG_CARD)
         status_wrap.pack(side="right")
-        on = bool(self._discord_state.get("enabled"))
-        self._discord_status_dot = StatusDot(status_wrap, color=GREEN if on else RED, size=8)
-        self._discord_status_dot.pack(side="left", padx=(0, 6))
-        self._discord_status_lbl = tk.Label(
+        on = bool(self._alerts_state.get("enabled"))
+        self._alerts_status_dot = StatusDot(status_wrap, color=GREEN if on else RED, size=8)
+        self._alerts_status_dot.pack(side="left", padx=(0, 6))
+        self._alerts_status_lbl = tk.Label(
             status_wrap, text="ON" if on else "OFF", bg=BG_CARD,
             fg=GREEN if on else RED, font=(FONT_FAMILY, 9, "bold"))
-        self._discord_status_lbl.pack(side="left")
+        self._alerts_status_lbl.pack(side="left")
 
         info = tk.Frame(card.inner, bg=BG_INPUT, padx=16, pady=12)
         info.pack(fill="x", padx=20, pady=(4, 12))
-        tk.Label(info, text="Auto-import RSA plays from the Discord channels you're in",
+        tk.Label(info, text="Plays import themselves — nothing here to fill in",
                  bg=BG_INPUT, fg=TEXT_PRIMARY, font=(FONT_FAMILY, 10, "bold")).pack(anchor="w")
-        tk.Label(info, text="Reads new messages with your account token (no bot/webhook needed). "
-                 "BUY alerts go straight into Quick Picks — which Mirror Trading can then "
-                 "auto-buy. SELL alerts are recorded as exits and round-up confirmations, and "
-                 "are never auto-traded: an alerter selling says nothing about what you hold. "
-                 "Pulls once a day (one request per channel — the app only reads, never posts).",
+        tk.Label(info, text="BUY alerts go straight into Quick Picks — which Mirror Trading "
+                 "can then auto-buy. SELL alerts are recorded as exits and round-up "
+                 "confirmations, and are never auto-traded: an alerter selling says nothing "
+                 "about what you hold. Pulls once a day, and only ever reads.",
                  bg=BG_INPUT, fg=TEXT_SECONDARY, font=(FONT_FAMILY, 9),
-                 wraplength=620, justify="left").pack(anchor="w", pady=(4, 8))
-        tk.Label(info, text="⚠  Using a user token to read messages breaks Discord's ToS and "
-                 "could flag your account. Personal use, at your own risk.",
-                 bg=BG_INPUT, fg=YELLOW, font=(FONT_FAMILY, 8), wraplength=620,
-                 justify="left").pack(anchor="w")
-        tk.Label(info, text="How to get them: Discord → Settings → Advanced → Developer Mode ON. "
-                 "Right-click the channel → Copy Channel ID. Token: open Discord in your browser, "
-                 "DevTools (F12) → Network → click any request → Headers → 'authorization'.",
-                 bg=BG_INPUT, fg=TEXT_MUTED, font=(FONT_FAMILY, 8), wraplength=620,
-                 justify="left").pack(anchor="w", pady=(6, 0))
+                 wraplength=620, justify="left").pack(anchor="w", pady=(4, 0))
 
         # ---- Config lock -------------------------------------------------
         # The feed ships pre-configured, so a downloaded copy pulls plays with
-        # nothing to fill in. The fields stay read-only behind an unlock code
-        # to stop a casual edit from silently breaking the feed for everyone.
-        # This is a fumble-guard, not security: the values still live in .env
-        # on disk and anyone with the files can read them.
+        # nothing to fill in. The whole settings panel — token, source and
+        # channels — is HIDDEN rather than merely greyed out until the access
+        # code is entered: a customer never needs it, should not be reading the
+        # feed's credentials off the screen, and should not be able to break
+        # the feed for everyone with a stray edit.
+        #
+        # A curtain and a fumble-guard, not security. The same values sit in
+        # .env next to this file, so anyone with the folder can still read
+        # them; what the code buys is that a normal user never sees any of it.
         lock_bar = tk.Frame(card.inner, bg=BG_INPUT, padx=16, pady=10)
         lock_bar.pack(fill="x", padx=20, pady=(0, 8))
-        self._discord_locked = True
+        self._alerts_locked = True
         tk.Label(lock_bar, text=icon("lock"), bg=BG_INPUT, fg=TEXT_SECONDARY,
                  font=(ICON_FONT, 11)).pack(side="left", padx=(0, 8))
-        self._discord_lock_lbl = tk.Label(
-            lock_bar, text="Feed settings are locked — plays load automatically",
+        self._alerts_lock_lbl = tk.Label(
+            lock_bar, text=FEED_LOCKED_HINT,
             bg=BG_INPUT, fg=TEXT_SECONDARY, font=(FONT_FAMILY, 9))
-        self._discord_lock_lbl.pack(side="left")
-        self._discord_lock_btn = PillButton(
+        self._alerts_lock_lbl.pack(side="left")
+        self._alerts_lock_btn = PillButton(
             lock_bar, text="Unlock", bg_color=BG_CARD_ALT, hover_color=ACCENT,
-            command=self._toggle_discord_lock, width=90, height=28, font_size=9)
-        self._discord_lock_btn.pack(side="right")
+            command=self._toggle_alerts_lock, width=90, height=28, font_size=9)
+        self._alerts_lock_btn.pack(side="right")
 
-        form = tk.Frame(card.inner, bg=BG_CARD)
+        # Everything in here is packed only while the card is unlocked.
+        self._alerts_config = tk.Frame(card.inner, bg=BG_CARD)
+        tk.Label(self._alerts_config,
+                 text="⚠  Reading a channel with a personal account token is against the "
+                      "source service's terms and could flag that account. Personal use, at "
+                      "your own risk.",
+                 bg=BG_CARD, fg=YELLOW, font=(FONT_FAMILY, 8), wraplength=620,
+                 justify="left").pack(anchor="w", padx=20, pady=(0, 10))
+
+        form = tk.Frame(self._alerts_config, bg=BG_CARD)
         form.pack(fill="x", padx=20, pady=(0, 10))
-        tk.Label(form, text="DISCORD TOKEN", bg=BG_CARD, fg=TEXT_SECONDARY,
+        tk.Label(form, text="FEED TOKEN", bg=BG_CARD, fg=TEXT_SECONDARY,
                  font=(FONT_MONO, 8)).grid(row=0, column=0, sticky="w", pady=4, padx=(0, 10))
-        self._discord_token_entry = ttk.Entry(form, width=46, show="•",
+        self._alerts_token_entry = ttk.Entry(form, width=46, show="•",
                                               font=(FONT_MONO, 9))
-        self._discord_token_entry.insert(0, _env("DISCORD_TOKEN"))
-        self._discord_token_entry.grid(row=0, column=1, sticky="w", pady=4)
+        self._alerts_token_entry.insert(0, _env("FEED_TOKEN"))
+        self._alerts_token_entry.grid(row=0, column=1, sticky="w", pady=4)
         tk.Label(form, text="SERVER (optional)", bg=BG_CARD, fg=TEXT_SECONDARY,
                  font=(FONT_MONO, 8)).grid(row=1, column=0, sticky="w", pady=4, padx=(0, 10))
-        self._discord_server_entry = ttk.Entry(form, width=46, font=(FONT_MONO, 9))
-        self._discord_server_entry.insert(0, _env("DISCORD_SERVER"))
-        self._discord_server_entry.grid(row=1, column=1, sticky="w", pady=4)
+        self._alerts_server_entry = ttk.Entry(form, width=46, font=(FONT_MONO, 9))
+        self._alerts_server_entry.insert(0, _env("FEED_SERVER"))
+        self._alerts_server_entry.grid(row=1, column=1, sticky="w", pady=4)
         tk.Label(form, text="BUY CHANNEL (name or ID)", bg=BG_CARD, fg=TEXT_SECONDARY,
                  font=(FONT_MONO, 8)).grid(row=2, column=0, sticky="w", pady=4, padx=(0, 10))
-        self._discord_chan_entry = ttk.Entry(form, width=46, font=(FONT_MONO, 9))
-        self._discord_chan_entry.insert(0, _env("DISCORD_CHANNEL") or _env("DISCORD_CHANNEL_ID"))
-        self._discord_chan_entry.grid(row=2, column=1, sticky="w", pady=4)
+        self._alerts_chan_entry = ttk.Entry(form, width=46, font=(FONT_MONO, 9))
+        self._alerts_chan_entry.insert(0, _env("FEED_CHANNEL") or _env("FEED_CHANNEL_ID"))
+        self._alerts_chan_entry.grid(row=2, column=1, sticky="w", pady=4)
         tk.Label(form, text='e.g.  BUY   (the channel name) — or paste a numeric ID',
                  bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).grid(
                      row=3, column=1, sticky="w")
 
         tk.Label(form, text="SELL CHANNEL (optional)", bg=BG_CARD, fg=TEXT_SECONDARY,
                  font=(FONT_MONO, 8)).grid(row=4, column=0, sticky="w", pady=4, padx=(0, 10))
-        self._discord_sell_entry = ttk.Entry(form, width=46, font=(FONT_MONO, 9))
-        self._discord_sell_entry.insert(
-            0, _env("DISCORD_SELL_CHANNEL") or _env("DISCORD_SELL_CHANNEL_ID"))
-        self._discord_sell_entry.grid(row=4, column=1, sticky="w", pady=4)
+        self._alerts_sell_entry = ttk.Entry(form, width=46, font=(FONT_MONO, 9))
+        self._alerts_sell_entry.insert(
+            0, _env("FEED_SELL_CHANNEL") or _env("FEED_SELL_CHANNEL_ID"))
+        self._alerts_sell_entry.grid(row=4, column=1, sticky="w", pady=4)
         tk.Label(form, text='e.g.  SELL — exits and round-up confirmations. Never auto-traded.',
                  bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).grid(
                      row=5, column=1, sticky="w")
 
-        btns = tk.Frame(card.inner, bg=BG_CARD)
-        btns.pack(fill="x", padx=20, pady=(6, 10))
-        save_btn = PillButton(btns, text="Save", bg_color=BG_CARD_ALT, hover_color=ACCENT,
-                              command=self._save_discord_creds, width=70, height=30,
-                              font_size=9)
-        save_btn.pack(side="left", padx=(0, 8))
-        find_btn = PillButton(btns, text="Find Channel", bg_color=BG_CARD_ALT,
-                              hover_color=ACCENT, command=self._discord_find_channel,
-                              width=115, height=30, font_size=9)
-        find_btn.pack(side="left", padx=(0, 8))
-        # Only the *editing* controls lock. Test / Import Now / the enable
-        # toggle stay live so a locked copy can still pull plays.
-        self._discord_locked_widgets = [
-            self._discord_token_entry, self._discord_server_entry,
-            self._discord_chan_entry, self._discord_sell_entry,
-            save_btn, find_btn,
-        ]
-        self._apply_discord_lock()
-        PillButton(btns, text="Test", bg_color=BG_CARD_ALT, hover_color=ACCENT,
-                   command=self._test_discord, width=70, height=30,
+        cfg_btns = tk.Frame(self._alerts_config, bg=BG_CARD)
+        cfg_btns.pack(fill="x", padx=20, pady=(0, 4))
+        PillButton(cfg_btns, text="Save", bg_color=BG_CARD_ALT, hover_color=ACCENT,
+                   command=self._save_alerts_creds, width=70, height=30,
                    font_size=9).pack(side="left", padx=(0, 8))
-        PillButton(btns, text="Import Now", bg_color=BG_CARD_ALT, hover_color=ACCENT,
-                   command=self._discord_import_now, width=110, height=30,
-                   font_size=9).pack(side="left")
+        PillButton(cfg_btns, text="Find Channel", bg_color=BG_CARD_ALT,
+                   hover_color=ACCENT, command=self._alerts_find_channel,
+                   width=115, height=30, font_size=9).pack(side="left")
+
+        # Test / Import Now / the enable toggle stay visible either way, so a
+        # locked copy can still pull plays on demand.
+        self._alerts_actions = tk.Frame(card.inner, bg=BG_CARD)
+        self._alerts_actions.pack(fill="x", padx=20, pady=(6, 10))
+        PillButton(self._alerts_actions, text="Test", bg_color=BG_CARD_ALT,
+                   hover_color=ACCENT, command=self._test_alerts_feed, width=70,
+                   height=30, font_size=9).pack(side="left", padx=(0, 8))
+        PillButton(self._alerts_actions, text="Import Now", bg_color=BG_CARD_ALT,
+                   hover_color=ACCENT, command=self._alerts_import_now, width=110,
+                   height=30, font_size=9).pack(side="left")
 
         tk.Label(card.inner, text="FEED ACTIVITY", bg=BG_CARD, fg=TEXT_SECONDARY,
                  font=(FONT_FAMILY, 9, "bold")).pack(anchor="w", padx=20, pady=(4, 6))
-        self._discord_log = tk.Text(card.inner, bg=BG_INPUT, fg=TEXT_PRIMARY,
+        self._alerts_log = tk.Text(card.inner, bg=BG_INPUT, fg=TEXT_PRIMARY,
                                     font=(FONT_MONO, 9), height=5, bd=0,
                                     state="disabled", insertbackground=TEXT_PRIMARY,
                                     highlightthickness=0, padx=8, pady=8)
-        self._discord_log.pack(fill="x", padx=20)
+        self._alerts_log.pack(fill="x", padx=20)
 
         toggle_row = tk.Frame(card.inner, bg=BG_CARD)
         toggle_row.pack(fill="x", padx=20, pady=(10, 20))
-        self._discord_toggle_btn = PillButton(
+        self._alerts_toggle_btn = PillButton(
             toggle_row,
             text="Disable Auto-Import" if on else "Enable Auto-Import",
-            command=self._toggle_discord_import, width=190, height=40, font_size=11)
-        self._discord_toggle_btn.pack(side="left")
+            command=self._toggle_alerts_import, width=190, height=40, font_size=11)
+        self._alerts_toggle_btn.pack(side="left")
+
+        # Last, because hiding the panel is positioned against the action row,
+        # which has to exist by then.
+        self._apply_alerts_lock()
 
         if on:
             # Launch always pulls, even if today's scheduled pull already ran in
             # an earlier session.
-            self.after(2000, lambda: self._discord_daily_check(force=True))
+            self.after(2000, lambda: self._alerts_daily_check(force=True))
 
-    def _apply_discord_lock(self) -> None:
-        """Push self._discord_locked out to the widgets and the lock bar."""
-        state = "disabled" if self._discord_locked else "normal"
-        for w in getattr(self, "_discord_locked_widgets", []):
-            try:
-                w.configure(state=state)
-            except Exception:
-                pass
-        self._discord_lock_lbl.configure(
-            text="Feed settings are locked — plays load automatically"
-                 if self._discord_locked else
+    def _apply_alerts_lock(self) -> None:
+        """Show or hide the settings panel, and re-label the lock bar."""
+        if self._alerts_locked:
+            self._alerts_config.pack_forget()
+        else:
+            # `before` puts it back between the lock bar and the action row —
+            # a bare pack() after a hide would re-add it at the bottom of the
+            # card, under the activity log.
+            self._alerts_config.pack(fill="x", before=self._alerts_actions)
+        self._alerts_lock_lbl.configure(
+            text=FEED_LOCKED_HINT if self._alerts_locked else
                  "Unlocked — changes here affect every copy that syncs this feed",
-            fg=TEXT_SECONDARY if self._discord_locked else YELLOW)
-        self._discord_lock_btn.configure_text(
-            "Unlock" if self._discord_locked else "Lock")
+            fg=TEXT_SECONDARY if self._alerts_locked else YELLOW)
+        self._alerts_lock_btn.configure_text(
+            "Unlock" if self._alerts_locked else "Hide")
 
-    def _toggle_discord_lock(self) -> None:
-        if not self._discord_locked:
-            self._discord_locked = True
-            self._apply_discord_lock()
+    def _toggle_alerts_lock(self) -> None:
+        if not self._alerts_locked:
+            self._alerts_locked = True
+            self._apply_alerts_lock()
             return
         code = self._ask_inline(
-            "Unlock Feed Settings",
-            "Enter the access code to edit the Discord feed settings:",
+            "Feed Settings",
+            "Enter the access code to view the feed settings:",
             show="*")
         if code is None:
             return
-        if code != DISCORD_CONFIG_UNLOCK:
+        if code.strip() != FEED_CONFIG_UNLOCK:
             messagebox.showerror("Incorrect Code",
                                  "That access code is not correct.", parent=self)
             return
-        self._discord_locked = False
-        self._apply_discord_lock()
+        self._alerts_locked = False
+        self._apply_alerts_lock()
 
-    def _discord_log_msg(self, msg: str) -> None:
+    def _alerts_log_msg(self, msg: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
-        self._discord_log.configure(state="normal")
-        self._discord_log.insert("end", f"[{ts}]  {msg}\n")
-        self._discord_log.see("end")
-        self._discord_log.configure(state="disabled")
+        self._alerts_log.configure(state="normal")
+        self._alerts_log.insert("end", f"[{ts}]  {msg}\n")
+        self._alerts_log.see("end")
+        self._alerts_log.configure(state="disabled")
 
     # The two channel roles and the .env keys each one uses. Adding a third
     # stream later is a row here, not a new branch in every method below.
     _CHANNEL_KEYS = {
-        "buy":  ("DISCORD_CHANNEL", "DISCORD_CHANNEL_ID"),
-        "sell": ("DISCORD_SELL_CHANNEL", "DISCORD_SELL_CHANNEL_ID"),
+        "buy":  ("FEED_CHANNEL", "FEED_CHANNEL_ID"),
+        "sell": ("FEED_SELL_CHANNEL", "FEED_SELL_CHANNEL_ID"),
     }
 
-    def _save_discord_creds(self) -> None:
+    def _save_alerts_creds(self) -> None:
         updates = {
-            "DISCORD_TOKEN": self._discord_token_entry.get().strip(),
-            "DISCORD_SERVER": self._discord_server_entry.get().strip(),
+            "FEED_TOKEN": self._alerts_token_entry.get().strip(),
+            "FEED_SERVER": self._alerts_server_entry.get().strip(),
         }
-        for role, entry in (("buy", self._discord_chan_entry),
-                            ("sell", self._discord_sell_entry)):
+        for role, entry in (("buy", self._alerts_chan_entry),
+                            ("sell", self._alerts_sell_entry)):
             name_key, id_key = self._CHANNEL_KEYS[role]
             raw = entry.get().strip()
             updates[name_key] = raw
@@ -11496,9 +11636,9 @@ class App(ctk.CTk):
             elif raw.lower() != (_env(name_key) or "").lower():
                 updates[id_key] = ""
         _save_env_file(updates)
-        self._discord_log_msg("Saved.")
+        self._alerts_log_msg("Saved.")
 
-    def _ensure_discord_channel_id(self, role: str = "buy", required: bool = True):
+    def _ensure_alerts_channel_id(self, role: str = "buy", required: bool = True):
         """Return (channel_id, error). Resolves a channel NAME → id once and
         caches the id so daily pulls stay at one request per channel."""
         name_key, id_key = self._CHANNEL_KEYS[role]
@@ -11510,75 +11650,75 @@ class App(ctk.CTk):
             if not required:
                 return None, None   # sell channel is optional; not an error
             return None, "Enter a channel name (e.g. BUY) or ID first."
-        cid, gname, err = _discord_resolve_channel(
-            _env("DISCORD_TOKEN"), raw, _env("DISCORD_SERVER"))
+        cid, gname, err = _feed_resolve_channel(
+            _env("FEED_TOKEN"), raw, _env("FEED_SERVER"))
         if cid:
             _save_env_file({id_key: cid})
             if gname:
-                self.after(0, lambda: self._discord_log_msg(
+                self.after(0, lambda: self._alerts_log_msg(
                     f"Resolved #{raw} → '{gname}' (id {cid})"))
         return cid, err
 
-    def _discord_find_channel(self) -> None:
-        self._save_discord_creds()
-        self._discord_log_msg("Looking up channels...")
+    def _alerts_find_channel(self) -> None:
+        self._save_alerts_creds()
+        self._alerts_log_msg("Looking up channels...")
 
         def worker():
             for role, label in (("buy", "BUY"), ("sell", "SELL")):
-                cid, err = self._ensure_discord_channel_id(role, required=(role == "buy"))
+                cid, err = self._ensure_alerts_channel_id(role, required=(role == "buy"))
                 if err:
-                    self.after(0, lambda l=label, e=err: self._discord_log_msg(f"{l}: {e}"))
+                    self.after(0, lambda l=label, e=err: self._alerts_log_msg(f"{l}: {e}"))
                 elif cid:
-                    self.after(0, lambda l=label, c=cid: self._discord_log_msg(
+                    self.after(0, lambda l=label, c=cid: self._alerts_log_msg(
                         f"{l} channel ready (id {c})."))
                 else:
-                    self.after(0, lambda l=label: self._discord_log_msg(
+                    self.after(0, lambda l=label: self._alerts_log_msg(
                         f"{l}: not set — exits won't be imported."))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _test_discord(self) -> None:
-        self._save_discord_creds()
-        self._discord_log_msg("Testing connection...")
+    def _test_alerts_feed(self) -> None:
+        self._save_alerts_creds()
+        self._alerts_log_msg("Testing connection...")
 
         def worker():
-            cid, cerr = self._ensure_discord_channel_id("buy")
+            cid, cerr = self._ensure_alerts_channel_id("buy")
             if cerr:
-                self.after(0, lambda: self._discord_log_msg(f"FAILED: {cerr}"))
+                self.after(0, lambda: self._alerts_log_msg(f"FAILED: {cerr}"))
                 return
-            buy_msgs, err = _discord_fetch(cid, _env("DISCORD_TOKEN"), limit=10)
+            buy_msgs, err = _feed_fetch(cid, _env("FEED_TOKEN"), limit=10)
             if err:
-                self.after(0, lambda: self._discord_log_msg(f"FAILED: {err}"))
+                self.after(0, lambda: self._alerts_log_msg(f"FAILED: {err}"))
                 return
 
             sell_msgs = []
-            sell_cid, _ = self._ensure_discord_channel_id("sell", required=False)
+            sell_cid, _ = self._ensure_alerts_channel_id("sell", required=False)
             if sell_cid:
-                sell_msgs, serr = _discord_fetch(sell_cid, _env("DISCORD_TOKEN"), limit=10)
+                sell_msgs, serr = _feed_fetch(sell_cid, _env("FEED_TOKEN"), limit=10)
                 if serr:
                     sell_msgs = []
-                    self.after(0, lambda: self._discord_log_msg(f"SELL failed: {serr}"))
+                    self.after(0, lambda: self._alerts_log_msg(f"SELL failed: {serr}"))
 
             # Preview exactly what a real import would produce.
             batch = rsa_feed.parse_messages(buy_msgs, sell_msgs)
             syms = sorted({b.symbol for b in batch.buys})
-            self.after(0, lambda: self._discord_log_msg(
+            self.after(0, lambda: self._alerts_log_msg(
                 f"BUY  — read {len(buy_msgs)} messages, tickers: "
                 + (", ".join(syms) if syms else "none (check message format)")))
             if sell_cid:
                 exits = sorted({s.symbol for s in batch.sells})
                 ru = sorted({r.symbol for r in batch.roundups})
-                self.after(0, lambda: self._discord_log_msg(
+                self.after(0, lambda: self._alerts_log_msg(
                     f"SELL — read {len(sell_msgs)} messages, "
                     f"{len(batch.sells)} exit(s): " + (", ".join(exits) or "none")
                     + (f" | round-ups: {', '.join(ru)}" if ru else "")))
             else:
-                self.after(0, lambda: self._discord_log_msg(
+                self.after(0, lambda: self._alerts_log_msg(
                     "SELL — not configured (optional; exits won't be imported)."))
         threading.Thread(target=worker, daemon=True).start()
 
     def _extract_picks_from_text(self, text: str) -> List[Dict[str, str]]:
         """Plain-text fallback: (TICKER) parser first, then $cashtag."""
-        picks = self._parse_discord_picks(text)
+        picks = self._parse_alert_picks(text)
         if not picks:
             seen = set()
             for m in re.findall(r"\$([A-Za-z]{1,5})\b", text):
@@ -11634,12 +11774,12 @@ class App(ctk.CTk):
         _push_picks_remote(all_picks)
         self.after(0, lambda: self._render_quick_picks(all_picks))
 
-    def _discord_import_now(self) -> None:
-        self._save_discord_creds()
-        self._discord_log_msg("Importing latest messages...")
-        self._run_in_thread(self._discord_import_worker, False)
+    def _alerts_import_now(self) -> None:
+        self._save_alerts_creds()
+        self._alerts_log_msg("Importing latest messages...")
+        self._run_in_thread(self._alerts_import_worker, False)
 
-    def _discord_import_worker(self, use_after: bool) -> None:
+    def _alerts_import_worker(self, use_after: bool) -> None:
         """One pull of both alert channels.
 
         BUY drives Quick Picks (and therefore Mirror Trading) exactly as before.
@@ -11649,31 +11789,31 @@ class App(ctk.CTk):
         """
         buy_msgs, sell_msgs = [], []
 
-        cid, cerr = self._ensure_discord_channel_id()
+        cid, cerr = self._ensure_alerts_channel_id()
         if cerr:
-            self.after(0, lambda: self._discord_log_msg(f"Error: {cerr}"))
+            self.after(0, lambda: self._alerts_log_msg(f"Error: {cerr}"))
             return
-        after = self._discord_state.get("last_id") if use_after else None
-        buy_msgs, err = _discord_fetch(cid, _env("DISCORD_TOKEN"), after=after, limit=50)
+        after = self._alerts_state.get("last_id") if use_after else None
+        buy_msgs, err = _feed_fetch(cid, _env("FEED_TOKEN"), after=after, limit=50)
         if err:
-            self.after(0, lambda: self._discord_log_msg(f"Error: {err}"))
+            self.after(0, lambda: self._alerts_log_msg(f"Error: {err}"))
             return
 
         # The sell channel is optional: a user who only configured BUY keeps
         # working, they just don't get exits.
-        sell_cid, sell_err = self._ensure_discord_channel_id(role="sell", required=False)
+        sell_cid, sell_err = self._ensure_alerts_channel_id(role="sell", required=False)
         if sell_cid:
-            sell_after = self._discord_state.get("last_sell_id") if use_after else None
-            sell_msgs, serr = _discord_fetch(
-                sell_cid, _env("DISCORD_TOKEN"), after=sell_after, limit=50)
+            sell_after = self._alerts_state.get("last_sell_id") if use_after else None
+            sell_msgs, serr = _feed_fetch(
+                sell_cid, _env("FEED_TOKEN"), after=sell_after, limit=50)
             if serr:
-                self.after(0, lambda: self._discord_log_msg(f"Sell channel: {serr}"))
+                self.after(0, lambda: self._alerts_log_msg(f"Sell channel: {serr}"))
                 sell_msgs = []
         elif sell_err and not use_after:
-            self.after(0, lambda: self._discord_log_msg(f"Sell channel: {sell_err}"))
+            self.after(0, lambda: self._alerts_log_msg(f"Sell channel: {sell_err}"))
 
         if not buy_msgs and not sell_msgs:
-            self.after(0, lambda: self._discord_log_msg("No new messages."))
+            self.after(0, lambda: self._alerts_log_msg("No new messages."))
             return
 
         batch = rsa_feed.parse_messages(buy_msgs, sell_msgs)
@@ -11681,35 +11821,35 @@ class App(ctk.CTk):
         # --- BUY side: unchanged behaviour, straight into Quick Picks.
         added = self._import_picks_from_messages(buy_msgs) if buy_msgs else []
         if buy_msgs:
-            self._discord_state["last_id"] = str(max(int(m["id"]) for m in buy_msgs))
+            self._alerts_state["last_id"] = str(max(int(m["id"]) for m in buy_msgs))
         if sell_msgs:
-            self._discord_state["last_sell_id"] = str(max(int(m["id"]) for m in sell_msgs))
-        _save_discord_state(self._discord_state)
+            self._alerts_state["last_sell_id"] = str(max(int(m["id"]) for m in sell_msgs))
+        _save_feed_state(self._alerts_state)
 
         if added:
             syms = ", ".join(sorted({p["symbol"] for p in added}))
-            self.after(0, lambda: self._discord_log_msg(
+            self.after(0, lambda: self._alerts_log_msg(
                 f"Imported {len(added)} pick(s): {syms}"))
             self.after(0, lambda: self._push_notification(
-                f"Discord: imported {syms}", "success"))
+                f"Alert feed: imported {syms}", "success"))
             self.after(0, lambda: self._mirror_after_import(added))
         elif buy_msgs:
-            self.after(0, lambda: self._discord_log_msg("No new tickers found."))
+            self.after(0, lambda: self._alerts_log_msg("No new tickers found."))
 
         # --- SELL side: report what closed and what rounded up.
         if batch.sells:
             lines = ", ".join(
                 f"{s.symbol} {s.proceeds_text}" for s in batch.sells[-6:])
-            self.after(0, lambda: self._discord_log_msg(
+            self.after(0, lambda: self._alerts_log_msg(
                 f"{len(batch.sells)} exit(s): {lines}"))
             # Persist them: exits used to exist only as this one log line, so
             # the brokerage each alert named was lost the moment it scrolled.
             incoming = batch.to_json().get("sells") or []
             _save_sells(_merge_sells(_load_sells(), incoming))
-            self.after(0, lambda: self._sells_arrived("discord import"))
+            self.after(0, lambda: self._sells_arrived("feed import"))
         if batch.roundups:
             ru = ", ".join(sorted({r.symbol for r in batch.roundups}))
-            self.after(0, lambda: self._discord_log_msg(f"Round-up confirmed: {ru}"))
+            self.after(0, lambda: self._alerts_log_msg(f"Round-up confirmed: {ru}"))
             self.after(0, lambda: self._push_notification(
                 f"Round-up confirmed: {ru}", "success"))
 
@@ -11752,42 +11892,44 @@ class App(ctk.CTk):
         try:
             sent = cloud.publish_feed(batch.to_json())
         except CloudError as exc:
-            self.after(0, lambda: self._discord_log_msg(f"Cloud publish failed: {exc}"))
+            err = str(exc)
+            self.after(0, lambda: self._alerts_log_msg(f"Cloud publish failed: {err}"))
             return
         if any(sent.values()):
-            self.after(0, lambda: self._discord_log_msg(
+            self.after(0, lambda: self._alerts_log_msg(
                 f"Published to cloud — {sent['buys']} buys, {sent['sells']} exits, "
                 f"{sent['roundups']} round-ups."))
 
-    def _toggle_discord_import(self) -> None:
-        if self._discord_state.get("enabled"):
-            self._discord_state["enabled"] = False
-            if self._discord_poll_id:
-                self.after_cancel(self._discord_poll_id)
-                self._discord_poll_id = None
-            self._discord_status_dot.set_color(RED)
-            self._discord_status_lbl.configure(text="OFF", fg=RED)
-            self._discord_toggle_btn.configure_text("Enable Auto-Import")
-            self._discord_log_msg("Auto-import DISABLED")
-            _save_discord_state(self._discord_state)
+    def _toggle_alerts_import(self) -> None:
+        if self._alerts_state.get("enabled"):
+            self._alerts_state["enabled"] = False
+            if self._alerts_poll_id:
+                self.after_cancel(self._alerts_poll_id)
+                self._alerts_poll_id = None
+            self._alerts_status_dot.set_color(RED)
+            self._alerts_status_lbl.configure(text="OFF", fg=RED)
+            self._alerts_toggle_btn.configure_text("Enable Auto-Import")
+            self._alerts_log_msg("Auto-import DISABLED")
+            _save_feed_state(self._alerts_state)
             return
 
-        if not _env("DISCORD_TOKEN") or not _env("DISCORD_CHANNEL_ID"):
-            self._save_discord_creds()
-        if not _env("DISCORD_TOKEN") or not _env("DISCORD_CHANNEL_ID"):
+        if not _env("FEED_TOKEN") or not _env("FEED_CHANNEL_ID"):
+            self._save_alerts_creds()
+        if not _env("FEED_TOKEN") or not _env("FEED_CHANNEL_ID"):
             messagebox.showwarning("Missing details",
-                                   "Enter and Save your Discord token and channel ID first.",
+                                   "Feed settings are not filled in yet — unlock them and "
+                                   "save a token and channel first.",
                                    parent=self)
             return
-        self._discord_state["enabled"] = True
-        self._discord_status_dot.set_color(GREEN)
-        self._discord_status_lbl.configure(text="ON", fg=GREEN)
-        self._discord_toggle_btn.configure_text("Disable Auto-Import")
-        self._discord_log_msg("Auto-import ENABLED — pulls once a day")
-        _save_discord_state(self._discord_state)
-        self._discord_daily_check()
+        self._alerts_state["enabled"] = True
+        self._alerts_status_dot.set_color(GREEN)
+        self._alerts_status_lbl.configure(text="ON", fg=GREEN)
+        self._alerts_toggle_btn.configure_text("Disable Auto-Import")
+        self._alerts_log_msg("Auto-import ENABLED — pulls once a day")
+        _save_feed_state(self._alerts_state)
+        self._alerts_daily_check()
 
-    def _discord_daily_check(self, force: bool = False) -> None:
+    def _alerts_daily_check(self, force: bool = False) -> None:
         """Pull at most once per calendar day (one request/day — invisible to
         server staff, minimal account footprint). Re-checks hourly so it still
         fires on a new day if the app is left open.
@@ -11802,20 +11944,20 @@ class App(ctk.CTk):
         must not depend on this toggle, which exists to control whether we
         import picks.
         """
-        if not self._discord_state.get("enabled"):
+        if not self._alerts_state.get("enabled"):
             return
         # Re-entrant: enabling the toggle and the launch pull both call in.
-        self._cancel_timer("_discord_poll_id")
+        self._cancel_timer("_alerts_poll_id")
         today = datetime.now().strftime("%Y-%m-%d")
-        if force or self._discord_state.get("last_pull_date") != today:
-            self._discord_state["last_pull_date"] = today
-            _save_discord_state(self._discord_state)
-            self._discord_log_msg("Startup pull..." if force else "Daily pull...")
-            self._run_in_thread(self._discord_import_worker, True)
+        if force or self._alerts_state.get("last_pull_date") != today:
+            self._alerts_state["last_pull_date"] = today
+            _save_feed_state(self._alerts_state)
+            self._alerts_log_msg("Startup pull..." if force else "Daily pull...")
+            self._run_in_thread(self._alerts_import_worker, True)
         else:
-            self._discord_log_msg("Already pulled today — next pull tomorrow.")
+            self._alerts_log_msg("Already pulled today — next pull tomorrow.")
         # hourly heartbeat to catch the day rollover
-        self._discord_poll_id = self.after(3600000, self._discord_daily_check)
+        self._alerts_poll_id = self.after(3600000, self._alerts_daily_check)
 
     # ---- Mirror (what automation did) --------------------------------------
     #
@@ -11827,7 +11969,7 @@ class App(ctk.CTk):
     # is why the answer used to be unavailable an hour later.
     #
     # Everything rendered here comes out of mirror_runs.json, written locally by
-    # this machine's own automation. No Discord, no subscription, no network.
+    # this machine's own automation. No alert feed, no subscription, no network.
 
     _MIRROR_OUTCOMES = {
         "filled":  ("FILLED",  GREEN),
@@ -12227,8 +12369,8 @@ class App(ctk.CTk):
     # ---- Exits (the TRACK board) ------------------------------------------
     #
     # The BUY feed says what to open. This page says what to CLOSE, which the
-    # app previously had no answer for at all — you had to read the Discord
-    # board yourself and remember which brokers were worth trying.
+    # app previously had no answer for at all — you had to read the alerts
+    # yourself and remember which brokers were worth trying.
     #
     # The routing rule is the whole point and lives in lifecycle.brokers_for():
     # a fractional play is only sellable at Public, Robinhood and SoFi, because
@@ -12236,7 +12378,7 @@ class App(ctk.CTk):
     # whole share and sells anywhere.
 
     def _track_channel(self) -> str:
-        return _env("DISCORD_LIFECYCLE_CHANNEL") or _env("DISCORD_TRACK_CHANNEL")
+        return _env("FEED_LIFECYCLE_CHANNEL") or _env("FEED_TRACK_CHANNEL")
 
     def _build_exits(self) -> None:
         frame = tk.Frame(self._content, bg=BG_PRIMARY)
@@ -12475,7 +12617,7 @@ class App(ctk.CTk):
             self._empty_state(
                 self._exits_list, "info", "Nothing to sell",
                 "Exits arrive with your subscription once this device is "
-                "linked — no Discord needed — and each one names the brokerage "
+                "linked — nothing else to set up — and each one names the brokerage "
                 "it was called at. Fractional remnants show up here on their "
                 "own off the split board. Neither has anything for you right "
                 "now.").pack(fill="x")
@@ -13092,9 +13234,15 @@ class App(ctk.CTk):
                 f"{len(tasks)} called exit(s) waiting for the open", "info")
             return
 
-        self._autosell_queue.extend(tasks)
-        self._log(f"Auto-sell ({reason}): queued {len(tasks)} exit(s) — "
-                  f"{', '.join(t.symbol for t in tasks)}"
+        added = self._queue_extend(tasks)
+        if not added:
+            # Everything this pull found is already waiting. Silent on purpose:
+            # a queue held behind a long trade would otherwise repeat the same
+            # line every hour and read like the exits were never picked up.
+            self._autosell_pump()
+            return
+        self._log(f"Auto-sell ({reason}): queued {len(added)} exit(s) — "
+                  f"{', '.join(t.symbol for t in added)}"
                   + (" [DRY RUN]" if self._autosell_dry_run.get() else ""))
         self._autosell_pump()
 
@@ -13159,9 +13307,11 @@ class App(ctk.CTk):
         # not drop what the user just confirmed. Deliberately scoped to the
         # tasks in hand rather than clearing the whole record.
         self._autosell_unclaim(tasks)
-        self._autosell_queue.extend(tasks)
-        self._log(f"Sweep: queued {len(tasks)} called exit(s) — "
-                  f"{', '.join(t.symbol for t in tasks)}"
+        added = self._queue_extend(tasks)
+        dupes = len(tasks) - len(added)
+        self._log(f"Sweep: queued {len(added)} called exit(s) — "
+                  f"{', '.join(t.symbol for t in added) or 'none new'}"
+                  + (f" ({dupes} already waiting)" if dupes else "")
                   + (" [DRY RUN]" if self._autosell_dry_run.get() else ""))
         # Reading holdings across several brokers takes tens of seconds and
         # every word of progress goes to the Activity log on another page.
@@ -13287,6 +13437,29 @@ class App(ctk.CTk):
     # sit and watch a ten-account Fidelity leg finish before you could ask for
     # the next one. Queue defers it instead.
 
+    def _queue_extend(self, tasks) -> List[Any]:
+        """Add a batch of sells, skipping anything already waiting.
+
+        The single-add path has always refused a duplicate; the bulk feeders —
+        the hourly check and the sweep — used to extend() blindly. They filter
+        on the sold-once record, but a play the pump has not POPPED yet was
+        never claimed, so a queue stuck behind a long trade collected the same
+        names again on every pull: "giving up on ARTL, GCTK, ARTL, GCTK, MGN,
+        MPU, ARTL, …" is one wedge and four pulls, not fourteen plays.
+
+        Harmless to the orders themselves (the pump drops a duplicate when it
+        reaches one) and not harmless at all to a human reading the log, who
+        cannot tell that list from a real backlog.
+        """
+        added = []
+        for t in tasks:
+            key = self._autosell_key(t)
+            if any(self._autosell_key(q) == key for q in self._autosell_queue):
+                continue
+            self._autosell_queue.append(t)
+            added.append(t)
+        return added
+
     def _queue_sell(self, task, *, source: str = "queued by hand") -> bool:
         """Add one sell to the queue. Returns False if it was already there."""
         key = self._autosell_key(task)
@@ -13407,6 +13580,7 @@ class App(ctk.CTk):
             return
         left = ", ".join(t.symbol for t in self._autosell_queue)
         self._autosell_queue.clear()
+        self._queue_stalled_said = False
         self._log(f"Queue: cleared {n} waiting sell(s) — {left}. Anything "
                   f"already placed is not affected.", "warn")
         self._render_sell_queue()
@@ -13445,6 +13619,58 @@ class App(ctk.CTk):
         self._queue_label.configure(
             text=text, fg=YELLOW if held else TEXT_PRIMARY)
 
+    def _pump_later(self, ms: int) -> None:
+        """Schedule exactly ONE pending pump tick.
+
+        Every feeder — the hourly auto-sell check, the sweep, a Queue click —
+        calls _autosell_pump, and the pump re-arms itself while it waits behind
+        a running trade. Nothing cancelled the previous timer, so a pull that
+        landed mid-wait left two chains ticking and a sweep click a third.
+
+        That was not merely wasteful: the stall watchdog used to count TICKS,
+        so four chains burned its budget four times as fast and it gave up
+        after two and a half minutes while announcing it had waited ten. The
+        watchdog is on a clock now, but one pending tick is still the honest
+        shape of a strictly sequential queue.
+        """
+        old = getattr(self, "_pump_after_id", None)
+        if old is not None:
+            try:
+                self.after_cancel(old)
+            except Exception:                   # already fired or invalid id
+                pass
+        self._pump_after_id = self.after(ms, self._pump_tick)
+
+    def _pump_tick(self) -> None:
+        self._pump_after_id = None
+        self._autosell_pump()
+
+    def _gate_idle_secs(self) -> float:
+        """Seconds since the thing holding the queue last showed any progress.
+
+        Two holders, one answer. _trade_in_flight is a batch, and a batch moves
+        every time a broker reports its leg (_trade_broker_complete stamps it).
+        _queue_busy is a holdings read, which has no intermediate progress at
+        all, so its own start time is the only stamp available.
+        """
+        now = datetime.now()
+        marks = []
+        # A holder with no stamp starts its clock HERE rather than reporting
+        # zero forever: "no stamp" is the one state that would otherwise put
+        # the watchdog permanently to sleep, which is the silent five-second
+        # spin it exists to replace.
+        if getattr(self, "_trade_in_flight", False):
+            if getattr(self, "_trade_progress_at", None) is None:
+                self._trade_progress_at = now
+            marks.append(self._trade_progress_at)
+        if getattr(self, "_queue_busy", False):
+            if getattr(self, "_queue_busy_at", None) is None:
+                self._queue_busy_at = now
+            marks.append(self._queue_busy_at)
+        if not marks:
+            return 0.0
+        return (now - max(marks)).total_seconds()
+
     def _autosell_pump(self) -> None:
         """Start the next play once the previous one has finished.
 
@@ -13454,16 +13680,15 @@ class App(ctk.CTk):
         """
         self._render_sell_queue()
         if not self._autosell_queue:
-            self._autosell_waits = 0
+            self._queue_stalled_said = False
             return
 
         # Out of hours the queue HOLDS rather than drains. Auto-sell and the
         # sweep already refuse to queue when the book is shut, but a hand-queued
         # sell is exactly the case where you line orders up the evening before
         # and expect them at the open — so this is checked here, where the order
-        # is actually placed, rather than only at the door. Deliberately not on
-        # the _autosell_waits counter below: that one gives up after ten
-        # minutes, and a closed market is not a stuck trade.
+        # is actually placed, rather than only at the door. Deliberately ahead
+        # of the stall watchdog below: a closed market is not a stuck trade.
         state, label, _ = _market_status()
         if state != "open":
             if not getattr(self, "_queue_held_said", False):
@@ -13474,7 +13699,7 @@ class App(ctk.CTk):
                 self._push_notification(
                     f"{len(self._autosell_queue)} sell(s) queued for the open",
                     "info")
-            self.after(60000, self._autosell_pump)
+            self._pump_later(60000)
             return
         self._queue_held_said = False
 
@@ -13489,36 +13714,38 @@ class App(ctk.CTk):
         # it afterwards, but recovering from a race is not the same as not
         # having one.
         if getattr(self, "_trade_in_flight", False) or getattr(self, "_queue_busy", False):
-            # Wait, but not forever. A broker that hangs holds _trade_in_flight
-            # true, and without a ceiling the rest of the list waits behind it
-            # in silence for the life of the process — which reads exactly like
-            # auto-sell being off. Say so, then stand down rather than spinning
-            # a timer every five seconds until the app is closed.
-            self._autosell_waits = getattr(self, "_autosell_waits", 0) + 1
-            if self._autosell_waits > AUTOSELL_WAIT_TICKS:
-                left = ", ".join(t.symbol for t in self._autosell_queue)
-                self._autosell_waits = 0
-                self._autosell_queue.clear()
-                # Released too: a read that never called back would otherwise
-                # keep the gate shut for the life of the process, and the next
-                # thing queued would sit behind a task nobody is waiting for.
-                self._queue_busy = False
-                self._log(f"Auto-sell: a trade has been running for "
-                          f"{AUTOSELL_WAIT_TICKS * 5 // 60} minutes — giving up on "
-                          f"{left}. They stay on the Exits tab to sell by hand.",
-                          "warn")
-                self._push_notification(
-                    f"Auto-sell stalled behind a slow trade — {left} not sold",
-                    "warning")
+            # Wait, but notice a WEDGE. The distinction that matters is between
+            # a trade taking a long time and a trade that has stopped: a single
+            # play sold across ten brokerages, each driving a browser through
+            # ten or twenty accounts, is a twenty-minute batch on a good day and
+            # there is nothing wrong with it. Judging that on elapsed time meant
+            # the queue stood itself down mid-drain — seconds after a broker had
+            # reported twenty filled accounts — and dropped every remaining sell
+            # on the floor. So: measure from the last sign of life, and when it
+            # really has gone quiet, KEEP the queue and look again in a minute.
+            # A wedge usually ends, and the sells are still wanted when it does.
+            if self._gate_idle_secs() > AUTOSELL_STALL_SECS:
+                if not getattr(self, "_queue_stalled_said", False):
+                    self._queue_stalled_said = True
+                    left = ", ".join(t.symbol for t in self._autosell_queue)
+                    mins = AUTOSELL_STALL_SECS // 60
+                    self._log(f"Queue: nothing has moved for {mins} minutes — "
+                              f"{left} are still queued and will go as soon as "
+                              f"the broker lets go. Sell them from the Exits tab "
+                              f"if you don't want to wait.", "warn")
+                    self._push_notification(
+                        f"A trade looks wedged — {left} still waiting to sell",
+                        "warning")
+                self._pump_later(AUTOSELL_STALL_POLL_MS)
                 return
-            self.after(5000, self._autosell_pump)
+            self._pump_later(5000)
             return
-        self._autosell_waits = 0
+        self._queue_stalled_said = False
 
         task = self._autosell_queue.pop(0)
         key = self._autosell_key(task)
         if key in self._autosell_sold:              # a re-queue between ticks
-            self.after(200, self._autosell_pump)
+            self._pump_later(200)
             return
 
         # Claimed BEFORE the holdings read, not after the order. Everything from
@@ -13530,6 +13757,7 @@ class App(ctk.CTk):
         self._log(f"Auto-sell: reading {task.symbol} holdings at "
                   f"{', '.join(task.brokers)}…")
         self._queue_busy = True
+        self._queue_busy_at = datetime.now()
         self._render_sell_queue()
         self._run_in_thread(self._autosell_resolve, task)
 
@@ -13558,7 +13786,7 @@ class App(ctk.CTk):
         self._log(f"Auto-sell: {task.symbol} failed — {why}", "error")
         self._push_notification(f"Auto-sell couldn't handle {task.symbol}: {why}",
                                 "warning")
-        self.after(1000, self._autosell_pump)
+        self._pump_later(1000)
 
     def _autosell_unclaim(self, tasks) -> None:
         """Forget that these particular plays were ever attempted.
@@ -13690,7 +13918,7 @@ class App(ctk.CTk):
         if getattr(self, "_trade_in_flight", False):
             self._autosell_retry(task, "another trade started mid-read")
             self._autosell_queue.insert(0, task)
-            self.after(5000, self._autosell_pump)
+            self._pump_later(5000)
             return
 
         if not resolved.ok:
@@ -13725,7 +13953,7 @@ class App(ctk.CTk):
                 self._push_notification(f"Auto-sell skipped {task.symbol}: "
                                         f"{'; '.join(why) or 'nothing to sell'}",
                                         "warning")
-            self.after(1000, self._autosell_pump)
+            self._pump_later(1000)
             return
 
         dry = bool(self._autosell_dry_run.get())
@@ -13748,7 +13976,7 @@ class App(ctk.CTk):
                 f"{task.symbol} may not have sold — check the broker", "error")
         # The next play waits for this batch; _autosell_pump re-arms itself
         # while a trade is in flight rather than racing it.
-        self.after(5000, self._autosell_pump)
+        self._pump_later(5000)
 
     # ---- TRACK polling -----------------------------------------------------
 
@@ -13762,10 +13990,10 @@ class App(ctk.CTk):
         told the truth if you happened to press Reload. An alert published at
         10am is worth nothing to someone who sees it tomorrow.
 
-        Sell alerts used to arrive only through the Discord SELL channel, which
+        Sell alerts used to arrive only through the feed's SELL channel, which
         meant a customer without a token saw an empty card forever. Cloud rows
         are MERGED into whatever is already on disk rather than replacing it, so
-        an install that once read Discord keeps its history.
+        an install that once read the feed keeps its history.
         """
         if not CLOUD_AVAILABLE:
             return
@@ -13871,7 +14099,7 @@ class App(ctk.CTk):
     def _track_loop(self) -> None:
         """Hourly TRACK poll, on its own timer.
 
-        Deliberately NOT tied to the Discord auto-import toggle. That switch
+        Deliberately NOT tied to the alert-feed auto-import toggle. That switch
         controls whether we import picks — writing to the watchlist and the
         mirror queue. Reading the board is a different thing: someone who
         enters picks by hand still holds positions, and still needs to be told
@@ -13884,7 +14112,7 @@ class App(ctk.CTk):
         if self._track_available():
             self._track_pull_now()
         # Exits ride the same tick: one hourly refresh of everything the feed
-        # supplies, so no page depends on the user having Discord configured.
+        # supplies, so no page depends on the user having the feed configured.
         self._run_in_thread(self._feed_pull_worker)
         self._track_loop_id = self.after(3600000, self._track_loop)
 
@@ -13912,7 +14140,7 @@ class App(ctk.CTk):
         """Either source will do: the cloud feed, or a TRACK channel.
 
         No account check — the board is served to anyone, so the only way to
-        have no source at all is having no network and no Discord channel.
+        have no source at all is having no network and no alert channel.
         """
         return bool(CLOUD_AVAILABLE or self._track_channel())
 
@@ -13923,7 +14151,7 @@ class App(ctk.CTk):
             self._push_notification(
                 "Can't read the round-up board — install the requirements "
                 "(py -3.13 -m pip install -r requirements.txt), or set "
-                "DISCORD_LIFECYCLE_CHANNEL to read it from Discord directly.",
+                "FEED_LIFECYCLE_CHANNEL to read the board from the feed directly.",
                 "warning")
             return
         self._track_busy = True
@@ -13932,8 +14160,9 @@ class App(ctk.CTk):
     def _track_pull_worker(self) -> None:
         """One board pull, off the UI thread.
 
-        Cloud first, Discord second — the cloud works for every subscriber and
-        Discord only for whoever holds a token with access to the channel. On a
+        Cloud first, the alert feed second — the cloud works for every
+        subscriber and the feed only for whoever holds a token with access to
+        the channel. On a
         customer's install there is no token at all, and that is the normal
         case, not the fallback.
 
@@ -13943,7 +14172,7 @@ class App(ctk.CTk):
         rows, changes, err = [], [], ""
         try:
             rows, changes, err = lifecycle.pull(
-                self._track_channel(), _env("DISCORD_TOKEN"))
+                self._track_channel(), _env("FEED_TOKEN"))
         except Exception as exc:
             err = str(exc)[:160]
         self.after(0, lambda: self._track_apply(rows, changes, err))
@@ -14544,6 +14773,7 @@ class App(ctk.CTk):
         so the guard holds even on a build where the strip is missing.
         """
         self._brokers_in_flight.update(batch.get("all_brokers") or [])
+        self._trade_progress_at = datetime.now()   # the gate just showed life
         if not hasattr(self, "_live_card"):
             self._refresh_trade_busy()
             return
@@ -14743,3 +14973,8 @@ class App(ctk.CTk):
 if __name__ == "__main__":
     app = App()
     app.mainloop()
+    # Reached only when the root window has gone. Under `pyw` this is the last
+    # observable moment of the process, so say so: a crash.log that ends here
+    # means the window was torn down, and one that ends without it means the
+    # process was killed outright.
+    _crash_note("MAINLOOP RETURNED")

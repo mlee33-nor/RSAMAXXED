@@ -4,7 +4,7 @@
 The cloud runs on container-local SQLite until Postgres is attached, which means
 every deploy replaces the disk and the whole feed with it. `publish_feed.py`
 recovers most of that on its next run — but only as far back as the last 100
-Discord messages, because that is all the channel tail holds. Everything older
+recent messages, because that is all the channel tail holds. Everything older
 is gone for good.
 
 This closes that hole for nothing: every run merges the live feed into a local

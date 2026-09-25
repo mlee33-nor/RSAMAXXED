@@ -40,7 +40,7 @@ from typing import Any, Iterable, Optional, Sequence
 
 from modules import atomic
 
-import discord_feed
+import feed_client
 import rsa_feed
 import trade_journal
 from rsa_feed import LifecycleRow
@@ -562,7 +562,7 @@ def fetch(channel_id: str, token: str, *, limit: int = 5) -> tuple[list[Lifecycl
     `limit` is small on purpose: the board is one message, so anything past the
     first few is unrelated chatter.
     """
-    msgs, err = discord_feed.fetch(channel_id, token, limit=limit)
+    msgs, err = feed_client.fetch(channel_id, token, limit=limit)
     if err:
         return [], err
     if not msgs:
@@ -577,7 +577,7 @@ def fetch_cloud() -> tuple[list[LifecycleRow], str]:
     """The board from the cloud feed. (rows, error).
 
     The route that works for an actual customer, and it needs no account.
-    Reading TRACK off Discord needs a personal user token with access to a
+    Reading TRACK off the alert channels needs a personal user token with a
     private channel, which is something only the operator has — everyone else
     gets the board from the cloud, linked or not.
     """
@@ -617,11 +617,11 @@ def pull(channel_id: str = "", token: str = "",
 
     Source order depends on which machine this is, and it has to:
 
-      OPERATOR (a TRACK channel is configured) reads Discord first. Discord is
+      OPERATOR (a TRACK channel is configured) reads the channel first. It is
         the source of truth for the board, and this machine is the one that
         publishes it. Reading the cloud first here was a feedback loop — we'd
         read back what we last published, find rows, never fall through to
-        Discord, and the board would freeze at whatever it said the first time.
+        the channel, and the board would freeze at whatever it first said.
       EVERYONE ELSE reads the cloud, which is the only source they have. There
         is no account needed for it; see fetch_cloud.
 
@@ -661,7 +661,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--all", action="store_true",
                     help="include plays we hold nowhere")
     ap.add_argument("--channel", default="",
-                    help="TRACK channel id (default: DISCORD_LIFECYCLE_CHANNEL)")
+                    help="TRACK channel id (default: FEED_LIFECYCLE_CHANNEL)")
     args = ap.parse_args(argv)
 
     try:
@@ -670,14 +670,14 @@ def _main(argv: Optional[list[str]] = None) -> int:
     except Exception:
         pass
 
-    token = (os.environ.get("DISCORD_TOKEN") or "").strip()
-    channel = (args.channel or os.environ.get("DISCORD_LIFECYCLE_CHANNEL")
-               or os.environ.get("DISCORD_TRACK_CHANNEL") or "").strip()
+    token = (os.environ.get("FEED_TOKEN") or "").strip()
+    channel = (args.channel or os.environ.get("FEED_LIFECYCLE_CHANNEL")
+               or os.environ.get("FEED_TRACK_CHANNEL") or "").strip()
     if not token:
-        print("DISCORD_TOKEN is not set")
+        print("FEED_TOKEN is not set")
         return 1
     if not channel:
-        print("Set DISCORD_LIFECYCLE_CHANNEL to the TRACK channel id")
+        print("Set FEED_LIFECYCLE_CHANNEL to the TRACK channel id")
         return 1
 
     rows, changes, err = pull(channel, token)

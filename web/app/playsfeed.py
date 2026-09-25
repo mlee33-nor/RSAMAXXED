@@ -1042,7 +1042,7 @@ def import_picks_file(db: Session, path: str) -> int:
     # whatever source_id it arrived under.
     #
     # The two paths key the same real alert differently: the publisher uses the
-    # Discord message id, this file uses picks:SYM:DATE. Matching on source_id
+    # upstream message id, this file uses picks:SYM:DATE. Matching on source_id
     # alone therefore lets one alert land twice — once complete from the
     # publisher, with its ratio, entry price and buy deadline, and once bare
     # from here with a dash in every one of those columns. On a public board

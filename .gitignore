@@ -10,7 +10,7 @@ custom_accounts.json
 mirror_state.json
 # What automation did, run by run — holds real broker account ids.
 mirror_runs.json
-discord_state.json
+feed_state.json
 watchlist.json
 *.exe
 .claude/

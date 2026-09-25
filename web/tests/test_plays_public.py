@@ -193,6 +193,10 @@ def test_a_logged_out_visitor_is_told_the_board_exists(anon):
 #: failing the day that date aged out, which is a false alarm arriving on a
 #: calendar rather than on a commit. Relative to today, they test the rule.
 RECENT_SELL_DATE = (date.today() - timedelta(days=5)).isoformat()
+# The open play must stay inside the board's EXIT_WINDOW_DAYS window, which is
+# measured from today. A fixed date here expired on its own (2026-08-01 fell off
+# the board on 2026-09-15) and failed six tests with nothing actually broken.
+RECENT_ALERT_DATE = (date.today() - timedelta(days=10)).isoformat()
 
 
 @pytest.fixture()
@@ -201,7 +205,7 @@ def board(anon):
     anon.post("/api/v1/plays/ingest", headers=KEY, json={
         "buys": [
             {"source_id": "t:1", "symbol": "HCWB", "kind": "standard",
-             "alert_date": "2026-08-01", "ratio": "1:15", "ratio_n": 15,
+             "alert_date": RECENT_ALERT_DATE, "ratio": "1:15", "ratio_n": 15,
              "entry_price": 0.25, "est_profit": 3.5, "last_buy_date": "2099-01-01",
              "roundup_history": "3/3 rounded up", "strategy": "1 Share/Account"},
             {"source_id": "t:2", "symbol": "AGAE", "kind": "otc",
@@ -222,8 +226,8 @@ def board(anon):
              "alert_date": "2026-07-02", "status": "rounded_up", "kind": "otc"},
             {"source_id": "2026-07-03:NUKK", "symbol": "NUKK", "sell_symbol": "NUKK",
              "alert_date": "2026-07-03", "status": "cash_in_lieu", "kind": "standard"},
-            {"source_id": "2026-08-01:HCWB", "symbol": "HCWB", "sell_symbol": "HCWB",
-             "alert_date": "2026-08-01", "status": "pending", "kind": "standard"},
+            {"source_id": f"{RECENT_ALERT_DATE}:HCWB", "symbol": "HCWB", "sell_symbol": "HCWB",
+             "alert_date": RECENT_ALERT_DATE, "status": "pending", "kind": "standard"},
         ],
     })
     return _unlock(anon).text
@@ -348,7 +352,7 @@ def test_every_open_play_can_be_ticked_off(board):
 def test_a_mark_is_keyed_to_the_alert_and_not_to_a_row_id(board):
     """The deploy runs an ephemeral database and re-ingests the feed, so row ids
     move under a browser that is still holding notes. date:SYMBOL doesn't."""
-    assert 'data-play="2026-08-01:HCWB"' in board
+    assert f'data-play="{RECENT_ALERT_DATE}:HCWB"' in board
 
 
 def test_a_mark_carries_the_post_split_ticker_too(anon):
@@ -357,9 +361,9 @@ def test_a_mark_carries_the_post_split_ticker_too(anon):
     the mark carries both names."""
     anon.post("/api/v1/plays/ingest", headers=KEY, json={
         "buys": [{"source_id": "rn:1", "symbol": "OLDCO", "kind": "standard",
-                  "alert_date": "2026-08-02", "last_buy_date": "2099-01-01"}],
-        "lifecycle": [{"source_id": "2026-08-02:OLDCO", "symbol": "OLDCO",
-                       "sell_symbol": "NEWCO", "alert_date": "2026-08-02",
+                  "alert_date": RECENT_ALERT_DATE, "last_buy_date": "2099-01-01"}],
+        "lifecycle": [{"source_id": f"{RECENT_ALERT_DATE}:OLDCO", "symbol": "OLDCO",
+                       "sell_symbol": "NEWCO", "alert_date": RECENT_ALERT_DATE,
                        "status": "rounded_up", "kind": "standard"}],
     })
     assert 'data-syms="OLDCO,NEWCO"' in _unlock(anon).text
@@ -493,7 +497,7 @@ def test_a_parser_bug_in_a_note_can_be_corrected(anon):
     published "$159.84**" against two unrelated tickers.
     """
     payload = {"sells": [{"source_id": "note:1", "symbol": "BYAH",
-                          "sell_date": "2026-08-07", "exit_price": 3.22,
+                          "sell_date": RECENT_SELL_DATE, "exit_price": 3.22,
                           "proceeds_low": 19.32, "note": "$159.84**",
                           "legs": [{"broker": "Chase", "accounts_low": 6,
                                     "accounts_high": 6}]}]}
@@ -517,7 +521,7 @@ def test_the_money_on_an_exit_can_never_be_rewritten(anon):
     price must change nothing — otherwise anyone holding the ingest key could
     restate what a play was worth after the fact."""
     first = {"sells": [{"source_id": "immutable:1", "symbol": "ZZTOP",
-                        "sell_date": "2026-08-07", "exit_price": 1.00,
+                        "sell_date": RECENT_SELL_DATE, "exit_price": 1.00,
                         "proceeds_low": 10.0, "legs": []}]}
     anon.post("/api/v1/plays/ingest", headers=KEY, json=first)
 
@@ -1102,7 +1106,7 @@ def test_this_month_reports_that_month_and_not_the_whole_record(payouts):
 # ------------------------------------------------- the two ingest paths
 #
 # An alert can reach the board two ways, and they key the SAME real alert
-# differently: the publisher uses the Discord message id, picks.json uses
+# differently: the publisher uses the upstream message id, picks.json uses
 # picks:SYM:DATE. Deduping on source_id alone therefore lets one alert land
 # twice — once complete from the publisher and once bare from the file, with a
 # dash where its ratio, entry price and buy deadline should be. On a public

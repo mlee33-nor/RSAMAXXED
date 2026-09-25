@@ -2,7 +2,7 @@
 """Publish the desktop app's picks to the live web feed, once.
 
 The desktop app writes the current RSA picks to `picks.json` at the repo root on
-its daily Discord pull. Railway only deploys the `web/` directory, so it can't
+its daily feed pull. Railway only deploys the `web/` directory, so it can't
 see that file — this script copies it into `web/picks.json` (which IS in the
 deploy) and pushes, so Railway redeploys and the free Plays page re-seeds from
 the fresh picks.
@@ -22,14 +22,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+from modules import quiet
+
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "picks.json"
 DST = ROOT / "web" / "picks.json"
 
 
 def _git(*args: str) -> subprocess.CompletedProcess:
+    # no_window_kwargs so this stays silent when it is driven from the GUI
+    # (pythonw has no console, so git would be handed a brand new one).
     return subprocess.run(["git", "-C", str(ROOT), *args],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True,
+                          **quiet.no_window_kwargs())
 
 
 def main() -> int:

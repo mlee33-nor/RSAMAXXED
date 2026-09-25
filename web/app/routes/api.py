@@ -291,7 +291,7 @@ def whoami(device: Device = Depends(require_device)) -> dict[str, Any]:
 #          board password (PLAYS_PASSWORD) — same bytes, no account.
 #
 # The write asymmetry is the point: the feed cannot be forged, and nobody but
-# the operator ever needs Discord credentials.
+# the operator ever needs upstream credentials.
 #
 # Reading used to be wide open, on the reasoning that the alert feed was a free
 # funnel rather than the product. It is now a paid tier (plans.py), so an
@@ -479,7 +479,7 @@ def ingest_plays(body: FeedIn, db: Session = Depends(get_db)) -> dict[str, Any]:
     # real identity. Same reasoning as the (symbol, date) guard in
     # import_picks_file, and the same failure it exists to prevent.
     def _msg_of(source_id: str) -> str:
-        """The Discord message an exit came from, or "" if the id does not name
+        """The upstream message an exit came from, or "" if the id does not name
         one. A leading run of digits is a snowflake; anything else did not come
         from the sell parser and must not be lumped in with its neighbours by a
         prefix that happens to match. The tail is deliberately unconstrained —
@@ -698,9 +698,9 @@ def read_lifecycle(
 ) -> list[dict[str, Any]]:
     """The TRACK board, in the shape rsa_feed.LifecycleRow serialises to.
 
-    This is what lets a subscriber who is not in the alert Discord see which of
+    This is what lets a subscriber with no access to the alert channels see which of
     their positions actually resolved. Without it the desktop's Exits page only
-    works for someone holding a personal Discord token with access to the
+    works for someone holding a personal feed token with access to the
     channel — which is nobody we sell to.
 
     Ordered oldest-first so a client folding it into local state processes the

@@ -32,7 +32,7 @@ def _reload_picks_once() -> int:
 
 async def _picks_reload_loop() -> None:
     """Keep the free feed live: re-read picks.json on a fixed interval so the
-    desktop app's daily Discord pull shows up without anyone loading the page.
+    desktop app's daily feed pull shows up without anyone loading the page.
     The import is idempotent, so each tick only inserts genuinely-new alerts."""
     interval = config.PICKS_RELOAD_SECONDS
     while True:
@@ -61,7 +61,12 @@ async def lifespan(_app: FastAPI):
             task.cancel()
 
 
-app = FastAPI(title="RSAMAXXED Cloud", docs_url=None, redoc_url=None, lifespan=lifespan)
+# openapi_url too, not just the two doc pages: the schema is built from every
+# route's docstring, and those describe internals -- where the feed comes from,
+# what the operator runs -- that customers must never see. Turning off /docs
+# alone still served all of it at /openapi.json.
+app = FastAPI(title="RSAMAXXED Cloud", docs_url=None, redoc_url=None,
+              openapi_url=None, lifespan=lifespan)
 
 app.add_middleware(
     SessionMiddleware,
