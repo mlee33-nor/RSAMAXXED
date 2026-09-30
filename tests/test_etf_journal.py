@@ -23,7 +23,22 @@ import trade_journal
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
+    """Both journals, and the file cloud_sync uploads, live in tmp.
+
+    The RSA journal is seeded with one row so "untouched" is a real
+    byte-for-byte comparison. Pointing at the repo root's trades.json instead
+    made these tests fail on a fresh clone (no such file) and, on the
+    operator's machine, compare against live trading data.
+    """
     monkeypatch.setattr(etf_journal, "ETF_FILE", tmp_path / "etf_trades.json")
+    rsa = tmp_path / "trades.json"
+    rsa.write_text(json.dumps([{
+        "id": "rsa-1", "timestamp": "2026-07-01T14:30:00+00:00",
+        "broker": "public", "account_id": "p1", "side": "buy",
+        "symbol": "AAAA", "qty": 1, "fill_price": 0.25}]), encoding="utf-8")
+    monkeypatch.setattr(trade_journal, "_FILE", rsa)
+    import cloud_sync
+    monkeypatch.setattr(cloud_sync, "_TRADES_FILE", rsa)
     yield
 
 
@@ -56,6 +71,7 @@ def test_an_etf_row_never_reaches_the_cloud_whitelist():
     import cloud_sync
     buy()
     uploaded = {t["id"] for t in cloud_sync.CloudSync._load_trades()}
+    assert uploaded == {"rsa-1"}, "cloud_sync is not reading the tmp journal"
     assert {t["id"] for t in etf_journal.get_trades()}.isdisjoint(uploaded)
 
 

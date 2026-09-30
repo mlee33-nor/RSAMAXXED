@@ -1,0 +1,5 @@
+# Windows batch files must keep CRLF line endings. cmd.exe misparses LF-only
+# .bat files (labels and goto/call can silently fail), and a checkout on a
+# machine with core.autocrlf=false would otherwise hand customers LF files.
+*.bat text eol=crlf
+*.cmd text eol=crlf

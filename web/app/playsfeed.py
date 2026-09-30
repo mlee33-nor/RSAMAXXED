@@ -606,6 +606,11 @@ class Board:
                     continue
                 rows.append({
                     "sym": l.play.symbol,
+                    # Which alert this exit belongs to. A play sold in tranches
+                    # has one row per tranche, so anything that counts PLAYS
+                    # (the funnel, "N plays paid") must count distinct keys,
+                    # never rows — see `priced_history`.
+                    "play": l.key,
                     "on": e.sell_date or l.resolved_on,
                     "alerted": l.play.alert_date or "",
                     "booked": e.sell_date or l.resolved_on,
@@ -615,6 +620,18 @@ class Board:
                     "sold": True,
                 })
         return sorted(rows, key=lambda r: r["on"])
+
+    @property
+    def priced_history(self) -> list[PlayLife]:
+        """Alerts with at least one priced payout — the funnel's third stage.
+
+        Counted in PLAYS, like the stages either side of it. `payout_rows` is
+        one row per exit, and a play sold in two tranches at two brokers has
+        two, so `len(payout_rows)` came out wider than "sold" (a count of
+        plays) the moment the feed published its first tranched exit.
+        """
+        keys = {r["play"] for r in self.payout_rows}
+        return [l for l in self.history if l.key in keys]
 
     @property
     def payout_months(self) -> list[str]:
@@ -739,18 +756,23 @@ class Board:
                if accounts is None else accounts)
         by_month: dict[str, dict] = {}
         total = 0.0
-        paid = 0
+        # Plays, not rows: a play sold in two tranches is two payout rows but
+        # one play that paid, and "paid" is the last stage of a funnel whose
+        # other stages count plays. Same rule in site.js summarise().
+        paid_plays: set[str] = set()
+        month_plays: dict[str, set[str]] = defaultdict(set)
         for r in self.payout_rows:
             n = sum(acc.get(k, 0) for k in r["brokers"])
             if not n:
                 continue
             amount = r["per"] * n
             total += amount
-            paid += 1
+            paid_plays.add(r["play"])
             key = (r["on"] or "")[:7] or "—"
             bucket = by_month.setdefault(key, {"key": key, "total": 0.0, "plays": 0})
             bucket["total"] += amount
-            bucket["plays"] += 1
+            month_plays[key].add(r["play"])
+            bucket["plays"] = len(month_plays[key])
         months = [by_month[k] for k in sorted(by_month)]
         best = max(months, key=lambda m: m["total"], default=None)
 
@@ -764,7 +786,7 @@ class Board:
         this_key = (today or date.today()).strftime("%Y-%m")
         return {
             "total": total,
-            "plays": paid,
+            "plays": len(paid_plays),
             "months": months,
             "best": best,
             "per_month": (total / len(months)) if months else 0.0,

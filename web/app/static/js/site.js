@@ -784,7 +784,12 @@ function summarise(rows, accounts, month, names = {}, grain = 'month', basis = '
   const byMonth = new Map();
   const byBroker = new Map();
   const detail = [];
-  let total = 0, plays = 0;
+  let total = 0;
+  // Plays, not rows: a play sold in tranches is one row per tranche but one
+  // play that paid. Counting rows let "Paid you" outgrow the funnel stages
+  // above it. Same rule as playsfeed.Board.totals().
+  const paidPlays = new Set();
+  const monthPlays = new Map();
 
   rows.forEach(r => {
     if (!inPeriod(r, month, basis)) return;
@@ -801,10 +806,13 @@ function summarise(rows, accounts, month, names = {}, grain = 'month', basis = '
     const n = held.reduce((a, k) => a + accounts[k], 0);
     if (!n) return;
     const amount = r.per * n;
-    total += amount; plays += 1;
+    const play = r.play || `${r.alerted || ''}:${r.sym}`;
+    total += amount; paidPlays.add(play);
     detail.push({ sym: r.sym, on: r.on, per: r.per, held, n, amount });
     const bucket = byMonth.get(key) || { key, total: 0, plays: 0 };
-    bucket.total += amount; bucket.plays += 1;
+    const seen = monthPlays.get(key) || new Set();
+    seen.add(play); monthPlays.set(key, seen);
+    bucket.total += amount; bucket.plays = seen.size;
     byMonth.set(key, bucket);
 
     // The same money, split by WHERE it landed. This is a decomposition, not a
@@ -841,6 +849,7 @@ function summarise(rows, accounts, month, names = {}, grain = 'month', basis = '
       if (y1 && m1 && y2 && m2) spanned = (y2 - y1) * 12 + (m2 - m1) + 1;
     }
   }
+  const plays = paidPlays.size;
   return { total, plays, months, brokers, best, detail, spanned,
            perMonth: spanned ? total / spanned : 0 };
 }

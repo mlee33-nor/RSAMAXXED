@@ -3,354 +3,535 @@
         R S A M A X X E D
 
         Multi-Broker Reverse-Split Arbitrage Automation
-        Set it up once. Target ~$600/month in round-up profit. Hands-off.
+        One click buys the play in every account you own.
 
 ================================================================================
 
-  RSAMAXXED is a desktop app that runs Reverse-Split Arbitrage (RSA) for you
-  across 10 brokerages at the same time. You pick the plays, hit one button,
-  and it buys the position in every linked account in parallel. When the
-  reverse splits land and your shares get rounded up, you sell and pocket
-  the difference. The whole loop is automated behind a single GUI.
+  RSAMAXXED is a Windows desktop app that runs Reverse-Split Arbitrage (RSA)
+  across up to 10 brokerages at the same time. Plays arrive on their own from
+  the RSAMAXXED feed. One click (or the automation, if you turn it on) buys
+  one share in every linked account, in parallel. When the reverse split
+  lands and a broker rounds your fraction up to a whole share, the Exits page
+  tells you what to sell and where, and sells it for you.
+
+  Your broker logins stay on your PC. They are used to sign in to that broker
+  and nothing else, and are never sent to RSAMAXXED.
 
 
 CONTENTS
   1.  What is RSA, and how it pays
-  2.  The monthly math (~$600)
+  2.  The math, with a worked example
   3.  How RSAMAXXED runs the play
-  4.  Feature overview
-  5.  Supported brokers
-  6.  The GUI — tab by tab
-  7.  Mirror trading
-  8.  The picks feed
-  9.  Trade journal & P/L tracking
-  10. Setup
-  11. Quick start
-  12. Notes on results
+  4.  Supported brokers
+  5.  Setup (start here)
+  6.  Getting your broker credentials
+  7.  The app, page by page
+  8.  Mirror trading (automatic buying)
+  9.  Selling: the Exits page and auto-sell
+  10. The plays feed
+  11. Trade journal and P/L
+  12. Quick start
+  13. Updating
+  14. Troubleshooting
+  15. Notes on results
 
 
 ┌─ 1. WHAT IS RSA, AND HOW IT PAYS ───────────────────────────────────────────
 │
-│  RSA = Reverse-Split Arbitrage. It turns a quirk of how brokers handle
-│  reverse stock splits into repeatable profit.
+│  RSA = Reverse-Split Arbitrage. It turns a quirk in how brokers handle
+│  reverse stock splits into small, repeatable profits.
 │
-│  When a company runs a reverse split — say 1-for-10 — every 10 old shares
-│  become 1 new share. Hold an amount that does not divide evenly and you
-│  are left with a fractional share. Here is the edge: many brokers ROUND
-│  THAT FRACTION UP to a whole share instead of paying you cash for it.
+│  A company whose stock trades under $1 can be delisted, so it runs a
+│  reverse split to lift the price. In a 1-for-20 split, every 20 old
+│  shares become 1 new share. If you hold fewer than 20, you are left with
+│  a fraction of a share. Many brokers ROUND THAT FRACTION UP to one whole
+│  share instead of paying you cash for it.
 │
-│     BEFORE                      AFTER A 1-FOR-10 REVERSE SPLIT
-│     -----------------------     -----------------------------------
-│     Buy 1 share @ ~$0.80        0.1 share -> rounded UP to 1 share
-│     Cost: ~$0.80                New share worth ~$8.00+
-│                                 Net round-up gain: several dollars
+│     BEFORE                          AFTER A 1-FOR-20 REVERSE SPLIT
+│     ---------------------------     ----------------------------------
+│     Buy 1 share @ $0.25             0.05 share -> rounded UP to 1 share
+│     Cost: $0.25                     New share worth about $5.00
 │
-│  One share, one broker, one split. Small. But run it as 1 share in
-│  every account, across 10 brokers, on every qualifying split — and the
-│  small numbers stack into real monthly income.
+│                                     Sell it:  $5.00 - $0.25 = $4.75
+│
+│  One share, one account, one split: $4.75. Small on its own. The round-up
+│  is applied per ACCOUNT, though, so the same trade in every account you
+│  hold adds up.
 │
 └──────────────────────────────────────────────────────────────────────────────
 
 
-┌─ 2. THE MONTHLY MATH (~$600) ───────────────────────────────────────────────
+┌─ 2. THE MATH, WITH A WORKED EXAMPLE ────────────────────────────────────────
 │
-│  The model is simple multiplication:
+│     profit per account  =  entry price x (split ratio - 1)
+│                         =  $0.25 x 19  =  $4.75
 │
-│     profit  =  round-ups per split  x  brokers linked  x  splits / month
+│     profit per play     =  profit per account x accounts that round up
 │
-│  A worked example:
+│     10 accounts that round up .......  10 x $4.75  =  $47.50
+│     20 accounts that round up .......  20 x $4.75  =  $95.00
 │
-│     per round-up gain ........ $8  - $25   (varies by post-split price)
-│     brokers linked ........... 10
-│     qualifying splits / mo ... 3  - 6
+│  That is an illustration, not a forecast. Real plays differ:
 │
-│     low  end:  $8  x 10 x 3  =  $240
-│     mid  band: $15 x 10 x 4  =  $600     <-- the target
-│     high end:  $25 x 10 x 5  =  $1,250
+│     -  the entry price and split ratio are different every time
+│     -  not every broker rounds up; some pay the fraction as cash
+│     -  the post-split price can drop before you sell
+│     -  some plays are cancelled, or the company pays cash instead
+│     -  how many qualifying splits appear varies month to month
 │
-│  ┌────────────────────────────────────────────────────────────────────┐
-│  │  TARGET:  ~$600 / month  for roughly 10 minutes of work per play.   │
-│  └────────────────────────────────────────────────────────────────────┘
+│  The money needed is small: one share of a low-priced stock per account,
+│  and it comes back when you sell.
 │
-│  Capital required is tiny: one share of a sub-$5 stock per broker.
-│  A full month of plays typically ties up well under $200 at a time,
-│  and that capital comes back the moment you sell.
+│  Results vary. Nothing here is financial advice, and past plays do not
+│  promise future ones. You are trading your own accounts at your own risk.
 │
 └──────────────────────────────────────────────────────────────────────────────
 
 
 ┌─ 3. HOW RSAMAXXED RUNS THE PLAY ────────────────────────────────────────────
 │
-│  The full cycle, start to finish:
-│
-│     [1]  A reverse split gets announced on a low-priced stock.
+│     [1]  A reverse split is announced on a low-priced stock.
 │            |
 │            v
-│     [2]  It lands in the picks feed (synced) or you add it yourself.
+│     [2]  The play arrives in the app from the RSAMAXXED feed and shows
+│          up on the Watchlist.
 │            |
 │            v
-│     [3]  Open the Trade tab, select the ticker, pick your brokers.
+│     [3]  BUY: Mirror trading buys it for you automatically, or you buy
+│          it in one click on the Trade Desk. One share per account, at
+│          every broker you pick, all at once.
 │            |
 │            v
-│     [4]  One click -> RSAMAXXED buys the position in EVERY linked
-│          broker at once (mirror trading, run in parallel).
+│     [4]  The split happens. Brokers round your fraction up (or pay cash).
 │            |
 │            v
-│     [5]  The reverse split executes. Brokers round your holdings up.
+│     [5]  SELL: the feed calls the exit and the play moves to SELL NOW on
+│          the Exits page. Click Sell, or let auto-sell do it.
 │            |
 │            v
-│     [6]  Holdings tab flags the position; you sell across all brokers.
-│            |
-│            v
-│     [7]  Trade journal logs every fill and shows realized P/L.
-│
-│  Steps 3-4 are the only ones that need you, and they take a minute.
+│     [6]  The trade journal records every fill and Analytics shows your
+│          realized profit.
 │
 └──────────────────────────────────────────────────────────────────────────────
 
 
-┌─ 4. FEATURE OVERVIEW ───────────────────────────────────────────────────────
+┌─ 4. SUPPORTED BROKERS ──────────────────────────────────────────────────────
 │
-│   +  Ten brokers, one window — no juggling tabs and logins.
-│   +  Mirror trading — one order replicated across every linked account.
-│   +  Parallel execution — all brokers fire at once, not one by one.
-│   +  Synced picks feed — a shared, dated watchlist of reverse-split plays.
-│   +  Reverse-split alerts — qualifying positions highlighted automatically.
-│   +  Live P/L — realized profit tracked per position, green/red coded.
-│   +  Trade journal — every share this tool buys or sells is logged.
-│   +  One-screen dashboard — invested, value, P&L, broker health at a glance.
-│   +  Dark desktop GUI — no terminal needed for day-to-day use.
+│  Link any or all of these on the Brokers page. You can add more than one
+│  login at each broker (for example yours and a family member's).
 │
-└──────────────────────────────────────────────────────────────────────────────
-
-
-┌─ 5. SUPPORTED BROKERS ──────────────────────────────────────────────────────
-│
-│  All ten link from the Accounts tab and run side by side.
-│
-│    BROKER          CONNECTION
+│    BROKER          HOW THE APP CONNECTS
 │    -------------   ------------------------------------------------
-│    Robinhood       API
-│    Fidelity        Automated browser session
-│    Chase           Automated browser session
-│    Schwab          API
-│    Wells Fargo     Automated browser session
-│    SoFi            Automated browser session
-│    Fennel          API
-│    Public          API
-│    BBAE            API
-│    DSPAC           API
+│    BBAE            Broker's own web API
+│    Chase           Automated Chrome browser
+│    DSPAC           Broker's own web API
+│    Fennel          Broker's own web API
+│    Fidelity        Automated Chrome browser
+│    Public          Public's official API (secret token)
+│    Robinhood       Broker's own web API
+│    Schwab          Automated Firefox browser (installed by INSTALL.bat)
+│    SoFi            Automated Chrome browser
+│    Wells Fargo     Automated Chrome browser
 │
-│  More linked accounts = more round-ups per split = higher monthly total.
-│  Link every broker you can to hit the $600 target comfortably.
+│  One login at Chase, Fidelity, Schwab, SoFi and Wells Fargo covers every
+│  brokerage account under that login.
 │
-└──────────────────────────────────────────────────────────────────────────────
-
-
-┌─ 6. THE GUI — TAB BY TAB ───────────────────────────────────────────────────
-│
-│  DASHBOARD
-│    Metric cards for total invested, current value, and net P&L. Broker
-│    status dots show which accounts are live. "Refresh All" re-pulls
-│    every broker in one go.
-│
-│  HOLDINGS
-│    A live table of every position this tool opened, with running P/L
-│    in green or red. Positions tied to an upcoming reverse split are
-│    highlighted so you know exactly what is ready to sell.
-│
-│  TRADE
-│    The control room. Pick a ticker, choose BUY or SELL, select brokers
-│    by chip (only linked brokers show), and fire. Execution runs across
-│    all selected brokers in parallel.
-│
-│  ACCOUNTS
-│    Per-broker credential fields. Save to .env, then Bootstrap to
-│    establish the session. Do this once per broker.
-│
-│  LOGS
-│    A running activity log of every action — useful for confirming a
-│    multi-broker order all went through.
+│  The browser brokers run out of sight by default: no windows pop up on
+│  your desktop while the app works.
 │
 └──────────────────────────────────────────────────────────────────────────────
 
 
-┌─ 7. MIRROR TRADING ─────────────────────────────────────────────────────────
+┌─ 5. SETUP (START HERE) ─────────────────────────────────────────────────────
 │
-│  Mirror trading is the core of RSAMAXXED. One order is cloned to every
-│  broker you select and submitted at the same time:
+│  You need: a Windows 10 or 11 PC, an internet connection, and Google
+│  Chrome if you will use Chase, Fidelity, SoFi or Wells Fargo (Microsoft
+│  Edge, which comes with Windows, works as a fallback).
 │
-│     YOU:  Buy 1 share UCAR
+│  STEP 1  Get the files
+│     Download the ZIP from GitHub (green "Code" button -> Download ZIP)
+│     and unzip it somewhere permanent. C:\RSAMAXXED is the best choice:
+│     avoid Documents and the Desktop, which OneDrive syncs on many PCs,
+│     and any other folder OneDrive or Google Drive syncs. Do not run it
+│     from inside the ZIP; INSTALL.bat stops and says so if you try.
+│
+│  STEP 2  Double-click INSTALL.bat (once)
+│     It finds Python (installing Python 3.13 for you if needed), installs
+│     everything the app needs, downloads the browser Schwab uses, creates
+│     your settings file (.env) and puts an RSAMAXXED icon on your desktop.
+│     It takes a few minutes. Wait for "Done".
+│
+│     Windows may warn you, because the file came from the internet:
+│        "Windows protected your PC"  ->  click "More info"
+│                                     ->  click "Run anyway"
+│     This happens once. INSTALL.bat then clears the "downloaded from the
+│     internet" mark from everything else in the folder, so RSAMAXXED.bat
+│     and the rest do not ask again.
+│
+│  STEP 3  Start the app
+│     Double-click the RSAMAXXED icon on your desktop (or RSAMAXXED.bat in
+│     the folder). If it says it could not start, run INSTALL.bat again.
+│
+│  STEP 4  Connect your brokers
+│     Open the Brokers page. Each broker has a card with the fields it
+│     needs (see section 6 for where to find each one).
+│        -  Type your login in, then click Save. Save writes it to the .env
+│           file in the app's folder, on this PC only.
+│        -  Click "+ Add login" for a second login at the same broker. The
+│           optional tag is just a nickname so you can tell logins apart.
+│        -  Click Bootstrap. The app signs in and lists your accounts. It
+│           reports "connected" with the number of accounts, or why it
+│           failed.
+│     The first sign-in at a broker may ask for a code (text, email or
+│     an approve-on-your-phone prompt). The app shows a box on screen to
+│     type it into, and says so in a yellow bar. After that, sessions are
+│     remembered in the sessions folder, so you are not asked every time.
+│
+│  STEP 5  The plays are already on
+│     Nothing to sign up for, no password, no key. The feed downloads on
+│     launch and refreshes every hour. An empty Watchlist just means no
+│     plays are open right now. The status bar at the bottom shows when
+│     the feed last arrived.
+│
+└──────────────────────────────────────────────────────────────────────────────
+
+
+┌─ 6. GETTING YOUR BROKER CREDENTIALS ────────────────────────────────────────
+│
+│  A note on "TOTP secret". Some brokers let you use an authenticator app
+│  (Google Authenticator, Microsoft Authenticator, Authy...) for two-step
+│  sign-in. When you turn that on, the broker shows a QR code. Choose the
+│  option under it such as "Can't scan?" or "Enter key manually" and it
+│  shows a long code of letters and numbers: that is the TOTP secret.
+│  Paste it into RSAMAXXED AND add it to your authenticator app as usual.
+│  With it, the app can make the 6-digit codes itself. Treat it like a
+│  password. If authenticator 2-step is already on, you usually have to
+│  turn it off and on again to see the key.
+│
+│  BBAE
+│     Email or username, and password. The first sign-in may show a
+│     picture code (the app asks you to type what it says), then sends a
+│     one-time code by email (if you log in with your email) or text (if
+│     you use a username). Type it into the app when asked.
+│
+│  CHASE
+│     Your chase.com USERNAME (not your email address) and password.
+│     Chase silently rejects an email address here. If Chase sends a
+│     push, the app tells you to approve it in the Chase app. If Chase
+│     wants a code typed into its own page, the app brings the Chase
+│     browser window to the front and puts up a notice: type the code
+│     into that window and press Next. You have about 3 minutes.
+│
+│  DSPAC
+│     Same as BBAE: email or username and password, with a possible
+│     picture code and an emailed or texted one-time code.
+│
+│  FENNEL
+│     Just your Fennel email address; there is no password. Fennel emails
+│     you a code at sign-in; type it into the app when asked.
+│
+│  FIDELITY
+│     Username, password, and (optional but recommended) the TOTP secret.
+│     With the secret, sign-in needs nothing from you. Without it, the app
+│     asks for the code texted to you, or asks you to approve the sign-in
+│     in the Fidelity app.
+│
+│  PUBLIC
+│     A personal API secret token, not your password. On public.com, open
+│     your account settings, find the API section (under Security) and
+│     generate a secret key. Copy it into the Secret token field. No codes
+│     are ever needed. One token per Public login.
+│
+│  ROBINHOOD
+│     Username (email) and password. On first sign-in Robinhood usually
+│     sends an approval request to your phone: open the Robinhood app and
+│     tap Approve. If it asks for a texted or emailed code instead, the app
+│     shows a box for it. Wait for the approval rather than retrying;
+│     repeated attempts get you rate-limited for a while.
+│
+│  SCHWAB
+│     Username, password, and the TOTP secret. The form says the secret
+│     is optional, but a first sign-in without it fails, so treat it as
+│     required. Set up authenticator-app 2-step in Schwab's security
+│     settings and copy the key as described above.
+│
+│  SOFI
+│     Username, password, and the TOTP secret. Without the secret the app
+│     cannot finish SoFi's security check on its own, so treat it as
+│     required. If SoFi shows a "Verify you are human" check, the app
+│     brings the SoFi browser window to the front and puts up a notice:
+│     tick the box in that window (re-enter your password and press
+│     Log in if the form was cleared). You have a few minutes.
+│
+│  WELLS FARGO
+│     Username and password. At sign-in Wells Fargo usually sends an
+│     approval to your phone (approve within about 2 minutes). If that
+│     times out, the app switches to a texted code and asks you for it.
+│
+└──────────────────────────────────────────────────────────────────────────────
+
+
+┌─ 7. THE APP, PAGE BY PAGE ──────────────────────────────────────────────────
+│
+│  COMMAND CENTER  (home)
+│    Net realized profit, the RSA pipeline (pick -> buy -> split -> sell),
+│    top movers among current plays, broker status with "Refresh All",
+│    the current plays (Quick Picks / Partial / Purchased) and a short
+│    Sell now / Holding / Closed summary.
+│
+│  WATCHLIST
+│    Every open play from the feed, with live price, change and a small
+│    chart where a public quote exists (many tiny stocks have none), and a
+│    marker once you have bought it. "Add Symbol" pins an extra ticker.
+│
+│  TRADE DESK
+│    Buy or sell by hand. Choose BUY or SELL, type the ticker and quantity,
+│    pick broker chips, and click Execute. Results appear per account as
+│    they come in. "Dry Run" builds the order without sending it. Any
+│    quantity over 5 shares per account asks you to confirm first.
+│
+│  MIRROR
+│    A log of everything the automation bought for you, run by run, with
+│    per-broker results, and every feed check with what it skipped and
+│    why.
+│
+│  EXITS
+│    Where selling happens. The board groups plays into SELL NOW (exit
+│    called, you still hold shares), FRACTIONAL, HOLDING and CLOSED, with
+│    the auto-sell controls at the top. See section 9.
+│
+│  INVEST
+│    Optional: put idle cash in your broker accounts into ETFs. Pull your
+│    balances, pick an ETF and an amount per account, review, then buy.
+│    Whole shares only, the same quantity on every account at a broker;
+│    an account that can't afford it sits the round out. Has its own Dry
+│    run and a confirm step. Holdings are tracked on the page.
+│
+│  ANALYTICS
+│    Realized profit and performance: cumulative P/L, profit by ticker,
+│    volume by broker, monthly P/L and more, plus trade tables, a trade
+│    simulator, and CSV export of your trade history.
+│
+│  AUTOMATION
+│    Turn Mirror trading on or off and choose its brokers and age limit
+│    (section 8). The Alert Feed card needs nothing from you; plays
+│    import themselves.
+│
+│  BROKERS
+│    Enter logins, Save, Bootstrap (section 5, step 4). Also the optional
+│    RSAMAXXED Cloud card, which links this PC to your web dashboard on
+│    rsamaxxed.com (it syncs P/L and positions; never your broker logins).
+│
+│  ACTIVITY
+│    A live log of every sign-in, order and alert, a progress strip while
+│    a batch is running, and "Retry failed accounts".
+│
+│  Also: Ctrl+K opens a quick search (jump to a page, look up or trade a
+│  ticker), Ctrl+1 ... Ctrl+9 jump between pages, Ctrl+R refreshes. The
+│  bell in the top bar collects notifications. The app version is shown
+│  at the bottom of the left sidebar (for example v1.0.0).
+│
+└──────────────────────────────────────────────────────────────────────────────
+
+
+┌─ 8. MIRROR TRADING (AUTOMATIC BUYING) ──────────────────────────────────────
+│
+│  Mirror trading buys new plays for you, so you don't have to be at the
+│  screen when an alert lands.
+│
+│     New play in the feed:  buy 1 share
 │              |
-│      +-------+-------+-------+-------+-------+-------+-------+ ...
-│      v       v       v       v       v       v       v
-│    Robin  Fidelity Chase  Schwab  Wells   SoFi   Fennel  ...
-│      |       |       |       |       |       |       |
-│      +-------+-------+-------+-------+-------+-------+-------+
-│                            |
-│                            v
-│              10 identical positions, one click
+│      +-------+-------+-------+-------+-------+-------+ ...
+│      v       v       v       v       v       v
+│    Robin  Fidelity Chase  Schwab  Wells   SoFi   ...   (brokers you picked)
 │
-│  That is what turns a few-dollar round-up into a few-hundred-dollar one.
+│  How it behaves:
+│     -  It is OFF on a fresh install. Turn it on in Automation: pick the
+│        broker chips to use, then "Enable Mirror Trading" and confirm.
+│        It stays on across restarts until you turn it off.
+│     -  It checks for new plays on weekdays during market hours (about
+│        once an hour, 9:45 to 3:45 Eastern) and right after new plays
+│        arrive. Checks missed while the PC was asleep run when it wakes,
+│        but never after 4pm.
+│     -  It buys standard alerts only. Conditional and OTC plays are
+│        skipped, with the reason shown on the Mirror page.
+│     -  It skips plays older than your age limit (default 2 days), and
+│        skips any broker that already holds the stock.
+│     -  1 share per account, one play at a time, with a short pause
+│        between plays.
+│     -  These are REAL orders; there is no dry run here. Turning it off
+│        cancels anything still queued, but not orders already sent.
+│     -  It does not retry failures. They are listed under "Needs
+│        attention" with a shortcut to trade them by hand.
 │
-└──────────────────────────────────────────────────────────────────────────────
-
-
-┌─ 8. THE FEED — WHERE THE PLAYS COME FROM ───────────────────────────────────
-│
-│  You do not hunt for splits and there is nothing to join. Put your
-│  plays password in .env and three streams arrive on their own,
-│  refreshed every hour:
-│
-│     RSAMAXXED_PLAYS_KEY=your-password
-│
-│     BUYS    the plays to open       -> Watchlist, and Mirror Trading
-│     BOARD   what each split DID     -> Exits
-│     EXITS   what got sold, where    -> the sell-alert card
-│
-│  It is the same password that opens rsamaxxed.com/plays in a browser,
-│  where the whole board also lives: what is open, what exited, what
-│  every past split ended in, and what that record is worth at your
-│  account count.
-│
-│  The BOARD is the one that matters most and the one you cannot work
-│  out yourself. After a reverse split your position either rounded up
-│  to a whole share, came back as a fraction, or was paid out as cash —
-│  and which of those happened decides whether there is anything left
-│  to sell at all. See section 8b.
-│
-│  No account is required to receive any of it, and nothing is stored
-│  about you: the password identifies the subscription, not you. Linking
-│  a device is optional and only adds the cloud dashboard — it sends a
-│  device name and a random id, and no broker credential ever leaves
-│  the machine.
+│  The app must be open for mirror trading to run.
 │
 └──────────────────────────────────────────────────────────────────────────────
 
 
-┌─ 8b. FRACTIONS, ROUND-UPS, AND WHO PAYS WHICH ──────────────────────────────
+┌─ 9. SELLING: THE EXITS PAGE AND AUTO-SELL ──────────────────────────────────
 │
-│  Only THREE brokers hand back a fractional share after a split:
+│  After a split, each account ends up one of three ways:
 │
-│     Public      Robinhood      SoFi
+│     ROUND-UP   a whole share      sell 1 share wherever you hold it
+│     FRACTION   part of a share    only Public, Robinhood and SoFi keep
+│                                   fractions; sell the balance there
+│     CASH       paid out already   nothing to do (the other seven
+│                                   brokers settle fractions as cash)
 │
-│  The other seven settle the fraction as cash. There is nothing left in
-│  those accounts to sell, and an order sent to them is rejected every
-│  time. The Exits page already knows this — a fractional play is routed
-│  only to the three, and the rest are listed as "cash-in-lieu at ..."
-│  so it is obvious why they were left out.
+│  The Exits page knows which is which. When the feed calls an exit, the
+│  play moves to SELL NOW.
 │
-│  A round-up is the opposite: a whole share exists, and any broker
-│  holding it can sell it.
+│  SELLING BY HAND
+│     Click Sell on a row. The app reads your real balance from each
+│     broker, then shows exactly what it will sell, where, and which
+│     brokers it is leaving out and why (cash-in-lieu, nothing held).
+│     Click "Sell at N brokers" to send it. Tick "Dry run" first if you
+│     want to build the order without sending anything. "Open in Desk"
+│     copies it to the Trade Desk instead.
 │
-│     ROUND-UP  ✅   sell 1 share      every broker you hold it at
-│     FRACTION  🧩   sell the balance  Public / Robinhood / SoFi only
-│     CASH      💵   nothing to do     already settled to cash
-│
-│  Hit Sell on an Exits row and the terminal reads the real balance from
-│  each broker, shows you exactly what it will send where, and waits for
-│  you to confirm. Tick "Dry run" to build the whole order against your
-│  live sessions without submitting anything.
-│
-└──────────────────────────────────────────────────────────────────────────────
-
-
-┌─ 9. TRADE JOURNAL & P/L TRACKING ───────────────────────────────────────────
-│
-│  Every share RSAMAXXED buys or sells is written to the trade journal
-│  (trades.json) — broker, account, side, symbol, quantity, fill price,
-│  timestamp. Pre-existing holdings you did not buy through the tool are
-│  left out, so the numbers stay clean.
-│
-│  After a successful buy the tool auto-pulls the actual fill price from
-│  the broker, which is what powers the live P/L on the Holdings tab and
-│  the realized-profit total on the Dashboard. You always know exactly
-│  how much each play made.
+│  AUTO-SELL
+│     The Auto-sell card at the top of Exits sells SELL NOW plays for you.
+│     -  It starts DISARMED. "Arm auto-sell" turns it on.
+│     -  Dry run is ON by default, so at first it only shows what it
+│        would do. Untick Dry run for real orders; the status pill then
+│        reads "ARMED · LIVE ORDERS".
+│     -  "Fractionals too" also sells leftover fractions.
+│     -  Market hours only; anything found after hours waits for the open.
+│     -  It reads live holdings before every order, never sells the same
+│        play twice, handles at most 4 plays per batch (the rest wait for
+│        you, with a notification) and tries a play up to 3 times.
+│     -  The app must be open for it to run.
 │
 └──────────────────────────────────────────────────────────────────────────────
 
 
-┌─ 10. SETUP ─────────────────────────────────────────────────────────────────
+┌─ 10. THE PLAYS FEED ────────────────────────────────────────────────────────
 │
-│  Requirements: Windows, and Python 3.13 specifically — not 3.12, not
-│  3.14. Only 3.13 gets the dependencies below, and the other versions
-│  usually come first on PATH. Chase, SoFi, Wells Fargo and Fidelity
-│  drive a real browser, so you also need Chrome installed (Edge works
-│  as a fallback and already ships with Windows 11).
+│  The app downloads plays from rsamaxxed.com automatically: no account,
+│  no password, nothing to join or set up. Three things arrive, on launch
+│  and then every hour while the app is open:
 │
-│     1.  Install dependencies:
-│            py -3.13 -m pip install -r requirements.txt
+│     BUYS    new plays to open        -> Watchlist and Mirror trading
+│     BOARD   what each split did      -> Exits (round-up, fraction, cash)
+│     EXITS   when and where to sell   -> Exits SELL NOW
 │
-│         Use "py -3.13 -m pip", not a bare "pip". A bare pip installs
-│         into whichever Python is first on PATH, and the app then dies
-│         at "import customtkinter" with no window and no message.
+│  If a download fails the app retries on its own, and the status bar
+│  turns yellow when the feed is stale.
 │
-│     2.  ONLY IF YOU USE SCHWAB, fetch the browser it logs in with:
-│            py -3.13 -m playwright install firefox
-│
-│         The pip step above installs the playwright library but not the
-│         browser binary it drives, and schwab-api supports firefox and
-│         nothing else. Skip this and Schwab bootstrap fails with
-│         "Executable doesn't exist" — every other broker is unaffected.
-│
-│     3.  Launch the app:
-│            RSAMAXXED.bat
-│         (or run app.py directly for the GUI, or runner.py for CLI)
-│         Want a Desktop icon? Run once:  py -3.13 make_shortcut.py
-│
-│     4.  THE PLAYS ARE ALREADY ON. There is nothing to turn on and
-│         nothing to enter — no account, no sign-up, no password, no
-│         key, nothing to join. The terminal downloads the buy alerts, the
-│         exits and the round-up (fractional) board on launch, then
-│         refreshes every hour while it is open.
-│
-│         If the Watchlist is empty it means no plays are open right
-│         now, which is normal — new alerts land on their own. The
-│         status bar bottom-right shows when the feed last arrived.
-│
-│     5.  CONNECT YOUR BROKERS. Copy .env.example to .env and fill in
-│         only the brokers you use, or enter them in the Brokers tab and
-│         click Save. Then Bootstrap each one to start its session.
-│
-│     6.  Open the Dashboard and hit Refresh All. Green status dots
-│         mean a broker is linked and ready.
-│
-│  Credentials live in a local .env file and are used to log in to that
-│  broker and nothing else — none of them are ever sent to RSAMAXXED
-│  Cloud. Sessions are cached locally so you do not log in from scratch
-│  every time.
+│  Linking this PC to an rsamaxxed.com account (Brokers page, RSAMAXXED
+│  Cloud) is optional and only adds the web dashboard. It sends a device
+│  name and a random id; no broker login ever leaves the PC.
 │
 └──────────────────────────────────────────────────────────────────────────────
 
 
-┌─ 11. QUICK START ───────────────────────────────────────────────────────────
+┌─ 11. TRADE JOURNAL AND P/L ─────────────────────────────────────────────────
 │
-│     1.  Pick a play from the picks feed (or add your own ticker).
-│     2.  Trade tab -> select the ticker -> BUY -> select all brokers.
-│     3.  Fire. Watch the Logs tab confirm every broker filled.
-│     4.  Wait for the reverse split to execute.
-│     5.  Holdings tab highlights the rounded-up position.
-│     6.  Trade tab -> SELL across all brokers -> done.
-│     7.  Check realized P/L on the Dashboard.
+│  Every share RSAMAXXED buys or sells is recorded in trades.json in the
+│  app folder: broker, account, buy or sell, ticker, quantity, price and
+│  time. Shares you bought elsewhere are left out, so the numbers only
+│  cover this tool's trades.
+│
+│  Profit is counted when you SELL (realized profit). The app does not
+│  show paper gains on open plays, because until the split settles and
+│  you sell, there is no real profit to show.
+│
+│  trades.json is the one file nothing can rebuild. Back it up now and
+│  then, and keep it when you update (section 13).
 │
 └──────────────────────────────────────────────────────────────────────────────
 
 
-┌─ 12. NOTES ON RESULTS ──────────────────────────────────────────────────────
+┌─ 12. QUICK START ───────────────────────────────────────────────────────────
 │
-│  The ~$600/month figure is a target, not a promise. Actual return per
-│  play depends on:
+│     1.  Run INSTALL.bat once, then open RSAMAXXED from the desktop.
+│     2.  Brokers page: enter a login, Save, Bootstrap. Repeat per broker.
+│     3.  Command Center: "Refresh All". Green dots = ready.
+│     4.  Buy: turn on Mirror trading (Automation), or use the Trade Desk
+│         to buy 1 share of a Watchlist play at all your brokers.
+│     5.  Watch the Activity page confirm each account filled.
+│     6.  After the split, sell from Exits (or arm auto-sell).
+│     7.  See your realized profit on the Command Center and Analytics.
 │
-│     -  the split ratio and the post-split price
-│     -  how each broker handles fractional shares at split time
-│     -  how many brokers you have linked
-│     -  how many qualifying splits show up that month
+└──────────────────────────────────────────────────────────────────────────────
+
+
+┌─ 13. UPDATING ──────────────────────────────────────────────────────────────
 │
-│  Link more brokers and run every clean pick in the feed to push your
-│  monthly number toward — and past — the $600 mark.
+│  Check the version at the bottom of the left sidebar, and compare it
+│  with the latest release on GitHub:
+│     https://github.com/mlee33-nor/RSAMAXXED/releases
+│  The current version is v1.0.0. Close RSAMAXXED before updating.
+│
+│  IF YOU INSTALLED WITH GIT
+│     1.  In the app folder run:   git pull
+│         Your .env, trades.json and other personal files are not
+│         tracked by git, so they are left alone.
+│     2.  Double-click INSTALL.bat again. It is safe to re-run at any
+│         time: it installs any add-ons the update needs and never
+│         touches your settings or trades.
+│
+│  IF YOU INSTALLED FROM THE ZIP
+│     1.  Download the new ZIP and unzip it to a NEW folder.
+│     2.  From your OLD folder, copy these into the new one:
+│            .env                    your broker logins
+│            every .json file in     trades.json (your trade history)
+│            the main folder         and the app's saved state; the ZIP
+│                                    has none in its main folder, so
+│                                    nothing of the new version is
+│                                    overwritten
+│            the sessions folder     saved broker sign-ins
+│            the logs folder         (optional) activity history
+│     3.  Double-click INSTALL.bat in the NEW folder. It is quick when
+│         nothing changed, updates anything that did, and points the
+│         desktop icon at the new folder.
+│     4.  Start the app and check that your trades and brokers are there,
+│         then delete the old folder.
+│
+│  Running INSTALL.bat again is always safe: it never changes your .env
+│  or your trade history.
+│
+└──────────────────────────────────────────────────────────────────────────────
+
+
+┌─ 14. TROUBLESHOOTING ───────────────────────────────────────────────────────
+│
+│  The app doesn't open / "RSAMAXXED could not start"
+│     Run INSTALL.bat again and read any error it shows.
+│
+│  "Windows protected your PC"
+│     More info -> Run anyway. It only appears for downloaded files.
+│
+│  A broker fails to connect
+│     Check the Activity page for the reason. Common ones:
+│        -  Chase: use your username, not your email.
+│        -  Schwab or SoFi: add the TOTP secret (section 6).
+│        -  Robinhood: approve on your phone, and don't retry quickly.
+│        -  Schwab "Executable doesn't exist": run INSTALL.bat again.
+│     To watch the browser brokers work, add RSA_BACKGROUND=false to .env
+│     and restart the app.
+│
+│  The Watchlist is empty
+│     Usually just no open plays right now. The status bar shows when the
+│     feed last arrived.
+│
+└──────────────────────────────────────────────────────────────────────────────
+
+
+┌─ 15. NOTES ON RESULTS ──────────────────────────────────────────────────────
+│
+│  RSAMAXXED automates the clicking. It does not guarantee a profit. What
+│  a play earns depends on the split ratio and post-split price, how each
+│  broker handles fractions, how many accounts you link, and how many
+│  qualifying splits appear. Brokers can reject orders, change their
+│  rules, or restrict accounts. Only trade money you can afford to lose,
+│  and check your broker statements.
+│
+│  This software is not financial advice.
 │
 └──────────────────────────────────────────────────────────────────────────────
 
 ================================================================================
-  RSAMAXXED  —  pick it, mirror it, round it up.
+  RSAMAXXED  -  pick it, mirror it, round it up.
 ================================================================================

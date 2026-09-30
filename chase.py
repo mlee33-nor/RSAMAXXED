@@ -16,7 +16,7 @@ from modules import broker_logging as BLOG
 import broker_logins
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow, find_browser_executable, cleanup_orphaned_chrome
 from modules import quiet
-from modules._2fa_prompt import universal_2fa_prompt
+from modules._2fa_prompt import universal_2fa_prompt, notify_user, clear_notice
 from modules.brokers.chase.chase_normalizer import normalize as chase_normalize
 
 BROKER = "chase"
@@ -704,6 +704,7 @@ async def _async_login(
     browser = await uc.start(browser_args=browser_args, user_data_dir=str(_profile_dir()), browser_executable_path=find_browser_executable())
     if not headless:
         quiet.tame_windows(browser)
+    code_handed_over = False
     try:
         page = browser.tabs[0] if browser.tabs else await browser()
         _stage("browser_ready", f"headless={headless} profile={_profile_dir()}")
@@ -827,6 +828,16 @@ async def _async_login(
                             "Chase 2FA code required — retrying with a visible browser")
                     # Headed GUI flow: let the user type the code straight into the
                     # visible browser; keep polling for auth (bounded, never frozen).
+                    # In background mode that browser is parked off-screen with no
+                    # taskbar button, so it is only "visible" once revealed -- and
+                    # the app has to say so, since nothing else asks for the code.
+                    if not code_handed_over:
+                        code_handed_over = True
+                        quiet.reveal_browser(browser)
+                        notify_user(
+                            "Chase", "Enter your Chase code in the browser",
+                            "Chase sent you a security code. Type it into the "
+                            "Chase browser window that just opened and press Next.")
                     await page.sleep(3)
                     continue
 
@@ -874,6 +885,8 @@ async def _async_login(
         return cookies
 
     finally:
+        # However the login ended, whatever it asked of the user is over.
+        clear_notice("Chase")
         try:
             for tab in getattr(browser, "tabs", []) or []:
                 try:
@@ -920,7 +933,10 @@ def ensure_session(*, prime_trade: bool = False, **kwargs: Any) -> BrokerOutput:
                 prime_trade=prime_trade,
                 headless_override=headless,
                 notify_push=True,
-                notify_push_fn=lambda: print("Chase sent a push notification. Approve it in your Chase app."),
+                # notify_user, not print(): print() goes nowhere under pythonw.
+                notify_push_fn=lambda: notify_user(
+                    "Chase", "Approve the Chase sign-in",
+                    "Chase sent a push notification. Approve it in your Chase app."),
             )
         )
 

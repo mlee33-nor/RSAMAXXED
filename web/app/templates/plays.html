@@ -355,7 +355,7 @@
         {% for label, n, note in [
              ('Alerted', alerted,                        'every alert on the feed'),
              ('Sold',    board.sold_history | length,    'a sell alert closed it'),
-             ('Priced',  board.payout_rows | length,     'the sell named brokers, at a price')] %}
+             ('Priced',  board.priced_history | length,  'the sell named brokers, at a price')] %}
           <div class="fstep">
             <div class="fhead"><span class="fk">{{ label }}</span><b class="fv">{{ n }}</b></div>
             <span class="ftrack">

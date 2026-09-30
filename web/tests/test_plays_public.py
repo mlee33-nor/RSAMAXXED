@@ -1056,10 +1056,46 @@ def test_a_fractional_play_that_sold_pays_without_ever_being_a_round_up(fraction
 def test_every_funnel_stage_contains_the_next(fractional_sale):
     alerted = len(fractional_sale.history)
     sold = len(fractional_sale.sold_history)
-    priced = len(fractional_sale.payout_rows)
+    # Plays, not payout rows: a play sold in tranches has a row per tranche.
+    priced = len(fractional_sale.priced_history)
     paid = fractional_sale.totals()["plays"]
     assert alerted >= sold >= priced >= paid, (
         f"the funnel widens: alerted={alerted} sold={sold} priced={priced} paid={paid}")
+
+
+def test_a_play_sold_in_tranches_is_one_play_at_every_stage(anon):
+    """payout_rows is one row per EXIT. A play sold at Public one week and at
+    Chase the next is two rows but one play, and counting rows is what drew
+    "Priced" wider than "Sold" once the feed carried tranched exits."""
+    anon.post("/api/v1/plays/ingest", headers=KEY, json={
+        "buys": [{"source_id": "fn:t1", "symbol": "TWOLEG", "kind": "standard",
+                  "alert_date": "2026-08-11", "entry_price": 1.00,
+                  "ratio": "1:10", "ratio_n": 10, "last_buy_date": "2026-08-12"}],
+        "sells": [
+            {"source_id": "fn:t1a", "symbol": "TWOLEG", "sell_date": "2026-08-14",
+             "exit_price": 2.00, "proceeds_low": 2.0,
+             "legs": [{"broker": "Public", "accounts_low": 1}]},
+            {"source_id": "fn:t1b", "symbol": "TWOLEG", "sell_date": "2026-08-15",
+             "exit_price": 3.00, "proceeds_low": 3.0,
+             "legs": [{"broker": "Chase", "accounts_low": 1}]},
+        ],
+    })
+    board = _board_of(anon)
+    rows = [r for r in board.payout_rows if r["sym"] == "TWOLEG"]
+    assert len(rows) == 2, "the fixture stopped exercising the tranche path"
+    assert len({r["play"] for r in rows}) == 1
+    priced = [l for l in board.priced_history if l.play.symbol == "TWOLEG"]
+    assert len(priced) == 1, "a tranched play was priced twice"
+    assert len(board.priced_history) <= len(board.sold_history)
+
+    only_this = {"public": 1, "chase": 1}
+    totals = board.totals(only_this)
+    tranche_month = next(m for m in totals["months"] if m["key"] == "2026-08")
+    # Both tranches still pay: money is per row, only the COUNT is per play.
+    assert sum(r["per"] for r in rows) == pytest.approx(3.0, abs=0.01)
+    assert totals["plays"] <= len(board.priced_history)
+    assert tranche_month["plays"] <= len({r["play"] for r in board.payout_rows
+                                          if (r["on"] or "")[:7] == "2026-08"})
 
 
 def test_paid_is_not_a_subset_of_rounded_up(fractional_sale):

@@ -68,6 +68,10 @@ except Exception:  # missing module, missing requests, anything at all
 # Constants
 # ---------------------------------------------------------------------------
 
+# The release a customer is running — shown in the sidebar footer and stamped
+# on every crash-log START line, so a support report says which build it is.
+APP_VERSION = "1.0.0"
+
 ROOT_DIR = Path(__file__).resolve().parent
 ENV_FILE = ROOT_DIR / ".env"
 LOG_DIR = ROOT_DIR / "logs"  # persistent trade_results.log lives here
@@ -207,7 +211,8 @@ def _install_crash_log() -> None:
     threading.excepthook = on_thread_error
     atexit.register(lambda: _crash_note(
         "PROCESS EXIT", "".join(_tb.format_stack())))
-    _crash_note("START", f"pid={os.getpid()} python={sys.version.split()[0]}")
+    _crash_note("START", f"v{APP_VERSION} pid={os.getpid()} "
+                         f"python={sys.version.split()[0]}")
 
 
 _CRASH_FH = None
@@ -305,12 +310,13 @@ def _browser_slot(broker: str) -> Optional[threading.Lock]:
     """Per-broker Chrome lock (None for API brokers that don't use a browser)."""
     return _browser_locks.get(broker)
 
-# Known sub-account counts per broker (avoids re-scraping just for the count)
-_KNOWN_ACCOUNT_COUNTS: Dict[str, int] = {
-    "fidelity": 10,
-    "wellsfargo": 10,
-    "robinhood": 3,
-}
+# broker -> how many accounts its last successful bootstrap / holdings call
+# returned THIS session. Written by App._update_total_accounts; read through
+# _account_counts_by_broker(). There is deliberately no table of guesses here:
+# the old one held one operator's own fleet (10 Fidelity, 10 Wells Fargo, 3
+# Robinhood), so a customer with one account at each read "3/13" on every
+# coverage bar and no pick ever left Partial.
+_LIVE_ACCOUNT_COUNTS: Dict[str, int] = {}
 
 BROKER_ENV_KEYS: Dict[str, List[str]] = {
     "bbae":       ["BBAE_USER", "BBAE_PASSWORD"],
@@ -441,7 +447,8 @@ CHART_PALETTE = [ACCENT, "#aeb3c2", "#7c8294", "#565b6b",
 
 # Fonts
 FONT_FAMILY = "Segoe UI"
-FONT_MONO   = "Cascadia Code"  # fallback to Consolas — tabular figures for $ values
+FONT_MONO   = "Cascadia Code"  # tabular figures for $ values; see _select_mono_font
+FONT_MONO_FALLBACK = "Consolas"  # ships with every Windows since Vista
 
 # ---------------------------------------------------------------------------
 # CustomTkinter appearance
@@ -492,6 +499,61 @@ ICONS = {
 ICONS["lock"] = chr(0xE72E)
 ICONS["unlock"] = chr(0xE785)
 ICONS["calendar"] = chr(0xE787)
+
+# Windows 10 ships Segoe MDL2 Assets but not Segoe Fluent Icons (that font is
+# Windows 11's). Tk silently substitutes a text font for a missing family, and
+# a Private-Use code point in a text font draws nothing, so on Windows 10 every
+# icon in the app was blank. MDL2 is Fluent's predecessor and shares its code
+# points for every glyph above except these, checked against both fonts' cmaps.
+ICON_FONT_FALLBACK = "Segoe MDL2 Assets"
+_MDL2_SUBSTITUTES: Dict[str, str] = {
+    "clock": chr(0xE823),     # Fluent E917 has no MDL2 glyph; E823 = "Recent"
+}
+
+
+def _select_icon_font(families) -> str:
+    """Point ICON_FONT at whichever icon font this machine actually has.
+
+    Needs the family list from a live Tk root (tkinter.font.families), so it
+    runs from App.__init__ once the root exists — never at import. Fluent wins
+    when present; MDL2 is used only when Fluent is missing, and swaps in the
+    few glyphs whose code point differs. With neither installed nothing
+    changes: there is no better answer to fall back to.
+    """
+    global ICON_FONT
+    have = {str(f) for f in families}
+    if "Segoe Fluent Icons" in have:
+        ICON_FONT = "Segoe Fluent Icons"
+    elif ICON_FONT_FALLBACK in have:
+        ICON_FONT = ICON_FONT_FALLBACK
+        ICONS.update(_MDL2_SUBSTITUTES)
+    return ICON_FONT
+
+
+def _select_mono_font(families) -> str:
+    """Point FONT_MONO at Consolas when Cascadia Code is not installed.
+
+    Cascadia Code only ships with Windows Terminal / newer Windows 11 builds,
+    and Tk silently substitutes a proportional font for a missing family, so
+    every price column stopped lining up. Same timing as _select_icon_font:
+    runs from App.__init__ once the root exists, never at import.
+
+    Most call sites read FONT_MONO when they build a widget, so they pick the
+    new value up. A handful of App class attributes (_WF_PRICE, _SF_MONO, ...)
+    were built at import from the old value; those are rebuilt here, found by
+    looking rather than by a list that would go stale.
+    """
+    global FONT_MONO
+    have = {str(f) for f in families}
+    if FONT_MONO in have or FONT_MONO_FALLBACK not in have:
+        return FONT_MONO
+    old, FONT_MONO = FONT_MONO, FONT_MONO_FALLBACK
+    for cls in [c for c in globals().values()
+                if isinstance(c, type) and c.__module__ == __name__]:
+        for attr, val in list(vars(cls).items()):
+            if isinstance(val, tuple) and val and val[0] == old:
+                setattr(cls, attr, (FONT_MONO,) + val[1:])
+    return FONT_MONO
 
 
 def icon(name: str) -> str:
@@ -2067,39 +2129,154 @@ def _tidy_reason(msg: str, limit: int = 150) -> str:
     return msg[:limit] + ("…" if len(msg) > limit else "")
 
 
+def _observed_account_counts() -> Dict[str, int]:
+    """broker -> distinct accounts with a confirmed buy in the trailing window.
+
+    The same (broker, account_id) set the coverage numerator counts, so a
+    denominator built from it can never fall below what a pick can score.
+    Recent buys only: over all time the journal also holds accounts that were
+    since renamed or closed (Wells Fargo shows 20 distinct labels for 10 real
+    accounts), and that inflated denominator means no pick ever reads as fully
+    bought. Memoised per (journal version, day) — it is a pass over every trade.
+    """
+    key = (trade_journal.version(), id(trade_journal.get_trades), date.today())
+    hit = _COVERAGE_MEMO.get("observed")
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    out: Dict[str, int] = {}
+    try:
+        cutoff = (datetime.now() - timedelta(days=ACCOUNT_UNIVERSE_WINDOW_DAYS)
+                  ).strftime("%Y-%m-%d")
+        seen = {(str(t.get("broker") or ""), str(t.get("account_id") or ""))
+                for t in trade_journal.get_trades()
+                if t.get("side") == "buy"
+                and str(t.get("timestamp") or "")[:10] >= cutoff}
+        for broker, _acct in seen:
+            if broker:
+                out[broker] = out.get(broker, 0) + 1
+    except Exception:
+        out = {}
+    _COVERAGE_MEMO["observed"] = (key, out)
+    return out
+
+
+# balances.json keys an account by its label, and some brokers put the balance
+# IN the label ("WELLSTRADE (****1234) = $5.00"), so one account gathers a new
+# row every time its cash moves. Only the rows from the latest refresh count,
+# and they are compared with the balance cut off.
+_BALANCE_SUFFIX_RE = re.compile(r"\s*=\s*-?\$?[\d,.]+\s*$")
+_REFRESH_WINDOW_S = 120
+
+
+def _balances_account_counts() -> Dict[str, int]:
+    """broker -> accounts returned by the latest holdings refresh on record.
+
+    balances.json is written by every Refresh All, so it is the one place a
+    broker's account count survives a restart before anything has been bought
+    there. Stale by nature — callers treat it as a floor, never an answer.
+    """
+    key = balances.version()
+    hit = _COVERAGE_MEMO.get("balances")
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    out: Dict[str, int] = {}
+    try:
+        for broker, book in (balances.load().get("brokers") or {}).items():
+            stamped = []
+            for acct_id, row in (book or {}).items():
+                try:
+                    at = datetime.fromisoformat(str((row or {}).get("seen_at") or ""))
+                except ValueError:
+                    continue
+                stamped.append((at, acct_id))
+            if not stamped:
+                continue
+            latest = max(at for at, _ in stamped)
+            fresh = {_BALANCE_SUFFIX_RE.sub("", str(a)).strip()
+                     for at, a in stamped
+                     if (latest - at).total_seconds() <= _REFRESH_WINDOW_S}
+            if fresh:
+                out[str(broker)] = len(fresh)
+    except Exception:
+        out = {}
+    _COVERAGE_MEMO["balances"] = (key, out)
+    return out
+
+
+def _account_count_evidence() -> Dict[str, int]:
+    """broker -> how many accounts we have actual EVIDENCE for (absent = none).
+
+    This session's live count wins when a bootstrap or refresh has succeeded —
+    it is what the broker says right now. Before that, the larger of the last
+    refresh on record and what the journal has seen bought. Nothing here is a
+    guess.
+    """
+    observed = _observed_account_counts()
+    stored = _balances_account_counts()
+    out: Dict[str, int] = {}
+    for broker in set(observed) | set(stored) | set(_LIVE_ACCOUNT_COUNTS):
+        live = _LIVE_ACCOUNT_COUNTS.get(broker)
+        n = live if live is not None else max(stored.get(broker, 0),
+                                              observed.get(broker, 0))
+        if n > 0:
+            out[broker] = n
+    return out
+
+
+def _account_counts_by_broker() -> Dict[str, int]:
+    """Linked broker -> how many accounts it holds, for the dashboard's
+    ACCOUNTS figure, the status rows and the order estimate.
+
+    A linked broker we know nothing about yet counts as ONE account: it is at
+    least one, and anything larger would be a number made up for someone
+    else's fleet.
+    """
+    evidence = _account_count_evidence()
+    return {b: max(1, evidence.get(b, 0))
+            for b in BROKER_MODULES if _broker_has_creds(b)}
+
+
+def _tradable_account_counts() -> Dict[str, int]:
+    """Linked broker -> accounts a pick has to reach there to count as fully
+    bought — the per-broker coverage denominator.
+
+    When the broker has reported its accounts THIS session, the larger of that
+    live count and the accounts the journal has seen bought. Trusting the
+    journal alone read a broker listing 3 accounts, only 1 of them ever
+    bought, as fully covered — the other two were silently never owed
+    anything. The journal still sets a floor, so a bar can never read 12/10
+    (the numerator counts the same (broker, account) set). An account that
+    really is never bought into (a joint account, a spare sub-account) now
+    keeps its picks in Partial; "Mark done" is how the user clears those.
+
+    With no live count yet (fresh start, broker not bootstrapped), the journal
+    comes first as before, then the last refresh on record, then one — a
+    stale stored count is not trusted over what was actually bought.
+    """
+    observed = _observed_account_counts()
+    evidence = _account_count_evidence()
+    out: Dict[str, int] = {}
+    for b in BROKER_MODULES:
+        if not _broker_has_creds(b):
+            continue
+        live = _LIVE_ACCOUNT_COUNTS.get(b)
+        if live:
+            out[b] = max(observed.get(b, 0), int(live))
+        else:
+            out[b] = observed.get(b) or evidence.get(b) or 1
+    return out
+
+
 def _account_universe_static() -> int:
     """Total accounts we can buy into — the coverage denominator, computed
     without a live App instance.
 
-    _KNOWN_ACCOUNT_COUNTS is only a rough guess (it defaults unlisted brokers
-    to 1, so Public's dozen counted as one) and a too-small denominator makes
-    a half-filled pick look complete. The journal knows every account we have
-    ever actually traded, so take whichever is larger.
+    A too-small denominator makes a half-filled pick look complete, and a
+    too-large one strands every pick in Partial. So it is built only from what
+    this user's own journal and brokers have shown (see
+    _tradable_account_counts), never from a fixed table.
     """
-    known = sum(_KNOWN_ACCOUNT_COUNTS.get(b, 1) if _broker_has_creds(b) else 0
-                for b in BROKER_MODULES)
-    # The journal half is a pass over every trade; it only changes with the
-    # journal (and the day, since it is a trailing window).
-    key = (trade_journal.version(), id(trade_journal.get_trades), date.today())
-    hit = _COVERAGE_MEMO.get("universe")
-    if hit is not None and hit[0] == key:
-        return max(known, hit[1])
-    try:
-        from datetime import timedelta
-        # Recent buys only. Over all time the journal also holds accounts that
-        # were since renamed or closed (Wells Fargo shows 20 distinct labels
-        # for 10 real accounts), and that inflated denominator means no pick
-        # ever reads as fully bought.
-        cutoff = (datetime.now() - timedelta(days=ACCOUNT_UNIVERSE_WINDOW_DAYS)
-                  ).strftime("%Y-%m-%d")
-        seen = len({(t.get("broker"), t.get("account_id"))
-                    for t in trade_journal.get_trades()
-                    if t.get("side") == "buy"
-                    and str(t.get("timestamp") or "")[:10] >= cutoff})
-    except Exception:
-        seen = 0
-    _COVERAGE_MEMO["universe"] = (key, seen)
-    return max(known, seen)
+    return sum(_tradable_account_counts().values())
 
 
 # (what it was computed from) -> result, for the two journal scans below. One
@@ -2480,6 +2657,17 @@ if sys.platform == "win32":
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
+        # Before anything is built: every icon label reads ICON_FONT when it is
+        # created, and the family list needs this root to exist. Windows 10
+        # has no Segoe Fluent Icons, so without this every icon drew blank.
+        # FONT_MONO the same way: Cascadia Code is missing on many machines.
+        try:
+            import tkinter.font as tkfont
+            _families = tkfont.families(self)
+            _select_icon_font(_families)
+            _select_mono_font(_families)
+        except Exception:
+            pass
         # First, because the `after` override below reads it and a worker can
         # hand back work before the rest of __init__ has finished.
         self._ui_queue: "queue.Queue[tuple]" = queue.Queue()
@@ -2913,8 +3101,14 @@ class App(ctk.CTk):
 
     def _show_action_alert(self, title: str, body: str, *,
                            detail: str = "", icon_name: str = "warning",
-                           color: str = YELLOW) -> None:
+                           color: str = YELLOW,
+                           waiting_text: str = "● waiting for approval",
+                           raise_window: bool = True) -> None:
         """Full-window alert for a step only the user can complete elsewhere.
+
+        `raise_window=False` is for a step done in a broker's browser window
+        that has just been brought to the front: raising the app would bury
+        the very window the user needs.
 
         Unlike `_ask_inline` there is nothing to type. A device approval is
         already sitting on the user's phone and the login is blocked until they
@@ -2932,6 +3126,8 @@ class App(ctk.CTk):
                 existing["title"].configure(text=title)
                 existing["body"].configure(text=body)
                 existing["detail"].configure(text=detail)
+                if existing.get("waiting") is not None:
+                    existing["waiting"].configure(text=waiting_text)
                 return
 
             overlay = tk.Frame(self, bg=BG_PRIMARY)
@@ -2959,12 +3155,13 @@ class App(ctk.CTk):
                                   justify="center")
             lbl_detail.pack(anchor="center", pady=(SP_LG, 0))
 
-            waiting = tk.Label(inner, text="● waiting for approval", bg=BG_CARD,
+            waiting = tk.Label(inner, text=waiting_text, bg=BG_CARD,
                                fg=color, font=(FONT_MONO, 11))
             waiting.pack(anchor="center", pady=(SP_XL, 0))
 
             state = {"frame": overlay, "title": lbl_title, "body": lbl_body,
-                     "detail": lbl_detail, "pulse": None, "on": True}
+                     "detail": lbl_detail, "waiting": waiting, "pulse": None,
+                     "on": True}
 
             def pulse() -> None:
                 if not waiting.winfo_exists():
@@ -2984,13 +3181,14 @@ class App(ctk.CTk):
 
             self._action_alert = state
 
-            try:
-                self.deiconify()
-                self.lift()
-                self.attributes("-topmost", True)
-                self.after(800, lambda: self.attributes("-topmost", False))
-            except Exception:
-                pass
+            if raise_window:
+                try:
+                    self.deiconify()
+                    self.lift()
+                    self.attributes("-topmost", True)
+                    self.after(800, lambda: self.attributes("-topmost", False))
+                except Exception:
+                    pass
             try:
                 self.bell()
                 winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
@@ -3139,6 +3337,38 @@ class App(ctk.CTk):
 
         _2fa_prompt.set_prompt_hook(otp_hook)
 
+        # Notices: a login waiting on something done in the broker's own
+        # browser (SoFi's human check, a Chase code typed into the page). The
+        # module has already brought that window to the front, so the alert
+        # must not raise the app over it. Called from login threads.
+        self._notice_broker: Optional[str] = None
+
+        def notice_show(broker: str, title: str, message: str) -> None:
+            def _on_ui() -> None:
+                self._notice_broker = broker
+                self._log(f"ALERT: {message}")
+                self._push_notification(message, "warning")
+            self.after(0, _on_ui)
+            self._show_action_alert(
+                title, message,
+                detail=("The login is waiting on you and continues by itself "
+                        "once that's done. If a browser window was opened for "
+                        "it and you can't see it, look for it on the taskbar."),
+                icon_name="lock", waiting_text="● waiting for you",
+                raise_window=False,
+            )
+
+        def notice_clear(broker: str) -> None:
+            def _on_ui() -> None:
+                # Only take down this broker's notice -- not a Robinhood
+                # approval or another broker's check that is still up.
+                if self._notice_broker == broker:
+                    self._notice_broker = None
+                    self._hide_action_alert()
+            self.after(0, _on_ui)
+
+        _2fa_prompt.set_notice_hooks(notice_show, notice_clear)
+
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -3262,7 +3492,7 @@ class App(ctk.CTk):
         self._sidebar_conn_lbl = tk.Label(
             foot, bg=SIDEBAR_BG, fg=TEXT_SECONDARY, font=(FONT_FAMILY, 8))
         self._sidebar_conn_lbl.pack(side="left")
-        tk.Label(foot, text="v2.2", bg=SIDEBAR_BG, fg=TEXT_MUTED,
+        tk.Label(foot, text=f"v{APP_VERSION}", bg=SIDEBAR_BG, fg=TEXT_MUTED,
                  font=(FONT_MONO, 8)).pack(side="right")
 
     def _make_nav_item(self, name: str, label: str, ic: str) -> None:
@@ -5022,11 +5252,20 @@ class App(ctk.CTk):
     # ---- Dashboard --------------------------------------------------------
 
     def _update_total_accounts(self, broker: str = None, count: int = None) -> None:
-        """Update a broker's account count and refresh the total accounts card."""
-        if broker and count is not None:
-            self._broker_account_counts[broker] = count
+        """Record a broker's live account count and refresh the total card.
+
+        The count goes into _LIVE_ACCOUNT_COUNTS rather than only this
+        widget's dict, so the coverage denominator (_account_universe_static,
+        which the pick tabs, coverage bars and simulator read) moves with it.
+        Called bare, it just recomputes — e.g. after a broker is linked or
+        unlinked.
+        """
+        if broker and count is not None and count > 0:
+            _LIVE_ACCOUNT_COUNTS[broker] = int(count)
+        self._broker_account_counts = _account_counts_by_broker()
         total = sum(self._broker_account_counts.values())
-        self._dash_accounts.configure(text=str(total))
+        if getattr(self, "_dash_accounts", None) is not None:
+            self._dash_accounts.configure(text=str(total))
 
     def _render_dash_movers(self) -> None:
         """Top movers panel on the dashboard, driven by live watchlist quotes."""
@@ -5126,16 +5365,10 @@ class App(ctk.CTk):
 
         self._dash_invested = _substat("DEPLOYED (OPEN COST)")
         self._dash_pl = _substat("OPEN POSITIONS")
-        startup_total = sum(
-            _KNOWN_ACCOUNT_COUNTS.get(b, 1) if _broker_has_creds(b) else 0
-            for b in BROKER_MODULES
-        )
         self._dash_accounts = _substat("ACCOUNTS")
-        self._dash_accounts.configure(text=str(startup_total))
-        self._broker_account_counts: Dict[str, int] = {
-            b: _KNOWN_ACCOUNT_COUNTS.get(b, 1) if _broker_has_creds(b) else 0
-            for b in BROKER_MODULES
-        }
+        self._broker_account_counts: Dict[str, int] = _account_counts_by_broker()
+        self._dash_accounts.configure(
+            text=str(sum(self._broker_account_counts.values())))
 
         movers_card = RoundedFrame(hero_row, bg_color=BG_CARD, border_color=BORDER,
                                    radius=RAD_LG)
@@ -5228,7 +5461,9 @@ class App(ctk.CTk):
                     self._public_status_labels[idx] = _status_row(f"Public P{idx}", "credentials set")
                 continue
 
-            n = _KNOWN_ACCOUNT_COUNTS.get(broker)
+            # Only a count we have evidence for; a broker nothing has reported
+            # on yet says so rather than showing a number.
+            n = _account_count_evidence().get(broker)
             status_text = f"{_plural(n, 'account')}" if n else "credentials set"
             self._broker_status_labels[broker] = _status_row(broker.capitalize(), status_text)
 
@@ -5454,9 +5689,8 @@ class App(ctk.CTk):
             self._sell_count_lbl.configure(text="")
             self._empty_state(
                 grids["now"], "info", "No exits yet",
-                "Exits arrive with your subscription once this device is "
-                "linked - nothing else to set up - and name the brokerage each one "
-                "was called at.",
+                "Exits appear here automatically as plays are called - nothing "
+                "to set up - and name the brokerage each one was called at.",
                 bg=BG_CARD, pad=16).pack(fill="x")
             return
 
@@ -6208,9 +6442,7 @@ class App(ctk.CTk):
         counts as fully bought: if the bar's denominator and the Purchased gate
         disagree, a row reads "43/27 accounts" and never leaves Quick Picks.
         """
-        counts = getattr(self, "_broker_account_counts", None)
-        live = sum(counts.values()) if counts else 0
-        return max(live, _account_universe_static())
+        return _account_universe_static()
 
     @staticmethod
     def _draw_coverage_bar(cv: tk.Canvas, frac: float, color: str) -> None:
@@ -9976,11 +10208,7 @@ class App(ctk.CTk):
         tk.Label(sim_form, text="ACCOUNTS", bg=BG_CARD, fg=TEXT_SECONDARY,
                  font=(FONT_FAMILY, 8, "bold")).grid(row=2, column=2, sticky="w", padx=(0, 10), pady=(0, 6))
         self._sim_accounts = ttk.Entry(sim_form, width=10, font=(FONT_MONO, 10))
-        total_accts = sum(
-            _KNOWN_ACCOUNT_COUNTS.get(b, 1) if _broker_has_creds(b) else 0
-            for b in BROKER_MODULES
-        )
-        self._sim_accounts.insert(0, str(total_accts))
+        self._sim_accounts.insert(0, str(_account_universe_static()))
         self._sim_accounts.grid(row=2, column=3, sticky="w", padx=(0, 16), pady=(0, 6))
 
         calc_row = tk.Frame(sim_card.inner, bg=BG_CARD)
@@ -14269,9 +14497,9 @@ class App(ctk.CTk):
             # Both empty, so say so once rather than printing two empty states.
             self._empty_state(
                 self._exits_list, "info", "Nothing to sell",
-                "Exits arrive with your subscription once this device is "
-                "linked — nothing else to set up — and each one names the brokerage "
-                "it was called at. Fractional remnants show up here on their "
+                "Exits appear here automatically as plays are called — nothing "
+                "to set up — and each one names the brokerage it was called "
+                "at. Fractional remnants show up here on their "
                 "own off the split board. Neither has anything for you right "
                 "now.").pack(fill="x")
             return
@@ -16333,6 +16561,14 @@ class App(ctk.CTk):
                 render()
             except Exception as exc:      # one broken piece must not eat the save
                 self._log(f"Accounts: could not refresh broker UI — {exc}", "warn")
+        # The ACCOUNTS figure and the coverage denominator count linked brokers
+        # too; a newly linked one starts at one account until it reports more.
+        recount = getattr(self, "_update_total_accounts", None)
+        if recount is not None:
+            try:
+                recount()
+            except Exception as exc:
+                self._log(f"Accounts: could not refresh account count — {exc}", "warn")
 
     def _render_linked_count(self) -> None:
         """The two "N brokers linked" readouts, in the sidebar and status bar."""

@@ -1,34 +1,63 @@
+# RSAMAXXED dependencies. Install with INSTALL.bat, or by hand:
+#     py -3.13 -m pip install -r requirements.txt
+#
+# The broker and browser libraries are pinned with == on purpose. Each of them
+# drives a broker's private web API or login page, and an unannounced upstream
+# release has broken a working install more than once (Fennel 2.0, zendriver
+# before 0.15.5, playwright-stealth 2.0 -- notes below). These are the exact
+# versions the app is run and tested with. Bump one at a time, deliberately.
+#
+# Tested on Python 3.13 (recommended) and 3.14; also installs on 3.12.
+
+# --- Core ------------------------------------------------------------------
 python-dotenv>=1.0.0
-customtkinter>=5.2.2
+customtkinter==5.2.2
 requests>=2.28.0
 pyotp>=2.8.0
 pytz>=2023.3
 tzdata>=2023.3
-robin-stocks>=3.0.0
-bbae-invest-api>=0.1.5
-dspac-invest-api>=0.1.4
-# <2 is required, not cosmetic. 2.0 is a breaking rewrite: it dropped the email
-# + OTP login this app uses (`Fennel(filename=, path=)` and `.login()` are gone)
-# for a constructor that takes a Fennel-issued PAT, and renamed the rest
+# Draws the app icon (logo.py). Already pulled in by the BBAE/DSPAC libraries;
+# listed so the desktop shortcut never depends on that accident.
+pillow>=10.0.0
+
+# --- Broker libraries ------------------------------------------------------
+robin-stocks==3.4.0
+bbae-invest-api==0.1.5
+dspac-invest-api==0.1.4
+# Must stay on 1.x. 2.0 is a breaking rewrite: it dropped the email + OTP login
+# this app uses (`Fennel(filename=, path=)` and `.login()` are gone) for a
+# constructor that takes a Fennel-issued PAT, and renamed the rest
 # (get_account_ids -> get_account_info, get_stock_holdings ->
 # get_portfolio_positions). On 2.x every Fennel call dies at construction with
 # "Fennel.__init__() got an unexpected keyword argument 'filename'", surfacing
-# in the UI as "Auth failed". The old passwordless endpoint is still live, so
-# 1.2.0 keeps working; moving to 2.x is a rewrite of fennel.py, not a bump.
-fennel-invest-api>=1.2.0,<2
-schwab-api>=0.3.0
+# in the UI as "Auth failed". Moving to 2.x is a rewrite of fennel.py.
+fennel-invest-api==1.2.0
+schwab-api==0.4.3
+
+# --- Browser automation ----------------------------------------------------
 # >=0.15.5 is required, not cosmetic. Chrome 150 dropped the `sameParty` cookie
 # field; older zendriver's Cookie.from_json does json["sameParty"] and raises
 # KeyError inside the CDP listener task. The listener pops the transaction
 # BEFORE invoking it, so the await never resolves and the whole connection goes
-# deaf — every browser broker (chase/sofi/wellsfargo/fidelity) hangs forever.
-zendriver>=0.15.5
-curl-cffi>=0.5.0
+# deaf -- every browser broker (chase/sofi/wellsfargo/fidelity) hangs forever.
+zendriver==0.15.5
+# zendriver's transport. Pinned with it: a websockets major release changes the
+# client API zendriver is written against.
+websockets==15.0.1
+curl-cffi==0.14.0
 beautifulsoup4>=4.12.0
-# Not used directly by this app -- schwab-api imports it to drive its login.
+# Not used directly by this app -- schwab-api imports them to drive its login.
 # Installing these does NOT install a browser: Schwab also needs
-# `py -3.13 -m playwright install firefox`, and firefox specifically, because
-# schwab_api.authentication raises ValueError on any other browserType.
-# Without it Schwab bootstrap dies on "Executable doesn't exist".
-playwright>=1.40.0
-playwright-stealth>=1.0.0
+# `py -3.13 -m playwright install firefox` (INSTALL.bat does it), and firefox
+# specifically, because schwab_api.authentication raises ValueError on any other
+# browserType. Without it Schwab bootstrap dies on "Executable doesn't exist".
+playwright==1.58.0
+# Must stay on 1.x. schwab-api 0.4.3 does `from playwright_stealth import
+# stealth_async` and `from playwright_stealth.stealth import StealthConfig`;
+# 2.0 removed both, so on 2.x `import schwab_api` itself fails and Schwab
+# cannot even start.
+playwright-stealth==1.0.6
+# playwright-stealth 1.x imports pkg_resources, which lives in setuptools and
+# was removed in setuptools 82. A fresh Python 3.12+ venv has no setuptools at
+# all, so without this line Schwab fails with "No module named 'pkg_resources'".
+setuptools>=70,<82

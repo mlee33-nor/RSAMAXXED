@@ -76,10 +76,33 @@ def wired(tmp_path, monkeypatch):
                         lambda url, headers=None, timeout=None:
                             _Resp(client.get(_path(url), headers=headers)))
     monkeypatch.setattr(cloud_sync, "_STATE_FILE", tmp_path / "cloud_state.json")
-    monkeypatch.setattr(cloud_sync, "_TRADES_FILE", REPO_ROOT / "trades.json")
+    # A synthetic journal in tmp, never the repo root's trades.json: that file
+    # is the operator's live trade history, absent from a fresh clone, and a
+    # test that reads it passes or fails on whatever was traded that week.
+    trades_file = tmp_path / "trades.json"
+    trades_file.write_text(json.dumps(_SAMPLE_TRADES), encoding="utf-8")
+    monkeypatch.setattr(cloud_sync, "_TRADES_FILE", trades_file)
 
     sync = cloud_sync.CloudSync(base_url="http://testserver")
     return sync, client
+
+
+# Two round trips — one up, one down — so the realized figure the dashboard
+# prints is a real sum and not a lone row. Tickers and labels are made up.
+_SAMPLE_TRADES = [
+    {"id": "t-1", "timestamp": "2026-07-01T14:30:00+00:00", "broker": "public",
+     "account_id": "Public 1 BROKERAGE (0001)", "side": "buy", "symbol": "AAAA",
+     "qty": 1, "fill_price": 0.25},
+    {"id": "t-2", "timestamp": "2026-07-09T15:00:00+00:00", "broker": "public",
+     "account_id": "Public 1 BROKERAGE (0001)", "side": "sell", "symbol": "AAAA",
+     "qty": 1, "fill_price": 4.75},
+    {"id": "t-3", "timestamp": "2026-07-02T14:30:00+00:00", "broker": "fidelity",
+     "account_id": "Fidelity 1 (0002)", "side": "buy", "symbol": "BBBB",
+     "qty": 2, "fill_price": 1.10},
+    {"id": "t-4", "timestamp": "2026-07-12T15:00:00+00:00", "broker": "fidelity",
+     "account_id": "Fidelity 1 (0002)", "side": "sell", "symbol": "BBBB",
+     "qty": 2, "fill_price": 0.90},
+]
 
 
 def _csrf(html: str) -> str:
@@ -114,7 +137,8 @@ def test_full_pairing_and_push_through_the_real_client(wired):
     assert sync.is_linked
     assert sync.linked_email == "contract@example.com"
 
-    trades = json.loads((REPO_ROOT / "trades.json").read_text("utf-8"))
+    trades = json.loads(cloud_sync._TRADES_FILE.read_text("utf-8"))
+    assert trades, "the fixture journal is empty; the push below proves nothing"
     result = sync.push_trades()
     assert result["inserted"] == len(trades), result
 
@@ -192,8 +216,11 @@ def test_revoked_token_unlinks_locally(wired):
     assert not sync.is_linked, "app kept a dead token"
 
 
-def test_unreachable_cloud_raises_cloud_error_not_a_crash():
+def test_unreachable_cloud_raises_cloud_error_not_a_crash(tmp_path, monkeypatch):
     """The GUI catches CloudError. Anything else would surface as a traceback."""
+    # begin_pairing mints a machine id and saves it; keep that out of the
+    # repo root, where cloud_state.json is the operator's real device link.
+    monkeypatch.setattr(cloud_sync, "_STATE_FILE", tmp_path / "cloud_state.json")
     sync = cloud_sync.CloudSync(base_url="http://127.0.0.1:9")  # nothing listens on :9
     with pytest.raises(cloud_sync.CloudError):
         sync.begin_pairing()

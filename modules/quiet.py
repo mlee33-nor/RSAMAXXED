@@ -28,6 +28,14 @@ different leaks, two different fixes.
    screenshot-based diagnostics the browser brokers rely on. Set
    RSA_BROWSER_HIDE=true to trade those away for a truly hidden window.
 
+3. THE EXCEPTION. A parked window is also a window nobody can use, and two
+   logins need the user's hands: SoFi's "Verify you are human" check, and a
+   Chase code that has to be typed into the page itself. ``reveal_browser()``
+   is the inverse of the parking -- it brings that one browser back on-screen,
+   restores its taskbar button and puts it in front, and stops the tame loop
+   from re-parking it. It is not re-parked afterwards; the browser closes when
+   the login finishes anyway.
+
 Set RSA_BACKGROUND=false to watch everything happen, which is what you want
 when debugging a broker by eye.
 """
@@ -236,6 +244,10 @@ def _tame_loop(pid: int, seconds: float) -> None:
     deadline = time.time() + seconds
     handled = set()
     while time.time() < deadline:
+        if _is_revealed(pid):
+            # Handed to the user -- parking it now would snatch the window
+            # away mid-click.
+            return
         try:
             pids = _process_tree(pid)
             for hwnd in _top_level_windows(pids):
@@ -246,6 +258,53 @@ def _tame_loop(pid: int, seconds: float) -> None:
         except Exception:
             return
         time.sleep(0.4)
+
+
+# =============================================================================
+# Handing a parked window to the user
+# =============================================================================
+
+# Pids reveal_browser() has put in front of the user. The tame loop checks this
+# so a reveal inside its 20-second window is not undone on the next pass.
+_revealed: set = set()
+_revealed_lock = threading.Lock()
+
+
+def _is_revealed(pid: int) -> bool:
+    with _revealed_lock:
+        return pid in _revealed
+
+
+def reveal_browser(target: Any) -> bool:
+    """Bring a parked headed browser on-screen and to the front.
+
+    The inverse of browser_args() + tame_windows(), for the moments a login
+    needs the user's hands (SoFi's human check, a Chase code typed into the
+    page). Accepts a zendriver browser or a raw pid. Returns True if at least
+    one window was brought back.
+
+    Does nothing outside background mode -- the window is already on the
+    desktop there -- and, like everything here, never raises: a window that
+    will not come forward must not break the login that asked for it.
+    """
+    if not IS_WINDOWS or not background_mode():
+        return False
+    pid = target if isinstance(target, int) else browser_pid(target)
+    if not pid:
+        return False
+    pid = int(pid)
+    with _revealed_lock:
+        _revealed.add(pid)
+    shown = False
+    try:
+        # include_hidden: under RSA_BROWSER_HIDE the window was SW_HIDE'd, and
+        # a hidden window is exactly the one that has to come back.
+        for hwnd in _top_level_windows(_process_tree(pid), include_hidden=True):
+            if _show_window(hwnd):
+                shown = True
+    except Exception:
+        return shown
+    return shown
 
 
 # --- Win32 plumbing ---------------------------------------------------------
@@ -311,9 +370,16 @@ def _process_tree(root: int) -> set:
     return pids
 
 
-def _top_level_windows(pids: set) -> List[int]:
-    """Visible top-level Chrome windows owned by any of `pids`."""
+def _top_level_windows(pids: set, *, include_hidden: bool = False) -> List[int]:
+    """Visible top-level Chrome windows owned by any of `pids`.
+
+    `include_hidden` also returns hidden ones that carry a title, but only
+    under RSA_BROWSER_HIDE, where _park_window hid the real browser window.
+    Chrome keeps several untitled invisible helper windows of the same class;
+    showing those would pop blank frames onto the desktop.
+    """
     found: List[int] = []
+    want_hidden = include_hidden and hide_browser_windows()
     try:
         ctypes, wintypes = _win32()
         user32 = ctypes.windll.user32
@@ -327,7 +393,8 @@ def _top_level_windows(pids: set) -> List[int]:
                 if int(owner.value) not in pids:
                     return True
                 if not user32.IsWindowVisible(hwnd):
-                    return True
+                    if not want_hidden or user32.GetWindowTextLengthW(hwnd) <= 0:
+                        return True
                 user32.GetClassNameW(hwnd, buf, 256)
                 # Chrome's browser window. Skips its invisible message-only
                 # windows and any other stray handle on the process.
@@ -374,6 +441,61 @@ def _park_window(hwnd: int) -> bool:
         return False
 
 
+def _work_area() -> tuple:
+    """(left, top, right, bottom) of the primary monitor minus the taskbar."""
+    try:
+        ctypes, wintypes = _win32()
+        rect = wintypes.RECT()
+        # SPI_GETWORKAREA
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+            if rect.right > rect.left and rect.bottom > rect.top:
+                return (rect.left, rect.top, rect.right, rect.bottom)
+    except Exception:
+        pass
+    return (0, 0, 1280, 800)
+
+
+def _show_window(hwnd: int) -> bool:
+    """Undo _park_window for one window: on-screen, taskbar button, in front."""
+    try:
+        ctypes, wintypes = _win32()
+        user32 = ctypes.windll.user32
+
+        SW_SHOW = 5
+        SW_RESTORE = 9
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_SHOWWINDOW = 0x0040
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+
+        h = wintypes.HWND(hwnd)
+        user32.ShowWindow(h, SW_RESTORE if user32.IsIconic(h) else SW_SHOW)
+
+        # The brokers ask for a 1920x1080 window, which is bigger than a
+        # laptop screen. Fit it inside the work area so the checkbox or code
+        # box is not hanging off the bottom edge.
+        left, top, right, bottom = _work_area()
+        width = max(640, min(1400, right - left - 80))
+        height = max(480, min(1000, bottom - top - 80))
+        # Topmost and straight back again: that puts the window above
+        # everything even when Windows refuses the SetForegroundWindow below
+        # (it only lets the foreground process hand focus away).
+        user32.SetWindowPos(h, wintypes.HWND(HWND_TOPMOST),
+                            left + 40, top + 40, width, height, SWP_SHOWWINDOW)
+        user32.SetWindowPos(h, wintypes.HWND(HWND_NOTOPMOST),
+                            0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+
+        _set_taskbar_button(hwnd, present=True)
+
+        if not user32.SetForegroundWindow(h):
+            # Focus refused -- flash the taskbar button so it still gets seen.
+            user32.FlashWindow(h, True)
+        return True
+    except Exception:
+        return False
+
+
 def _remove_taskbar_button(hwnd: int) -> None:
     """ITaskbarList::DeleteTab -- drop the button without touching the window.
 
@@ -382,6 +504,11 @@ def _remove_taskbar_button(hwnd: int) -> None:
     window is exactly what we are trying to avoid. DeleteTab is a plain request
     to the taskbar and leaves the window itself alone.
     """
+    _set_taskbar_button(hwnd, present=False)
+
+
+def _set_taskbar_button(hwnd: int, *, present: bool) -> None:
+    """ITaskbarList::AddTab / DeleteTab for one window. Best-effort."""
     try:
         ctypes, wintypes = _win32()
         ole32 = ctypes.windll.ole32
@@ -419,7 +546,8 @@ def _remove_taskbar_button(hwnd: int) -> None:
             proto_hwnd = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.HWND)
             try:
                 proto_self(vtbl[3])(ptr)                       # HrInit
-                proto_hwnd(vtbl[5])(ptr, wintypes.HWND(hwnd))  # DeleteTab
+                # vtbl[4] AddTab, vtbl[5] DeleteTab
+                proto_hwnd(vtbl[4] if present else vtbl[5])(ptr, wintypes.HWND(hwnd))
             finally:
                 proto_self(vtbl[2])(ptr)                       # Release
         finally:

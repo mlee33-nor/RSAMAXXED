@@ -17,7 +17,7 @@ import pytz
 import broker_logins
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow, display_path, find_browser_executable, cleanup_orphaned_chrome
 from modules import quiet
-from modules._2fa_prompt import universal_2fa_prompt
+from modules._2fa_prompt import universal_2fa_prompt, notify_user, clear_notice
 from modules import broker_logging as BLOG
 
 BROKER = "sofi"
@@ -481,38 +481,47 @@ async def _handle_captcha_wall(browser, page, *, headless: bool,
             "retrying with a visible browser"
         )
 
-    print(f"\n*** SoFi needs you: solve the CAPTCHA in the open browser window "
-          f"({marker}). Waiting up to {solve_budget_s}s. ***\n", flush=True)
+    # In background mode this headed window is parked off-screen with no
+    # taskbar button -- bring it to the user, and say so in the app (print()
+    # goes nowhere under pythonw).
+    quiet.reveal_browser(browser)
+    notify_user(
+        "SoFi", "Finish the SoFi check in the browser",
+        f"SoFi needs you: solve the CAPTCHA in the SoFi browser window that just "
+        f"opened. Waiting up to {solve_budget_s}s.")
 
-    start = time.time()
-    while (time.time() - start) < solve_budget_s:
-        await page.sleep(3)
-        # Solved and logged straight in?
-        try:
-            _auth_sanity_check(await _cookies_from_browser(browser))
+    try:
+        start = time.time()
+        while (time.time() - start) < solve_budget_s:
+            await page.sleep(3)
+            # Solved and logged straight in?
             try:
-                BLOG.write_log(
-                    _log_ctx(), broker=BROKER, action="session",
-                    label="captcha_cleared_authed", filename_prefix="session_stage",
-                    text="Bot check solved; session authenticated.")
+                _auth_sanity_check(await _cookies_from_browser(browser))
+                try:
+                    BLOG.write_log(
+                        _log_ctx(), broker=BROKER, action="session",
+                        label="captcha_cleared_authed", filename_prefix="session_stage",
+                        text="Bot check solved; session authenticated.")
+                except Exception:
+                    pass
+                return
             except Exception:
                 pass
-            return
-        except Exception:
-            pass
-        # Or solved and moved on to the OTP step / anywhere without the wall.
-        if not await _detect_captcha(page):
-            try:
-                BLOG.write_log(
-                    _log_ctx(), broker=BROKER, action="session",
-                    label="captcha_cleared", filename_prefix="session_stage",
-                    text="Bot check no longer present; continuing login flow.")
-            except Exception:
-                pass
-            return
+            # Or solved and moved on to the OTP step / anywhere without the wall.
+            if not await _detect_captcha(page):
+                try:
+                    BLOG.write_log(
+                        _log_ctx(), broker=BROKER, action="session",
+                        label="captcha_cleared", filename_prefix="session_stage",
+                        text="Bot check no longer present; continuing login flow.")
+                except Exception:
+                    pass
+                return
 
-    raise RuntimeError(
-        f"SoFi bot check ({marker}) not solved within {solve_budget_s}s")
+        raise RuntimeError(
+            f"SoFi bot check ({marker}) not solved within {solve_budget_s}s")
+    finally:
+        clear_notice("SoFi")
 
 
 def _is_unauthorized_text(s: str) -> bool:
@@ -743,7 +752,8 @@ _IFRAME_LIST_JS = """
 
 async def _await_human_verification(page, *, headless: bool,
                                     budget_s: int = 180,
-                                    appear_s: int = 20) -> None:
+                                    appear_s: int = 20,
+                                    browser=None) -> None:
     """Block until SoFi's 'Verify you are human' check is satisfied.
 
     SoFi's Auth0 form carries a Turnstile-style checkbox. Submitting before it
@@ -796,28 +806,39 @@ async def _await_human_verification(page, *, headless: bool,
             f"SoFi requires a human check ({d.get('name')}) — impossible headless; "
             "retrying with a visible browser")
 
-    print("\n*** SoFi: tick 'Verify you are human' in the open browser window. "
-          f"Waiting up to {budget_s}s. ***\n", flush=True)
+    # In background mode this headed window is parked off-screen with no
+    # taskbar button, and print() goes nowhere under pythonw -- so the check
+    # used to sit unseen until the budget ran out. Bring the window to the user
+    # and say so in the app.
+    quiet.reveal_browser(browser if browser is not None
+                         else getattr(page, "browser", None))
+    notify_user(
+        "SoFi", "Finish the SoFi check in the browser",
+        "SoFi needs you: tick 'Verify you are human' in the SoFi browser window "
+        f"that just opened. Waiting up to {budget_s}s.")
 
-    start = time.time()
-    while (time.time() - start) < budget_s:
-        await page.sleep(2)
-        try:
-            d2 = json.loads(await page.evaluate(_HUMAN_CHECK_JS) or "{}")
-        except Exception:
-            continue
-        if (not d2.get("present")) or d2.get("token"):
+    try:
+        start = time.time()
+        while (time.time() - start) < budget_s:
+            await page.sleep(2)
             try:
-                BLOG.write_log(
-                    _log_ctx(), broker=BROKER, action="session",
-                    label="human_check_cleared", filename_prefix="session_stage",
-                    text=f"Human check satisfied after {time.time()-start:.0f}s.")
+                d2 = json.loads(await page.evaluate(_HUMAN_CHECK_JS) or "{}")
             except Exception:
-                pass
-            return
+                continue
+            if (not d2.get("present")) or d2.get("token"):
+                try:
+                    BLOG.write_log(
+                        _log_ctx(), broker=BROKER, action="session",
+                        label="human_check_cleared", filename_prefix="session_stage",
+                        text=f"Human check satisfied after {time.time()-start:.0f}s.")
+                except Exception:
+                    pass
+                return
 
-    raise RuntimeError(
-        f"SoFi human check ({d.get('name')}) not completed within {budget_s}s")
+        raise RuntimeError(
+            f"SoFi human check ({d.get('name')}) not completed within {budget_s}s")
+    finally:
+        clear_notice("SoFi")
 
 
 async def _submit_login_form(page) -> bool:
@@ -989,7 +1010,7 @@ async def _force_login_flow(
 
     # The human check must hold a token BEFORE we submit, or Auth0 rejects the
     # POST and re-renders the form with the password blanked.
-    await _await_human_verification(page, headless=headless)
+    await _await_human_verification(page, headless=headless, browser=browser)
 
     # Click the real submit control. _click_first_text is a fuzzy whole-page text
     # search, and this page also contains the heading "Log in to Get Your Money
@@ -1033,14 +1054,6 @@ async def _force_login_flow(
                 "which cannot be cleared headless; retrying with a visible browser"
             )
 
-        print("\n" + "=" * 68
-              + "\n*** SoFi needs a human ***\n"
-                "In the browser window that just opened:\n"
-                "  1. tick 'Verify you are human'\n"
-                "  2. re-enter your password if the box was cleared\n"
-                "  3. press 'Log in'\n"
-                f"Waiting up to {_HUMAN_HANDOFF_S}s.\n"
-              + "=" * 68 + "\n", flush=True)
         try:
             BLOG.write_log(
                 _log_ctx(), broker=BROKER, action="session",
@@ -1050,23 +1063,37 @@ async def _force_login_flow(
         except Exception:
             pass
 
-        _hand = time.time()
-        while (time.time() - _hand) < _HUMAN_HANDOFF_S:
-            await page.sleep(2)
-            # Fully logged in already?
-            try:
-                _auth_sanity_check(await _cookies_from_browser(browser))
-                return
-            except Exception:
-                pass
-            # Or at least off the login form (OTP step, interstitial, ...).
-            if not await _login_form_still_present(page):
-                break
-        else:
-            raise RuntimeError(
-                "SoFi login not completed in time — the 'Verify you are human' box "
-                f"was still blocking the form after {_HUMAN_HANDOFF_S}s ({still})"
-            )
+        # This used to be a print(), which goes nowhere under pythonw, and in
+        # background mode this window is parked off-screen with no taskbar
+        # button -- so the user never found the box to tick. notify_user still
+        # prints for CLI runs.
+        quiet.reveal_browser(browser)
+        notify_user(
+            "SoFi", "Finish the SoFi check in the browser",
+            "SoFi needs you. In the SoFi browser window that just opened: tick "
+            "'Verify you are human', re-enter your password if the box was "
+            f"cleared, then press 'Log in'. Waiting up to {_HUMAN_HANDOFF_S}s.")
+
+        try:
+            _hand = time.time()
+            while (time.time() - _hand) < _HUMAN_HANDOFF_S:
+                await page.sleep(2)
+                # Fully logged in already?
+                try:
+                    _auth_sanity_check(await _cookies_from_browser(browser))
+                    return
+                except Exception:
+                    pass
+                # Or at least off the login form (OTP step, interstitial, ...).
+                if not await _login_form_still_present(page):
+                    break
+            else:
+                raise RuntimeError(
+                    "SoFi login not completed in time — the 'Verify you are human' box "
+                    f"was still blocking the form after {_HUMAN_HANDOFF_S}s ({still})"
+                )
+        finally:
+            clear_notice("SoFi")
 
     code_selectors = [
         "#code",

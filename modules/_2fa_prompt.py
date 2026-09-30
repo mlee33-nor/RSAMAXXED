@@ -118,3 +118,63 @@ def request_code(broker: str, timeout_s: int = 300, extra: str = "") -> Optional
     """
     answer = request_text(broker, universal_2fa_prompt(broker, extra), timeout_s)
     return _digits(answer or "")
+
+
+# =============================================================================
+# Notices: "go do something in the browser window", nothing to type back
+# =============================================================================
+#
+# SoFi's human check and a Chase code typed into the page itself are finished
+# in the broker's own browser window, not in a dialog. The module used to
+# print() the instruction, and under pythonw print() goes nowhere, so the user
+# never learned a window was waiting for them. A notice is one-way: shown while
+# the login waits, cleared when it moves on.
+
+#: (broker_label, title, message) -> None. Must not block.
+NoticeHook = Callable[[str, str, str], None]
+#: (broker_label) -> None. Takes that broker's notice down.
+ClearHook = Callable[[str], None]
+
+_notice_hook: Optional[NoticeHook] = None
+_clear_hook: Optional[ClearHook] = None
+
+
+def set_notice_hooks(show: Optional[NoticeHook],
+                     clear: Optional[ClearHook] = None) -> None:
+    """Register who shows broker notices. The GUI calls this once at startup."""
+    global _notice_hook, _clear_hook
+    with _hook_lock:
+        _notice_hook = show
+        _clear_hook = clear
+
+
+def notify_user(broker: str, title: str, message: str) -> None:
+    """Tell the user a login is waiting on them. NEVER raises.
+
+    Always prints too, so a CLI run (runner.py) still sees it.
+    """
+    try:
+        print(f"\n*** {broker}: {message} ***\n", flush=True)
+    except Exception:
+        pass
+    with _hook_lock:
+        fn = _notice_hook
+    if fn is None:
+        return
+    try:
+        fn(broker, title, message)
+    except Exception:
+        # A broken listener must never take down a login mid-challenge.
+        pass
+
+
+def clear_notice(broker: str) -> None:
+    """Take down `broker`'s notice, if one is up. NEVER raises."""
+    with _hook_lock:
+        fn = _clear_hook
+    if fn is None:
+        return
+    try:
+        fn(broker)
+    except Exception:
+        pass
