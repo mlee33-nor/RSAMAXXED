@@ -98,7 +98,7 @@ def test_a_genuine_total_failure_still_says_so():
     Mirror._mirror_record_outcome(m, b, total_ok=0, total_fail=24)
 
     assert "filled on NO broker" in m.log_text
-    assert "24 account(s) rejected" in m.log_text
+    assert "24 accounts rejected" in m.log_text
     assert m.notes[0][1] == "error"
 
 

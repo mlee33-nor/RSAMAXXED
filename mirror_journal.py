@@ -40,8 +40,11 @@ vanishing.
 """
 from __future__ import annotations
 
+import atexit
 import json
+import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -50,6 +53,12 @@ from modules import atomic
 
 _FILE = Path(__file__).resolve().parent / "mirror_runs.json"
 _lock = threading.RLock()
+_gen = 0          # bumped on every recorded change; see version()
+
+
+def _bump() -> None:
+    global _gen
+    _gen += 1
 
 # Enough history to answer "what happened last month" without letting a file the
 # UI reads on every page visit grow without bound.
@@ -58,12 +67,46 @@ MAX_SCANS = 400
 
 
 # --------------------------------------------------------------------- storage
+#
+# The file is ~1.3MB and is written once per broker leg as a mirror run fans
+# out — from the Tk main thread, because that is where legs land. Parsing it,
+# re-serialising it and writing it back was an 80-100ms freeze per leg, felt on
+# whatever page happened to be open. And the Mirror page parsed it three times
+# per render (runs, summary, scans).
+#
+# So the journal lives in memory. Reads come from the cache (reloaded only if
+# something else changed the file); a write updates the cache synchronously —
+# so a read straight after it sees it — and hands the disk write to one
+# background writer. The writer always writes the CURRENT state, so several
+# quick legs coalesce into one write and the last write on disk is always the
+# newest. flush() drains it; the app calls it on close and atexit backs that
+# up, so a queued write is not lost when the window goes away.
+
+_cache: Optional[Dict[str, Any]] = None
+_cache_stat: Optional[tuple] = None     # file (mtime, size) the cache matches
+_dirty = False                          # cache is ahead of the file
+_inflight = False                       # a snapshot is being written now
+_wake = threading.Condition(threading.Lock())
+_writer: Optional[threading.Thread] = None
+# Held for a whole write — snapshot AND disk. Two threads writing the same .tmp
+# at once (the writer and a flush on close) could interleave into a file that
+# is neither snapshot; serialising them also keeps writes in order.
+_io_lock = threading.Lock()
+
 
 def _empty() -> Dict[str, Any]:
     return {"version": 1, "runs": [], "scans": []}
 
 
-def _load() -> Dict[str, Any]:
+def _stat() -> Optional[tuple]:
+    try:
+        st = _FILE.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _read_file() -> Dict[str, Any]:
     """Never raises. A corrupt journal costs history, not the automation."""
     if not _FILE.exists():
         return _empty()
@@ -80,17 +123,143 @@ def _load() -> Dict[str, Any]:
     return data
 
 
+def _load() -> Dict[str, Any]:
+    """The live journal. Call with _lock held.
+
+    Served from memory unless the file changed underneath us (another copy of
+    the app, a restore by hand) — and never reloaded while our own write is
+    still queued, because then the memory copy is the newer one.
+    """
+    global _cache, _cache_stat
+    if _cache is not None and (_dirty or _inflight or _stat() == _cache_stat):
+        return _cache
+    st = _stat()
+    _cache = _read_file()
+    _cache_stat = st
+    return _cache
+
+
 def _save(data: Dict[str, Any]) -> None:
+    """Commit `data` as the journal: in memory now, on disk shortly."""
+    global _cache, _dirty
     data["runs"] = data["runs"][-MAX_RUNS:]
     data["scans"] = data["scans"][-MAX_SCANS:]
+    _cache = data
+    _dirty = True
+    _kick_writer()
+
+
+def _write_now(timeout: float = -1) -> None:
+    """Serialise the current cache and write it. Holds _lock only while it
+    serialises, so the snapshot is consistent and recorders are not blocked
+    by the disk."""
+    if not _io_lock.acquire(timeout=timeout):
+        return
+    try:
+        _write_locked()
+    finally:
+        _io_lock.release()
+
+
+def _write_locked() -> None:
+    global _dirty, _inflight, _cache_stat
+    with _lock:
+        if not _dirty or _cache is None:
+            return
+        # Compact, not indent=2: nobody reads this by eye, and indenting a
+        # 1.3MB file roughly doubled both its size and the time to write it.
+        text = json.dumps(_cache, separators=(",", ":"))
+        _dirty = False
+        # Until the replace lands the file is OLDER than memory; _load must not
+        # mistake that for someone else's change and reload over our data.
+        _inflight = True
     try:
         # Atomic, for the same reason trade_journal is: a half-written file
         # reads as a mirror that has never run and re-buys everything.
         tmp = _FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.write_text(text, encoding="utf-8")
         atomic.replace(tmp, _FILE)
     except OSError:
-        pass          # a read-only disk must not take the trade down with it
+        # A read-only disk must not take the trade down with it -- but the
+        # write is still owed. Mark it pending again so the writer retries
+        # (with a backoff, see _writer_loop) instead of dropping this run's
+        # history on the floor until something else happens to save.
+        with _lock:
+            _dirty = True
+        raise
+    finally:
+        with _lock:
+            # Whatever is on disk now is ours: adopt its stat so the next read
+            # does not reload over the memory copy (on a failed write that
+            # keeps this session's history in memory, as before).
+            _cache_stat = _stat()
+            _inflight = False
+
+
+#: Backoff between failed writes, seconds: first retry, and the ceiling.
+_RETRY_FIRST_S = 1.0
+_RETRY_MAX_S = 5.0
+_last_error: Optional[str] = None
+
+
+def _writer_loop() -> None:
+    """Write whenever the journal is dirty; back off while writes fail.
+
+    A write that raises leaves the journal dirty, and this loop only sleeps
+    while it is CLEAN -- so a failure used to send it straight back round:
+    one core pinned at 100% for as long as the disk stayed unwritable (or a
+    record stayed unserialisable), in the background of a trading app. Now a
+    failure waits 1s, then 2s, 4s, capped at 5s, and is reported once rather
+    than once per spin.
+    """
+    global _last_error
+    delay = _RETRY_FIRST_S
+    while True:
+        with _wake:
+            while not _dirty:
+                _wake.wait()
+        try:
+            _write_now()
+            delay = _RETRY_FIRST_S
+            _last_error = None
+        except Exception as exc:                # noqa: BLE001
+            msg = f"{type(exc).__name__}: {exc}"
+            if msg != _last_error:
+                _last_error = msg
+                try:
+                    print(f"mirror_journal: write failed, retrying -- {msg}",
+                          file=sys.stderr)
+                except Exception:
+                    pass                        # pyw: no stderr at all
+            time.sleep(delay)
+            delay = min(delay * 2, _RETRY_MAX_S)
+
+
+def _kick_writer() -> None:
+    global _writer
+    with _wake:
+        if _writer is None or not _writer.is_alive():
+            _writer = threading.Thread(target=_writer_loop, name="mirror-journal",
+                                       daemon=True)
+            _writer.start()
+        _wake.notify_all()
+
+
+def flush(timeout: float = 10.0) -> bool:
+    """Block until everything recorded is on disk. True if it is.
+
+    Waits out a write the background thread already has in progress (a daemon
+    thread is killed mid-write at exit), then writes anything still pending on
+    the calling thread — which works even when the writer thread is gone.
+    """
+    try:
+        _write_now(timeout)
+    except Exception:
+        return False
+    return not _dirty
+
+
+atexit.register(flush)
 
 
 def _now() -> str:
@@ -98,23 +267,34 @@ def _now() -> str:
 
 
 def load() -> Dict[str, Any]:
-    """The whole journal, newest last. Callers must not mutate the result."""
+    """The whole journal, newest last. Callers must not mutate the result —
+    it is the shared in-memory copy, not a private parse."""
     with _lock:
         return _load()
 
 
 def version() -> tuple:
-    """Cheap fingerprint for the page-render cache — mtime and size, no parse."""
-    try:
-        st = _FILE.stat()
-        return (st.st_mtime_ns, st.st_size)
-    except OSError:
-        return (0, 0)
+    """Cheap fingerprint for the page-render cache — no parse.
+
+    Moves when a write lands in memory (the generation), not when the file
+    catches up a moment later, so one change costs the page one render. A
+    journal changed by something else is still noticed, as one more change.
+    """
+    if not (_dirty or _inflight) and _cache is not None and _stat() != _cache_stat:
+        # Changed by something other than us: pick it up now and count it as
+        # one change, rather than reporting the file stat (which would move
+        # again after every write of our own and cost a second render).
+        with _lock:
+            if not (_dirty or _inflight) and _stat() != _cache_stat:
+                _load()
+                _bump()
+    return (_gen,)
 
 
 def clear() -> None:
     with _lock:
         _save(_empty())
+        _bump()
 
 
 # ------------------------------------------------------------------- recording
@@ -139,6 +319,7 @@ def record_scan(*, trigger: str, slot: str = "", considered: int = 0,
         data = _load()
         data["scans"].append(entry)
         _save(data)
+        _bump()
 
 
 def start_run(*, symbol: str, side: str, qty: str, brokers: List[str],
@@ -169,6 +350,7 @@ def start_run(*, symbol: str, side: str, qty: str, brokers: List[str],
         data = _load()
         data["runs"].append(entry)
         _save(data)
+        _bump()
     return run_id
 
 
@@ -207,6 +389,7 @@ def record_leg(run_id: str, leg: Dict[str, Any]) -> None:
             ],
         })
         _save(data)
+        _bump()
 
 
 def finish_run(run_id: str, *, ok_accounts: int, fail_accounts: int,
@@ -224,18 +407,21 @@ def finish_run(run_id: str, *, ok_accounts: int, fail_accounts: int,
         run["shares"] = float(shares)
         run["elapsed"] = float(elapsed)
         _save(data)
+        _bump()
 
 
 # --------------------------------------------------------------------- reading
 
 def runs(limit: int = 0) -> List[Dict[str, Any]]:
     """Runs newest first."""
-    rows = list(reversed(load()["runs"]))
+    with _lock:
+        rows = list(reversed(_load()["runs"]))
     return rows[:limit] if limit else rows
 
 
 def scans(limit: int = 0) -> List[Dict[str, Any]]:
-    rows = list(reversed(load()["scans"]))
+    with _lock:
+        rows = list(reversed(_load()["scans"]))
     return rows[:limit] if limit else rows
 
 
@@ -260,7 +446,9 @@ def summary(days: int = 7) -> Dict[str, Any]:
     flat 0 under a per-run measure, and the account number is the one that maps
     to money.
     """
-    data = load()
+    with _lock:
+        data = _load()
+        data = {"runs": list(data["runs"]), "scans": list(data["scans"])}
     floor = ""
     if days:
         try:

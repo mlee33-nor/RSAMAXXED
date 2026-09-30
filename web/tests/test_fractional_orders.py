@@ -47,8 +47,11 @@ class _Stub:
 
 
 @pytest.fixture()
-def rh(monkeypatch):
+def rh(monkeypatch, tmp_path):
     stub = _Stub()
+    # A dry run writes its ticket to logs/robinhood/<date>/ in the real repo;
+    # a test run must not leave test_order_*.log files among the user's own.
+    monkeypatch.setattr(robinhood, "_dry_run_log_dir", lambda: tmp_path)
     monkeypatch.setattr(robinhood, "_ensure_session", lambda: (True, ""))
     monkeypatch.setattr(robinhood, "_RH", stub)
     monkeypatch.setattr(robinhood, "_ACCOUNTS", [("Roth IRA", "12345678", "rh1")])

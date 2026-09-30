@@ -296,6 +296,7 @@ CONTENTS
 │     3.  Launch the app:
 │            RSAMAXXED.bat
 │         (or run app.py directly for the GUI, or runner.py for CLI)
+│         Want a Desktop icon? Run once:  py -3.13 make_shortcut.py
 │
 │     4.  THE PLAYS ARE ALREADY ON. There is nothing to turn on and
 │         nothing to enter — no account, no sign-up, no password, no

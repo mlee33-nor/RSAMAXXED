@@ -411,6 +411,10 @@ class BrokerLeg:
     low: float = 0.0             # smallest balance seen
     high: float = 0.0            # largest
     unread: int = 0              # accounts at this broker we could not read
+    # (account label, balance) for every account holding it, labels without
+    # the " = $value" suffix get_holdings() appends. Public sizes each account
+    # on its own, so the confirm dialog needs the spread, not just low/high.
+    holdings: tuple = ()
 
     @property
     def uniform(self) -> bool:
@@ -532,10 +536,13 @@ def resolve(task: "SellTask", outputs: dict[str, Any]) -> ResolvedExit:
             continue
 
         found: list[Decimal] = []
+        per_account: list[tuple] = []
         for account in readable:
             qty = _account_qty(account, symbols)
             if qty is not None and qty > 0:
                 found.append(qty)
+                label = str(getattr(account, "account_id", "") or "").split(" = ")[0].strip()
+                per_account.append((label, float(qty)))
 
         if not found:
             # Read every account and none had it: a real answer. Read only
@@ -548,6 +555,7 @@ def resolve(task: "SellTask", outputs: dict[str, Any]) -> ResolvedExit:
             qty=qty_text(min(found)), accounts=len(found),
             low=float(min(found)), high=float(max(found)),
             unread=unread,
+            holdings=tuple(per_account),
         ))
 
     return ResolvedExit(task=task, legs=tuple(legs),

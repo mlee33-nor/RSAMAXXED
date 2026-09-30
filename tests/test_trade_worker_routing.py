@@ -312,3 +312,51 @@ def test_the_counter_never_goes_negative():
     c = Counter()
     A.App._invest_batch_done(c)
     assert c._invest_in_flight == 0
+
+
+class SellFinisher(Finisher):
+    """A Finisher that records what it was asked to schedule."""
+
+    def __init__(self, in_flight):
+        super().__init__(in_flight)
+        self.scheduled = []
+
+    def after(self, _ms, fn, *args):
+        self.scheduled.append(getattr(fn, "__name__", fn))
+
+    def _refresh_sell_views(self):
+        pass
+
+    def _cloud_push_async(self):
+        pass
+
+
+def sell_batch(ok=1, dry=False):
+    b = etf_batch(["public"], "AIFA")
+    b.update(side="sell", origin="desk", dry_run=dry)
+    b["results"][0]["ok_accounts"] = ok
+    b["results"][0]["fail_accounts"] = 0 if ok else 1
+    return b
+
+
+def test_a_real_sell_repaints_the_sell_views():
+    """The Sell-now card is computed from the journal. A sell that filled has
+    to repaint it, or the card keeps offering the sell that just happened."""
+    f = SellFinisher(["public"])
+    A.App._trade_batch_finish(f, sell_batch())
+    assert "_refresh_sell_views" in f.scheduled
+
+
+@pytest.mark.parametrize("batch", [sell_batch(dry=True), sell_batch(ok=0)])
+def test_a_dry_or_failed_sell_leaves_the_sell_views_alone(batch):
+    f = SellFinisher(["public"])
+    A.App._trade_batch_finish(f, batch)
+    assert "_refresh_sell_views" not in f.scheduled
+
+
+def test_a_buy_does_not_repaint_the_sell_views():
+    f = SellFinisher(["public"])
+    b = etf_batch(["public"], "AIFA")
+    b.update(origin="desk", dry_run=False)
+    A.App._trade_batch_finish(f, b)
+    assert "_refresh_sell_views" not in f.scheduled

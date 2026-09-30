@@ -181,6 +181,9 @@ class Auto:
 
     _autosell_fire = A.App._autosell_fire
     _autosell_retry = A.App._autosell_retry
+    _reading_keys = A.App._reading_keys
+    _autosell_read_done = A.App._autosell_read_done
+    _autosell_play_key = A.App._autosell_play_key
     _autosell_key = A.App._autosell_key
     _journal_disputes = A.App._journal_disputes
     _journal_shortfalls = A.App._journal_shortfalls
@@ -214,7 +217,7 @@ class Auto:
     def _autosell_pump(self):
         pass
 
-    def _exit_fire(self, resolved, dry_run=False):
+    def _exit_fire(self, resolved, dry_run=False, autosell=False):
         self.fired = resolved
 
 
@@ -237,7 +240,7 @@ def test_an_empty_read_the_journal_contradicts_is_not_marked_sold(monkeypatch):
     Auto._autosell_fire(app, resolved)
 
     assert key not in app._autosell_sold
-    assert app._autosell_fails[key] == 1
+    assert app._autosell_fails[app._autosell_play_key(resolved.task)] == 1   # counted per play
     assert any("journal says we hold" in m for m in app.logs)
     assert any("Fidelity (10 accounts)" in m for m in app.logs)
 
@@ -296,7 +299,7 @@ def test_a_short_read_still_sells_but_says_so(monkeypatch):
     Auto._autosell_fire(app, resolved)
 
     assert app.fired is resolved                       # the sell was NOT blocked
-    assert any("journal says 10 account(s) open, the read found 7" in m
+    assert any("journal says 10 accounts open, the read found 7" in m
                for m in app.logs)
 
 

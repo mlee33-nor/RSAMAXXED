@@ -303,8 +303,7 @@ def test_no_chart_draw_forces_a_layout_pass():
     import inspect
     for name in ("_draw_etf_chart", "_draw_equity_curve", "_draw_symbol_bars",
                  "_draw_broker_donut", "_draw_daily_activity", "_draw_daily_pl",
-                 "_draw_monthly_pl", "_draw_return_dist",
-                 "_draw_allocation_pie"):
+                 "_draw_monthly_pl", "_draw_return_dist"):
         src = inspect.getsource(getattr(A.App, name))
         code = " ".join(l for l in src.splitlines()
                         if not l.strip().startswith("#"))

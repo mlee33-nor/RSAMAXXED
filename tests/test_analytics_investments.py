@@ -84,7 +84,7 @@ def test_it_shows_cost_value_and_unrealized_pl(card):
     card._render_investments()
     assert card._inv_cost.cget("text") == "$1,400.00"
     assert card._inv_value.cget("text") == "$1,541.12"
-    assert card._inv_pl.cget("text").startswith("$+141.12")
+    assert card._inv_pl.cget("text").startswith("+$141.12")
     assert card._inv_holdings.cget("text") == "1"
 
 

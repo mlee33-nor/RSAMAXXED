@@ -309,6 +309,37 @@ def _portfolio_value_from_equity(equity: Any) -> Optional[Decimal]:
     return total if seen else None
 
 
+def _held_by_symbol(client: Any, account_id: str,
+                    symbols: Tuple[str, ...]) -> Dict[str, Decimal]:
+    """This account's position in each of `symbols`, read from Public right now.
+
+    Per SYMBOL, not summed. After a rename an account can list the position
+    under the old ticker or the new one, and an order has to go out under the
+    ticker that actually holds the shares -- adding the two together and
+    selling the total under the new name asks that ticker for shares it does
+    not have.
+
+    Decimal from the raw quantity string, never through float: a fractional
+    remnant like 0.03333 has to go back to Public exactly as Public reported
+    it, or the sell asks for a hair more than the account holds and is refused.
+    Raises if the portfolio cannot be read -- the caller must not mistake a
+    failed read for an empty account.
+    """
+    pf = client.get_portfolio_v2(account_id)
+    held: Dict[str, Decimal] = {s: Decimal("0") for s in symbols}
+    for p in pf.get("positions") or []:
+        if not isinstance(p, dict):
+            continue
+        inst = p.get("instrument") or {}
+        sym = str((inst.get("symbol") if isinstance(inst, dict) else "") or "").strip().upper()
+        if sym not in held:
+            continue
+        q = _as_decimal(p.get("quantity"))
+        if q is not None and q > 0:
+            held[sym] += q
+    return held
+
+
 def _holdings_from_positions(positions: Any) -> List[HoldingRow]:
     """
     Convert Public's portfolio positions payload into universal HoldingRow objects.
@@ -515,14 +546,82 @@ def _format_preview_ticket(*, endpoint_path: str, body: Dict[str, Any]) -> str:
 # Executors (contract outputs only)
 # =============================================================================
 
-def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **kwargs) -> BrokerOutput:
+def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
+                  size_from_holdings: bool = False, remnant_only: bool = False,
+                  also_symbols: Tuple[str, ...] = (),
+                  max_by_account: Optional[Dict[str, str]] = None,
+                  **kwargs) -> BrokerOutput:
+    """Place one market order per Public account.
+
+    SELLING WHAT IS ACTUALLY THERE (`size_from_holdings`, sells only)
+
+    One `qty` for every account is right for a buy and wrong for an exit. A
+    reverse split credits each account whatever fraction Public decides, a
+    fractional sell can leave 0.98 behind, and an account may hold nothing at
+    all. Sending the same number to all of them strands shares in the accounts
+    that hold more and gets rejected in the ones that hold less. So each
+    account's position is read the moment before its order, and that account
+    sells what it holds; `qty` is ignored. An account holding nothing is
+    skipped, not sent an order it would reject. A read that fails is a failed
+    account, never "holds nothing".
+
+    CAPPED AT WHAT THIS TOOL BOUGHT (`max_by_account`, required)
+
+    "What it holds" is not "what we bought". An account that held 100 IPDN
+    before RSAMAXXED bought it 1 more holds 101, and an exit is an instruction
+    about OUR share, not the customer's own position. So every account sells
+    min(held, cap), where the cap is the caller's figure for what this tool
+    bought there (label -> Decimal string, labels exactly as built below). An
+    account missing from the map is skipped: we never bought there, or we are
+    already out. The map is required rather than optional because the uncapped
+    version sells a customer's entire position on our say-so, and a caller that
+    forgot to pass it has to fail loudly, not do that.
+
+    `remnant_only` additionally skips any account holding a whole share or
+    more. It is for an exit called at OTHER brokerages while Public returned a
+    fraction: the fraction is dead weight to clear, but a whole share here is a
+    position that waits for its own exit.
+
+    `also_symbols` are other tickers the same position may be listed under
+    (the pre-split name after a rename). The account is sized from `symbol`
+    alone; only if it holds nothing under `symbol` is an old ticker tried, and
+    then the order goes out under THAT ticker -- the one the shares are really
+    listed under. The ticker sold is returned in `extra["symbol"]`.
+
+    Accounts sold this way carry the quantity actually sent in
+    `extra["qty"]`, so the journal records what was sold rather than `qty`.
+    """
     ok, msg, ready = _ensure_clients()
     if not ok:
         return BrokerOutput(broker=BROKER, state="failed", message=msg, accounts=[])
 
-    api_side, qty_s, sym, err = _validate_trade_inputs(side, qty, symbol)
+    # Holdings-sized sells ignore `qty`, so only they may arrive without one.
+    # A buy or a plain sell with a blank quantity is a caller bug and keeps
+    # failing validation exactly as it always did.
+    sized_sell = bool(size_from_holdings) and str(side or "").strip().lower() == "sell"
+    api_side, qty_s, sym, err = _validate_trade_inputs(
+        side, (qty or "1") if sized_sell else qty, symbol)
     if err:
         return err
+    per_account = sized_sell
+    caps: Dict[str, Decimal] = {}
+    if per_account:
+        if max_by_account is None:
+            return BrokerOutput(
+                broker=BROKER, state="failed", accounts=[],
+                message="Holdings-sized sell refused: no per-account cap was "
+                        "given, and selling every account's whole position "
+                        "could sell shares RSAMAXXED never bought.")
+        for label, cap in max_by_account.items():
+            d = _as_decimal(cap)
+            if d is not None and d > 0:
+                caps[str(label).strip()] = d
+    symbols = tuple(dict.fromkeys(
+        [sym] + [str(s).strip().upper() for s in also_symbols if str(s).strip()]))
+    skipped: List[str] = []
+    # Why accounts were skipped, counted, so the app can say "nothing to sell
+    # -- 21 whole shares wait for their own exit" instead of "failed".
+    skip_kinds: Dict[str, int] = {}
 
     outs: List[AccountOutput] = []
     log_sections: List[str] = []
@@ -562,20 +661,63 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                 ))
                 continue
 
+            acct_qty = qty_s
+            order_sym = sym
+            extra: Optional[Dict[str, Any]] = None
+            if per_account:
+                cap = caps.get(acct_label)
+                if cap is None:
+                    # Checked before the read: an account we have no share in
+                    # is not ours to sell, whatever it holds, so there is no
+                    # reason to spend a portfolio call finding out.
+                    skipped.append(f"{acct_label}: not bought through RSAMAXXED, "
+                                   f"or already sold")
+                    skip_kinds["not_ours"] = skip_kinds.get("not_ours", 0) + 1
+                    continue
+                try:
+                    by_sym = _held_by_symbol(client, acct_id, symbols)
+                except Exception as e:
+                    outs.append(AccountOutput(
+                        account_id=acct_label, ok=False,
+                        message=f"Could not read the position before selling: {e}",
+                        order_id=None,
+                    ))
+                    continue
+                # The ticker being sold first; an old name only when the
+                # account shows nothing at all under the new one.
+                held = by_sym.get(sym, Decimal("0"))
+                if held <= 0:
+                    for alt in symbols[1:]:
+                        if by_sym.get(alt, Decimal("0")) > 0:
+                            held, order_sym = by_sym[alt], alt
+                            break
+                if held <= 0:
+                    skipped.append(f"{acct_label}: holds none")
+                    skip_kinds["none"] = skip_kinds.get("none", 0) + 1
+                    continue
+                if remnant_only and held >= 1:
+                    skipped.append(f"{acct_label}: holds {_fmt_decimal(held)}, "
+                                   f"a whole share - waits for its own exit")
+                    skip_kinds["whole"] = skip_kinds.get("whole", 0) + 1
+                    continue
+                acct_qty = _fmt_decimal(min(held, cap))
+                extra = {"qty": acct_qty, "symbol": order_sym}
+
             endpoint_path = f"/userapigateway/trading/{acct_id}/order"
             oid = str(uuid.uuid4())
             body = _build_public_market_order_body(
                 order_id=oid,
                 side=api_side,
-                symbol=sym,
-                quantity=qty_s,
+                symbol=order_sym,
+                quantity=acct_qty,
                 market_session="CORE",
                 tif="DAY",
             )
             ticket = _format_preview_ticket(endpoint_path=endpoint_path, body=body)
 
             if dry_run:
-                outs.append(AccountOutput(account_id=acct_label, ok=True, message=ticket, order_id=oid))
+                outs.append(AccountOutput(account_id=acct_label, ok=True, message=ticket,
+                                          order_id=oid, extra=extra))
                 log_sections.append(f"[{acct_label}]")
                 log_sections.append(ticket)
                 log_sections.append("")
@@ -585,26 +727,37 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                 order_id = client.place_equity_market_order(
                     account_id=acct_id,
                     side=api_side,
-                    symbol=sym,
-                    quantity=qty_s,
+                    symbol=order_sym,
+                    quantity=acct_qty,
                     market_session="CORE",
                     tif="DAY",
                     order_id=oid,
                 )
-                outs.append(AccountOutput(account_id=acct_label, ok=True, message="order placed", order_id=str(order_id) if order_id else oid))
+                placed = ("order placed" if not per_account
+                          else f"order placed ({acct_qty} sh {order_sym})")
+                outs.append(AccountOutput(account_id=acct_label, ok=True, message=placed,
+                                          order_id=str(order_id) if order_id else oid, extra=extra))
             except Exception as e:
                 outs.append(AccountOutput(account_id=acct_label, ok=False, message=str(e), order_id=None))
 
     ok_ct = sum(1 for a in outs if a.ok)
     fail_ct = sum(1 for a in outs if not a.ok)
     state = _state_from_counts(ok_ct, fail_ct)
+    # Nothing to sell anywhere is an answer, not a failure: every account was
+    # read and none held a sellable balance. The skips say why.
+    if per_account and not outs and skipped:
+        state = "success"
 
     broker_msg = ""
+    if skipped:
+        broker_msg = f"skipped {len(skipped)}: " + "; ".join(skipped)
     if dry_run:
         log_path = _write_dry_run_log(content="\n".join(log_sections).rstrip() + "\n")
-        broker_msg = f"DRY RUN — NO ORDER SUBMITTED | log: {log_path}"
+        broker_msg = (f"DRY RUN — NO ORDER SUBMITTED | log: {log_path}"
+                      + (f" | {broker_msg}" if broker_msg else ""))
 
-    return BrokerOutput(broker=BROKER, state=state, accounts=outs, message=broker_msg)
+    return BrokerOutput(broker=BROKER, state=state, accounts=outs, message=broker_msg,
+                        extra={"skipped": dict(skip_kinds)} if skip_kinds else None)
 
 
 def get_accounts(*args, **kwargs) -> BrokerOutput:

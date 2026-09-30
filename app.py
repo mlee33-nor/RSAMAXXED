@@ -22,6 +22,7 @@ import tkinter as tk
 import winsound
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from tkinter import ttk, messagebox
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,6 +37,7 @@ from dotenv import load_dotenv
 from modules.outputs import BrokerOutput, log_event
 from modules import _2fa_prompt
 from modules import atomic
+from modules.canvas_rows import RowCanvas, wrap_lines
 import balances
 import feed_client
 import etf_journal
@@ -109,6 +111,22 @@ AUTOSELL_STALL_POLL_MS = 60000
 # human instead of hammering the door.
 AUTOSELL_MAX_ATTEMPTS = 3
 
+# How soon the Sell-now board is looked at again after the sell queue drains
+# or a mirror (auto-buy) run finishes. Short on purpose: the day should run
+# buys, then sells, then whatever the per-batch cap left, without waiting on
+# the hourly tick. The pause lets the journal and broker sessions settle.
+AUTOSELL_RECHECK_MS = 30000
+
+# How long a handed-back play waits before it may be queued again. With
+# re-checks minutes apart rather than an hour, a broker that cannot log in
+# would otherwise use all AUTOSELL_MAX_ATTEMPTS in one burst.
+AUTOSELL_RETRY_BACKOFF_MS = 10 * 60 * 1000
+
+# The longest one exit holdings read may take before the brokers still out are
+# treated as unread. Under AUTOSELL_STALL_SECS so a hung read ends on its own
+# before the queue's wedge warning fires.
+EXIT_READ_TIMEOUT_S = 480
+
 
 load_dotenv(ENV_FILE)
 
@@ -131,8 +149,21 @@ load_dotenv(ENV_FILE)
 CRASH_LOG = LOG_DIR / "crash.log"
 
 
+def _crash_log_disabled() -> bool:
+    """RSA_NO_CRASH_LOG=1 turns the crash log off -- for the test suite.
+
+    The log is installed at IMPORT time, before any pytest fixture can point
+    LOG_DIR somewhere else, so every test run was appending START and PROCESS
+    EXIT entries to the user's real logs/crash.log -- the one file that exists
+    to explain a real crash. tests/conftest.py sets this before importing app.
+    """
+    return (os.getenv("RSA_NO_CRASH_LOG") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _crash_note(kind: str, body: str = "") -> None:
     """Append one entry to logs/crash.log. Never raises — it runs while dying."""
+    if _crash_log_disabled():
+        return
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -147,6 +178,8 @@ def _crash_note(kind: str, body: str = "") -> None:
 
 
 def _install_crash_log() -> None:
+    if _crash_log_disabled():
+        return
     import atexit
     import faulthandler
     import traceback as _tb
@@ -179,6 +212,51 @@ def _install_crash_log() -> None:
 
 _CRASH_FH = None
 _install_crash_log()
+
+
+#: Words in a failed account's message that mean the order may have reached the
+#: broker. Such a leg is never handed back for an automatic retry.
+_ORDER_MAY_EXIST = ("submitted", "placed", "accepted", "pending", "queued",
+                    "working", "order id", "confirmation", "verify")
+
+
+def _order_may_exist(result: Dict[str, Any]) -> bool:
+    """A broker result whose failure text suggests an order went out anyway."""
+    texts = [str(e) for e in (result.get("errors") or [])]
+    texts += [str(a.get("message") or "") for a in (result.get("accounts") or [])
+              if isinstance(a, dict)]
+    return any(w in t.lower() for t in texts for w in _ORDER_MAY_EXIST)
+
+
+def _autosell_restore(state: Dict[str, Any]) -> Tuple[set, List[str]]:
+    """(sold-once set, claims released) from a saved autosell_state.json.
+
+    A key saved under "reading" was claimed by a session that died before any
+    order went out, so it is released rather than restored as sold.
+    """
+    released = [k for k in (state.get("reading") or []) if isinstance(k, str)]
+    return set(state.get("sold") or []) - set(released), released
+
+
+def _activity_note(line: str) -> None:
+    """Mirror one Activity-log line to logs/activity_YYYYMMDD.log.
+
+    The on-screen log is memory only, so a session that died took every
+    decision it made with it: on 2026-09-29 the app vanished mid-morning and
+    there was no way to tell why auto-sell had passed over NRSN and CPOP.
+    Flushed per line (to the OS, not fsync'd): a hard kill loses nothing the
+    OS already has. Off under the test suite for the same reason as crash.log.
+    Never raises.
+    """
+    if _crash_log_disabled():
+        return
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path = LOG_DIR / f"activity_{datetime.now():%Y%m%d}.log"
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line.rstrip("\n") + "\n")
+    except Exception:
+        pass
 
 
 def _load_custom_accounts() -> List[Dict[str, Any]]:
@@ -264,6 +342,51 @@ def _blend(c1: str, c2: str, t: float) -> str:
     g = round(int(a[2:4], 16) * (1 - t) + int(b[2:4], 16) * t)
     bl = round(int(a[4:6], 16) * (1 - t) + int(b[4:6], 16) * t)
     return f"#{r:02x}{g:02x}{bl:02x}"
+
+
+def _bind_scrollregion(canvas, inner) -> None:
+    """Keep a canvas-hosted scrolling page's scroll region matched to `inner`.
+
+    Command Center -> Purchased -> Show older -> scroll to the bottom -> Hide
+    older left a blank page, and <Configure> alone cannot fix it. Once the
+    shrunken content lies wholly ABOVE the viewport, the canvas unmaps the
+    embedded frame instead of resizing it on screen, so no <Configure> ever
+    arrives: the region stays at the tall height and the view stays past the
+    end. The unmap is the one event that does fire, so both are listened for.
+    """
+    def _sync(_e=None):
+        _fit_scrollregion(canvas, inner)
+    inner.bind("<Configure>", _sync, add="+")
+    inner.bind("<Unmap>", _sync, add="+")
+
+
+#: "No signature recorded" -- distinct from None, which means "always render".
+_NO_SIG = object()
+
+
+def _fit_scrollregion(canvas, inner) -> None:
+    """Size the scroll region from `inner`'s REQUESTED height, then clamp.
+
+    Requested, not canvas.bbox("all") and not the frame's mapped size: both lag
+    behind a frame the canvas has unmapped (see _bind_scrollregion), and the
+    request is the one figure that is always current.
+
+    Clamped, because a region that shrinks underneath a scrolled view does not
+    pull the view back with it. If the view now starts past the last full
+    screen it moves to the last valid position, or to the top if it all fits.
+    """
+    try:
+        height = max(1, int(inner.winfo_reqheight()))
+        canvas.configure(scrollregion=(0, 0, max(1, canvas.winfo_width()), height))
+        view_h = canvas.winfo_height()
+        top = canvas.canvasy(0)
+        if height <= view_h:
+            if top > 0:
+                canvas.yview_moveto(0)
+        elif top + view_h > height:
+            canvas.yview_moveto((height - view_h) / height)
+    except tk.TclError:
+        pass                            # torn down mid-event
 
 
 # ── Monochrome "fintech terminal" surfaces — true-black base, cool graphite
@@ -740,6 +863,141 @@ def _save_env_file(updates: Dict[str, str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Paint suspension — one clean frame per page swap
+# ---------------------------------------------------------------------------
+#
+# Tk paints a freshly shown page from idle callbacks, one widget at a time, and
+# CTk widgets paint in stages on top of that (the canvas first, then the
+# rounded shapes). On a page of a few hundred widgets you can watch the boxes
+# arrive. Win32 has a switch for exactly this: WM_SETREDRAW(FALSE) on a window
+# stops it and its children from reaching the screen, and turning it back on
+# plus a RedrawWindow puts the finished result up in one go.
+#
+# Everything here fails open. If user32 is missing (not Windows) or a call
+# raises, painting simply is not suspended — the page still appears, it just
+# assembles in view the way it always did. The one outcome that must never
+# happen is a window left with redraw OFF, which looks like a frozen, blank
+# app; hence the depth count (nested freezes re-enable only at the outermost)
+# and the unconditional `finally`.
+
+_WM_SETREDRAW = 0x000B
+_RDW_INVALIDATE = 0x0001
+_RDW_ERASE = 0x0004
+_RDW_ALLCHILDREN = 0x0080
+_RDW_UPDATENOW = 0x0100
+_RDW_FRAME = 0x0400
+_REDRAW_FLAGS = (_RDW_ERASE | _RDW_FRAME | _RDW_INVALIDATE
+                 | _RDW_ALLCHILDREN | _RDW_UPDATENOW)
+
+
+def _load_user32():
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                   wintypes.WPARAM, wintypes.LPARAM]
+        u.SendMessageW.restype = wintypes.LPARAM
+        u.RedrawWindow.argtypes = [wintypes.HWND, ctypes.c_void_p,
+                                   ctypes.c_void_p, wintypes.UINT]
+        u.RedrawWindow.restype = wintypes.BOOL
+        return u
+    except Exception:
+        return None
+
+
+# Module-level so tests can swap in a recorder; None means "no suspension".
+_USER32 = _load_user32()
+_freeze_depth: Dict[int, int] = {}
+
+#: Page swaps repaint just the header and the raised page (see _raise_page)
+#: instead of everything under the content area. OFF until it has been looked
+#: at on the target machine. The baseline is ~75ms per switch; the sandbox
+#: run meant to measure this one ran with the display asleep (no painting, so
+#: no valid timing and no screenshots), and a repaint that is too narrow shows
+#: up as stale pixels, not as an error. Flip to True and look before keeping.
+_RAISE_SCOPED = False
+
+
+def _is_ctk(w) -> bool:
+    """A CustomTkinter widget (or subclass, like RoundedFrame / PillButton)."""
+    return any(c.__module__.startswith("customtkinter") for c in type(w).__mro__)
+
+
+class _frozen:
+    """`with _frozen(widget): ...` — nothing under `widget` reaches the screen
+    until the block ends, then it all appears at once.
+
+    Always pair the body with an update_idletasks() before leaving it when the
+    point is to hide assembly: Tk does its drawing in idle callbacks, so the
+    widgets have to have drawn themselves while painting was still held back.
+
+    `repaint` narrows what is repainted when the freeze lifts: those widgets
+    (and their children) instead of everything under `widget`. For a caller
+    that knows exactly what changed -- a page swap changes the header and the
+    page raised, and nothing else under the content area.
+    """
+
+    def __init__(self, widget, repaint=None):
+        self._widget = widget
+        self._repaint = tuple(repaint) if repaint else ()
+        self._hwnd: Optional[int] = None
+
+    def __enter__(self):
+        api = _USER32
+        if api is None:
+            return self
+        try:
+            # An unmapped window cannot be seen anyway, and WM_SETREDRAW(TRUE)
+            # sets WS_VISIBLE — un-freezing one would show a window Tk hid.
+            if not self._widget.winfo_ismapped():
+                return self
+            hwnd = int(self._widget.winfo_id())
+        except Exception:
+            return self
+        depth = _freeze_depth.get(hwnd, 0)
+        if depth == 0:
+            try:
+                api.SendMessageW(hwnd, _WM_SETREDRAW, 0, 0)
+            except Exception:
+                return self
+        _freeze_depth[hwnd] = depth + 1
+        self._hwnd = hwnd
+        return self
+
+    def __exit__(self, *_exc):
+        hwnd = self._hwnd
+        if hwnd is None:
+            return False
+        self._hwnd = None
+        depth = _freeze_depth.get(hwnd, 1) - 1
+        if depth > 0:
+            _freeze_depth[hwnd] = depth
+            return False
+        _freeze_depth.pop(hwnd, None)
+        api = _USER32
+        try:
+            api.SendMessageW(hwnd, _WM_SETREDRAW, 1, 0)
+        except Exception:
+            pass
+        targets = []
+        for w in self._repaint:
+            try:
+                targets.append(int(w.winfo_id()))
+            except Exception:
+                targets = []            # anything odd: repaint it all
+                break
+        for h in (targets or [hwnd]):
+            try:
+                api.RedrawWindow(h, None, None, _REDRAW_FLAGS)
+            except Exception:
+                pass
+        return False     # never swallow the body's exception
+
+
+# ---------------------------------------------------------------------------
 # Custom Widgets
 # ---------------------------------------------------------------------------
 
@@ -791,34 +1049,6 @@ class PillButton(ctk.CTkButton):
 
     def configure_text(self, text: str) -> None:
         self.configure(text=text)
-
-
-class FlatPillButton(tk.Label):
-    """A pill-styled button made of one tk.Label. For LIST ROWS only.
-
-    PillButton is a CTkButton, and a CTkButton is not cheap: it builds a canvas
-    and draws a rounded rect with border shapes on every instantiation and every
-    restyle. That is fine for the handful on a page header, and much too slow
-    once there is one PER ROW — the Watchlist renders a row per RSA pick, so a
-    79-pick feed paid for 79 canvas-backed buttons on every redraw and blocked
-    the UI thread for the better part of a second doing it.
-
-    Square-ish rather than truly rounded, which at this size reads the same in
-    a dense list. `_bind_row_hover` walks past it untouched: it only repaints
-    widgets whose bg matches the row surface, and this one is filled.
-    """
-
-    def __init__(self, parent, text="", command=None, bg_color=ACCENT,
-                 hover_color=ACCENT_HOVER, fg_color=TEXT_PRIMARY,
-                 width=72, height=30, font_size=9):
-        super().__init__(parent, text=text, bg=bg_color, fg=fg_color,
-                         font=(FONT_FAMILY, font_size, "bold"),
-                         cursor="hand2", padx=10, pady=5)
-        self._fill, self._hover = bg_color, hover_color
-        if command is not None:
-            self.bind("<Button-1>", lambda _e: command())
-        self.bind("<Enter>", lambda _e: self.configure(bg=self._hover))
-        self.bind("<Leave>", lambda _e: self.configure(bg=self._fill))
 
 
 class StatusDot(tk.Canvas):
@@ -1093,6 +1323,242 @@ def _leg_open_accounts(broker: str, symbol: str) -> List[tuple]:
     return [(a, q) for a, q in sorted(net.items()) if q > 1e-9]
 
 
+def _public_raw_positions(symbols, rows=None) -> Dict[str, List[float]]:
+    """Public account label -> [gross bought, raw sold] across `symbols`.
+
+    RAW journal rows, deliberately NOT split_adjusted. That lens restates a
+    fractional sell as closing the whole pre-split share, which is right for
+    P/L and wrong for one thing Public does: it can credit 0.2 of a share after
+    a split, and weeks later round the account up to 0.98. Sell the 0.2 and the
+    adjusted journal calls the account closed while 0.98 is sitting in it. The
+    raw figures still say what happened: bought 1, sold 0.2. Closes count as
+    sold -- a position the user marked gone is not ours to sell again.
+
+    Summed across the alert and current ticker, because the buy is journaled
+    under the name we bought it as and a later sell may be under the new one.
+    """
+    syms = {str(s or "").upper() for s in symbols if s}
+    out: Dict[str, List[float]] = {}
+    if rows is None:
+        try:
+            rows = trade_journal.get_trades()
+        except Exception:
+            return out
+    for t in rows:
+        if (str(t.get("broker") or "") != "public"
+                or str(t.get("symbol") or "").upper() not in syms):
+            continue
+        try:
+            qty = float(t.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        rec = out.setdefault(str(t.get("account_id") or "").strip(), [0.0, 0.0])
+        rec[0 if t.get("side") == "buy" else 1] += qty
+    return out
+
+
+def _public_sell_caps(symbols, rows=None) -> Dict[str, float]:
+    """Per Public account, the most a holdings-sized sell may take: what this
+    tool BOUGHT there, gross, for accounts it is not yet out of.
+
+    THE RULE (owner-approved, 2026-09-25). An account is eligible when we ever
+    bought the play there AND the raw net (bought - sold) is still above zero.
+    Its cap is the gross buy, and public.execute_trade sells min(held, cap):
+
+        bought 1, nothing sold, split left 0.0333       -> sells 0.0333
+        bought 1, split rounded up to 1                  -> sells 1
+        bought 1, sold 0.2, Public later rounded to 0.98 -> sells 0.98
+        bought 1, account also held 100 of its own       -> sells 1, never 101
+        bought 1, sold 1 (or 0.2 then 0.98)              -> not eligible
+
+    The gross buy is the cap rather than what is left of it because the units
+    do not line up: 0.98 of a post-split share after selling 0.2 is not
+    "0.8 remaining" of anything. The one thing that is always true is that we
+    never sell more shares than we put in.
+    """
+    return {acct: bought
+            for acct, (bought, sold) in _public_raw_positions(symbols, rows).items()
+            if acct and bought > 1e-9 and bought - sold > 1e-9}
+
+
+def _cap_text(qty: float) -> str:
+    """A cap as the Decimal string public.execute_trade takes -- never '1e-05'."""
+    try:
+        return lifecycle.qty_text(Decimal(repr(round(float(qty), 8))))
+    except (InvalidOperation, ValueError, TypeError):
+        return "0"
+
+
+def _public_sell_plan(holdings, caps: Dict[str, float],
+                      remnant_only: bool = False) -> Dict[str, Any]:
+    """What a holdings-sized Public sell will do, from a resolve-time read.
+
+    The same rule public.execute_trade applies at order time -- min(held,
+    cap), skip accounts with no cap, and under `remnant_only` skip whole
+    shares -- run against the balances lifecycle.resolve just read, so the
+    confirm dialog can say what is about to happen instead of printing one
+    quantity that no Public account is actually going to send.
+    """
+    sell: List[tuple] = []
+    not_ours = whole = 0
+    for label, held in holdings or ():
+        cap = caps.get(str(label).split(" = ")[0].strip())
+        if not cap:
+            not_ours += 1
+            continue
+        if remnant_only and held >= 1:
+            whole += 1
+            continue
+        q = min(float(held), float(cap))
+        if q > 1e-9:
+            sell.append((label, q))
+    return {"sell": sell, "not_ours": not_ours, "whole": whole}
+
+
+def _public_plan_text(plan: Dict[str, Any]) -> str:
+    """One line for the confirm dialog, e.g.
+    'sells what each account holds, up to what RSAMAXXED bought there —
+    21 accounts, 0.0333 each'."""
+    sell = plan.get("sell") or []
+    head = "sells what each account holds, up to what RSAMAXXED bought there"
+    if sell:
+        lo = min(q for _a, q in sell)
+        hi = max(q for _a, q in sell)
+        each = (f"{_qty_text(lo)} each" if hi - lo < 1e-9
+                else f"{_qty_text(lo)}–{_qty_text(hi)} each")
+        body = f"{head} — {_plural(len(sell), 'account')}, {each}"
+    else:
+        body = f"{head} — nothing to sell"
+    extra = []
+    if plan.get("not_ours"):
+        extra.append(f"{_plural(plan['not_ours'], 'account')} not bought "
+                     f"through RSAMAXXED, skipped")
+    if plan.get("whole"):
+        extra.append(f"{_plural(plan['whole'], 'account')} holding a whole "
+                     f"share wait for their own exit")
+    return body + ("" if not extra else " · " + " · ".join(extra))
+
+
+def _plural(n, word: str, many: Optional[str] = None) -> str:
+    """'1 account', '3 accounts' -- the '(s)' the UI used to print everywhere.
+
+    `n` may be a number or already-formatted text ('0.98', '1'), since share
+    counts reach the UI through _qty_text: it is printed as given and only
+    exactly one takes the singular.
+    """
+    try:
+        one = abs(float(str(n).replace(",", "")) - 1) < 1e-9
+    except (TypeError, ValueError):
+        one = False
+    return f"{n} {word if one else (many or word + 's')}"
+
+
+def _money_signed(value, decimals: int = 2) -> str:
+    """+$3,728.34 / -$12.50: the sign before the dollar sign, as money is
+    written. f"${x:+,.2f}" produced "$+3,728.34", which reads as a typo on
+    exactly the figures the app is proudest of (realized P/L)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    sign = "-" if v < 0 and round(abs(v), decimals) != 0 else "+"
+    return f"{sign}${abs(v):,.{int(decimals)}f}"
+
+
+def _money(value, decimals: int = 2) -> str:
+    """$1,234.50 / -$12.50 -- unsigned for positives, and the minus before
+    the dollar sign for negatives rather than "$-12.50" (chart axes and the
+    average loss, which are the figures that go below zero)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    neg = v < 0 and round(abs(v), decimals) != 0
+    return f"{'-' if neg else ''}${abs(v):,.{int(decimals)}f}"
+
+
+def _nothing_to_sell(result: Dict[str, Any]) -> bool:
+    """A broker leg that placed no order because no account had anything of
+    ours to sell -- an answer, not a failure. Public's holdings-sized sell is
+    the one that produces it: every account read, every one skipped."""
+    return (not result.get("ok_accounts") and not result.get("fail_accounts")
+            and not result.get("errors") and bool(result.get("skipped")))
+
+
+def _skip_note(skipped: Dict[str, int]) -> str:
+    """{'whole': 18, 'none': 3} -> '21 skipped (18 whole shares wait for their
+    own exit, 3 hold none)'."""
+    skipped = skipped or {}
+    n = sum(int(v or 0) for v in skipped.values())
+    why = []
+    if skipped.get("whole"):
+        k = skipped["whole"]
+        why.append(f"{_plural(k, 'whole share')} wait{'s' if k == 1 else ''} "
+                   f"for {'its' if k == 1 else 'their'} own exit")
+    if skipped.get("none"):
+        k = skipped["none"]
+        why.append(f"{k} hold{'s' if k == 1 else ''} none")
+    if skipped.get("not_ours"):
+        why.append(f"{skipped['not_ours']} not bought through RSAMAXXED or "
+                   f"already sold")
+    return f"{n} skipped" + (f" ({', '.join(why)})" if why else "")
+
+
+#: Symbols the round-up radar has already announced (see _check_roundup_radar).
+ROUNDUP_RADAR_FILE = ROOT_DIR / "roundup_radar.json"
+
+
+def _load_roundup_flagged() -> set:
+    try:
+        data = json.loads(ROUNDUP_RADAR_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {str(s).upper() for s in data} if isinstance(data, list) else set()
+
+
+def _save_roundup_flagged(symbols) -> None:
+    try:
+        _write_json(ROUNDUP_RADAR_FILE, sorted(symbols))
+    except OSError:
+        pass
+
+
+#: Plays whose Public late-round-up check is settled: SYMBOL -> the date an
+#: exit-time read of Public found nothing left to sell. See _sell_plays.
+PUBLIC_LATE_CHECKED_FILE = ROOT_DIR / "public_late_checked.json"
+
+
+def _load_public_late_checked() -> Dict[str, str]:
+    try:
+        data = json.loads(PUBLIC_LATE_CHECKED_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {str(k).upper(): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _mark_public_late_checked(symbols, day: Optional[str] = None) -> None:
+    """Record that Public was read at exit time and there is nothing more to
+    take on these plays, so a late-round-up leg stops offering itself.
+
+    A marker file rather than a journal row, on purpose. A close row would
+    also end it, but a close carries cost basis into `unaccounted()` -- and
+    these shares are already fully accounted for by the fractional sell that
+    split_adjusted restated. Nothing about P/L should change because we looked
+    and found nothing. A LATER exit called at Public reopens the leg on its
+    own, because the check is dated and an exit dated after it outranks it.
+    """
+    day = day or date.today().isoformat()
+    data = _load_public_late_checked()
+    for s in symbols:
+        s = str(s or "").upper()
+        if s and day >= data.get(s, ""):
+            data[s] = day
+    try:
+        _write_json(PUBLIC_LATE_CHECKED_FILE, data)
+    except OSError:
+        pass
+
+
 def _spread_over_accounts(accounts: List[tuple], qty: float) -> List[tuple]:
     """Split `qty` shares across open accounts, filling each before the next.
 
@@ -1152,6 +1618,7 @@ def _sell_plays(sells: List[Dict[str, Any]]) -> List[SellPlay]:
                 called[sym][key] = when
 
     plays: List[SellPlay] = []
+    late_checked: Optional[Dict[str, str]] = None     # loaded only if needed
     for sym in sorted({str(s.get("symbol") or "").upper() for s in sells} - {""}):
         brokers = sorted({b for (b, s) in ledger if s == sym} | set(called.get(sym, {})))
         legs = []
@@ -1174,6 +1641,25 @@ def _sell_plays(sells: List[Dict[str, Any]]) -> List[SellPlay]:
                 state = SELL_NONE
             elif left <= 1e-9:
                 state = SELL_DONE
+                # PUBLIC'S LATE ROUND-UP. Public can credit 0.2 of a share
+                # after a split and round the account up to 0.98 days or weeks
+                # later. Sell the 0.2 first and the split-adjusted ledger calls
+                # the leg closed -- correctly for P/L, and blind to the 0.98
+                # that arrives afterwards. So when an exit is called AT Public
+                # and the RAW journal still shows part of what we bought there
+                # unsold, the leg is offered again; the live read at sell time
+                # decides whether anything is actually there. Nothing else
+                # widens: without an exit at Public it stays done, and once an
+                # exit-time read has found nothing it stays done until a newer
+                # exit is called. See _public_sell_caps and
+                # _mark_public_late_checked.
+                when = called.get(sym, {}).get(b, "")
+                if b == "public" and when:
+                    if late_checked is None:
+                        late_checked = _load_public_late_checked()
+                    if (late_checked.get(sym, "") < when[:10]
+                            and _public_sell_caps((sym,))):
+                        state = SELL_NOW
             elif b in called.get(sym, {}):
                 state = SELL_NOW
             else:
@@ -1295,7 +1781,12 @@ def _sellnow_task(play, legs=None, renames: Optional[Dict[str, str]] = None):
         if lifecycle.app_key(leg.broker) not in BROKER_MODULES:
             continue
         brokers.append(rsa_feed.normalize_broker(leg.broker))
-        accounts += len(_leg_open_accounts(leg.broker, play.symbol))
+        n = len(_leg_open_accounts(leg.broker, play.symbol))
+        if lifecycle.app_key(leg.broker) == "public":
+            # A late round-up leg is closed in the adjusted ledger and still
+            # open in the raw one; count the accounts it will actually read.
+            n = max(n, len(_public_sell_caps((play.symbol,))))
+        accounts += n
         newest = max(newest, leg.alert_date or "")
     if not brokers:
         return None
@@ -1314,6 +1805,66 @@ def _sellnow_task(play, legs=None, renames: Optional[Dict[str, str]] = None):
             rsa_feed.normalize_broker(l.broker) for l in ready
             if lifecycle.app_key(l.broker) not in BROKER_MODULES),
     )
+
+
+#: SellTask.status for a Public remnant cleared on the back of an exit called
+#: elsewhere. _exit_fire reads it to send Public `remnant_only`.
+REMNANT_STATUS = "remnant"
+
+#: Whether auto-sell clears Public fractions on the back of an exit called at
+#: ANOTHER brokerage (_public_remnant_tasks). OFF, pending the owner's call.
+#:
+#: Public does not always settle a split at once: it can credit 0.2 of a share
+#: and round the account up to 0.98 days or weeks later. An exit called at
+#: Robinhood says nothing about whether Public has finished, so selling the
+#: fraction the moment it is called elsewhere can sell 0.2 now and leave the
+#: round-up to arrive into a play we have already walked away from. The code
+#: and its tests stay; flipping this to True turns it back on.
+#:
+#: This guards ONLY that addition. The TRACK board's own `fractional` plays
+#: (lifecycle.sell_worklist) keep clearing Public leftovers whenever the
+#: fractionals toggle is on, exactly as before.
+PUBLIC_REMNANT_CLEAR = False
+
+
+def _public_remnant_tasks(plays, renames: Optional[Dict[str, str]] = None) -> List[Any]:
+    """Public fractions left behind on plays whose exit was called elsewhere.
+
+    IPDN, 2026-09-24: the exit named Robinhood and Schwab, where the split
+    rounded up to a whole share. Public returned 1/30 of a share instead, so
+    the exit never named it -- and nothing else ever would. The Sell-now path
+    only sells brokerages an exit names, and the fractional path only sees
+    plays the TRACK board calls `fractional`, which a play that rounded up
+    somewhere is not. 21 accounts of IPDN sat at Public with no path out.
+
+    The rule is narrow on purpose. An exit must have been called on the play
+    at some brokerage (the play is over), Public must still be open in the
+    journal and not itself named, and Public is sent `remnant_only`: it reads
+    every account live and sells only balances under one share. A whole share
+    at Public is a position that waits for its own exit, never collateral.
+    """
+    if not PUBLIC_REMNANT_CLEAR or "public" not in BROKER_MODULES:
+        return []                       # see PUBLIC_REMNANT_CLEAR
+    renames = renames or {}
+    out: List[Any] = []
+    for play in plays:
+        called = [l.alert_date for l in play.legs
+                  if l.alert_date and lifecycle.app_key(l.broker) != "public"]
+        if not called:
+            continue
+        waiting = [l for l in play.legs
+                   if lifecycle.app_key(l.broker) == "public" and l.state == SELL_WAIT]
+        if not waiting:
+            continue
+        out.append(lifecycle.SellTask(
+            symbol=play.symbol,
+            alert_symbol=renames.get(play.symbol.upper(), play.symbol),
+            alert_date=max(called),
+            status=REMNANT_STATUS,
+            brokers=("Public",),
+            accounts=len(_leg_open_accounts(waiting[0].broker, play.symbol)),
+        ))
+    return out
 
 
 PICKS_FILE = ROOT_DIR / "picks.json"
@@ -1527,6 +2078,12 @@ def _account_universe_static() -> int:
     """
     known = sum(_KNOWN_ACCOUNT_COUNTS.get(b, 1) if _broker_has_creds(b) else 0
                 for b in BROKER_MODULES)
+    # The journal half is a pass over every trade; it only changes with the
+    # journal (and the day, since it is a trailing window).
+    key = (trade_journal.version(), id(trade_journal.get_trades), date.today())
+    hit = _COVERAGE_MEMO.get("universe")
+    if hit is not None and hit[0] == key:
+        return max(known, hit[1])
     try:
         from datetime import timedelta
         # Recent buys only. Over all time the journal also holds accounts that
@@ -1541,7 +2098,22 @@ def _account_universe_static() -> int:
                     and str(t.get("timestamp") or "")[:10] >= cutoff})
     except Exception:
         seen = 0
+    _COVERAGE_MEMO["universe"] = (key, seen)
     return max(known, seen)
+
+
+# (what it was computed from) -> result, for the two journal scans below. One
+# render of the Command Center asked for coverage five times over (purchased,
+# partial = touched - fully covered, the pipeline strip...), each a pass over
+# every trade in the journal. The answer only changes when the journal or the
+# pick list does, so it is computed once per (journal version, picks).
+_COVERAGE_MEMO: Dict[str, tuple] = {}
+
+
+def _memo_key(picks: List[Dict[str, str]]) -> tuple:
+    return (trade_journal.version(), id(trade_journal.get_trades),
+            tuple((str(p.get("symbol") or "").upper(), str(p.get("date") or ""))
+                  for p in picks))
 
 
 def _pick_coverage(picks: List[Dict[str, str]]) -> Dict[tuple, int]:
@@ -1550,7 +2122,19 @@ def _pick_coverage(picks: List[Dict[str, str]]) -> Dict[tuple, int]:
     A buy counts toward a pick when it is dated on or after the alert date.
     Counting *accounts* (broker + account_id) rather than brokers is what makes
     "bought on 7 of 22" mean something when one broker holds ten accounts.
+
+    Memoised per journal version — callers must treat the result as read-only.
     """
+    key = _memo_key(picks)
+    hit = _COVERAGE_MEMO.get("coverage")
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    cov = _pick_coverage_uncached(picks)
+    _COVERAGE_MEMO["coverage"] = (key, cov)
+    return cov
+
+
+def _pick_coverage_uncached(picks: List[Dict[str, str]]) -> Dict[tuple, int]:
     cov: Dict[tuple, int] = {}
     try:
         all_trades = trade_journal.get_trades()
@@ -1583,7 +2167,19 @@ def _pick_broker_map(picks: List[Dict[str, str]]) -> Dict[tuple, set]:
     by broker rather than counted, because "has THIS broker already bought it"
     and "has anyone bought it" are different questions. Mirror needs the first:
     a name bought by hand at Chase says nothing about whether Public holds it.
+
+    Memoised like _pick_coverage; the sets are shared, so never mutate them.
     """
+    key = _memo_key(picks)
+    hit = _COVERAGE_MEMO.get("brokers")
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    out = _pick_broker_map_uncached(picks)
+    _COVERAGE_MEMO["brokers"] = (key, out)
+    return out
+
+
+def _pick_broker_map_uncached(picks: List[Dict[str, str]]) -> Dict[tuple, set]:
     out: Dict[tuple, set] = {}
     try:
         all_trades = trade_journal.get_trades()
@@ -1606,6 +2202,32 @@ def _pick_broker_map(picks: List[Dict[str, str]]) -> Dict[tuple, set]:
         out[(sym, pick_date)] = {b for (d, b) in buys.get(sym, [])
                                  if b and d and d >= pick_date}
     return out
+
+
+# The Partial and Purchased tabs are history as much as worklist, and they only
+# grow: every pick ever bought lands there for good. Drawing all of it is what
+# made clicking those tabs lag, and the rows you act on are the recent ones.
+PICK_TAB_RECENT_DAYS = 14
+
+
+def _split_recent_picks(picks: List[Dict[str, str]],
+                        days: int = PICK_TAB_RECENT_DAYS,
+                        today: Optional[date] = None) -> Tuple[list, list]:
+    """(recent, older) by alert date. A pick whose date cannot be read counts
+    as recent — hiding it behind "Show older" would lose it, and it cannot be
+    aged honestly anyway."""
+    today = today or date.today()
+    floor = today - timedelta(days=days)
+    recent: List[Dict[str, str]] = []
+    older: List[Dict[str, str]] = []
+    for p in picks:
+        try:
+            d = datetime.strptime(str(p.get("date") or ""), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            recent.append(p)
+            continue
+        (recent if d >= floor else older).append(p)
+    return recent, older
 
 
 def _touched_pick_keys(picks: List[Dict[str, str]]) -> set:
@@ -1844,6 +2466,17 @@ def _fetch_quick_picks() -> List[Dict[str, str]]:
 # Application
 # ---------------------------------------------------------------------------
 
+# Our own taskbar identity. Under pythonw the taskbar otherwise groups the
+# window with Python and shows Python's icon instead of ours. Must be set before
+# the Tk root exists, so it runs at import rather than in __init__.
+if sys.platform == "win32":
+    try:
+        import ctypes as _ctypes
+        _ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RSAMAXXED.Terminal")
+    except Exception:
+        pass
+
+
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
@@ -1861,7 +2494,11 @@ class App(ctk.CTk):
         try:
             ico = logo.ico_path()
             if ico:
-                self.iconbitmap(ico)
+                # default= covers every Toplevel (dialogs, the 2FA prompt) too.
+                self.iconbitmap(default=ico)
+                # CustomTkinter re-sets its own icon ~200ms after init on
+                # Windows; re-assert ours once that has happened.
+                self.after(250, lambda: self.iconbitmap(default=ico))
         except Exception:
             pass
         self.geometry("1480x900")
@@ -1926,6 +2563,9 @@ class App(ctk.CTk):
         self._invest_in_flight: int = 0
         # Last-rendered fingerprint per page — see _page_signature.
         self._page_sig: Dict[str, Any] = {}
+        # Drawn lists on hidden pages skip resize redraws until shown (see
+        # RowCanvas). Only this app knows which page is on screen.
+        RowCanvas.is_hidden = staticmethod(self._widget_hidden)
         self._notifications: List[Dict[str, Any]] = []
         self._notif_unread: int = 0
         self._notif_popup: Optional[tk.Toplevel] = None
@@ -1934,7 +2574,9 @@ class App(ctk.CTk):
         self._toasts: List[tk.Toplevel] = []
         # Round-up radar: open positions whose quote has exploded past our
         # recorded cost — the reverse split almost certainly executed.
-        self._roundup_flagged: set = set()
+        # Remembered across launches, so the same positions are not announced
+        # again every time the app starts.
+        self._roundup_flagged: set = _load_roundup_flagged()
         # TRACK board (the Exits page). Populated by the hourly poll; must exist
         # before _build_frames because the page renders from it on first build.
         self._track_rows: List[Any] = []
@@ -1961,7 +2603,22 @@ class App(ctk.CTk):
         # that was the point of confirming in the first place.
         self._confirmed_sells: set = _load_confirmed_sells()
         self._show_confirmed: bool = False
-        self._autosell_sold: set = set(_as.get("sold") or [])
+        # Claimed plays whose holdings read is still out and NO order has been
+        # placed. Held in _autosell_sold too (so every "already handled" check
+        # sees it) but written to disk separately — see _save_autosell_state.
+        # One left over from the last session means that session died between
+        # the claim and the order, so nothing was sold and it is released.
+        self._autosell_reading: set = set()
+        self._autosell_sold, self._autosell_released = _autosell_restore(_as)
+        # key -> earliest time a handed-back play may be queued again. The
+        # re-checks after buys and after the queue drains are minutes apart,
+        # not an hour, so without this a broker that cannot log in would be
+        # retried back to back.
+        self._autosell_retry_after: Dict[str, datetime] = {}
+        # Set when the pump starts work; a drained queue re-checks the board
+        # only if it did something, so an empty check cannot loop.
+        self._autosell_recheck: bool = False
+        self._autosell_recheck_id: Optional[str] = None
         self._autosell_queue: List[Any] = []
         # A holdings read is out for the task the pump just popped. Covers the
         # window before _trade_in_flight goes up — see _autosell_pump.
@@ -1990,6 +2647,9 @@ class App(ctk.CTk):
         self._install_input_hook()
         self._install_shortcuts()
         self._show_frame("dashboard")
+        # Draw the other pages behind the dashboard once the startup rush is
+        # over, so the first visit to each is a raise, not a build.
+        self.after(2500, self._prewarm_pages)
 
         self._tick_clock()
         # Drains work a background thread could not hand to Tk directly. Must be
@@ -2150,6 +2810,12 @@ class App(ctk.CTk):
         """
         import traceback as _tb
         _crash_note("ROOT DESTROY", "".join(_tb.format_stack()))
+        # The run log is written in the background (see mirror_journal); make
+        # sure the last legs are on disk before the process can go away.
+        try:
+            mirror_journal.flush()
+        except Exception:
+            pass
         super().destroy()
 
     def report_callback_exception(self, exc, val, tb) -> None:
@@ -2533,11 +3199,13 @@ class App(ctk.CTk):
     # ---- Sidebar ----------------------------------------------------------
 
     # Ordered by the life of a play, not by category. A play arrives on the
-    # Watchlist, gets opened on the Trade Desk, sits in Positions, and closes
-    # on Exits — so the sidebar reads top to bottom in the order you actually
-    # work. The old grouping split that in half: Watchlist and Positions lived
-    # under OVERVIEW while Trade Desk and Exits lived under TRADING, which put
-    # step 3 above step 2 and buried the connection between them.
+    # Watchlist, gets opened on the Trade Desk (or by Mirror), and closes on
+    # Exits — so the sidebar reads top to bottom in the order you actually
+    # work. The old grouping split that in half: Watchlist lived under
+    # OVERVIEW while Trade Desk and Exits lived under TRADING, which buried the
+    # connection between them. (There was a Positions donut between Mirror and
+    # Exits; it was removed — it only restated the journal, and Exits is where
+    # an open play is acted on.)
     #
     # A section title of "" renders with no header — Command Center is the home
     # screen, not a member of a group.
@@ -2549,7 +3217,6 @@ class App(ctk.CTk):
             ("watchlist", "Watchlist", "watchlist"),      # what to open
             ("trade", "Trade Desk", "trade"),             # open it by hand
             ("mirror", "Mirror", "lightning"),            # or have it opened for you
-            ("holdings", "Positions", "positions"),       # what you hold
             ("exits", "Exits", "export"),                 # close it
         ]),
         ("INVEST", [
@@ -2644,8 +3311,14 @@ class App(ctk.CTk):
         self._style_nav(name, "hover" if entering else "idle")
 
     def _set_active_nav(self, name: str) -> None:
-        for n in self._nav_items:
-            self._style_nav(n, "active" if n == name else "idle")
+        # Only the two items whose state actually changes. Each restyle is a
+        # CTkFrame reconfigure — a canvas redraw — and doing all eleven on every
+        # click was a visible stutter in the sidebar before the page even moved.
+        prev = self._active_nav
+        if prev != name and prev in self._nav_items:
+            self._style_nav(prev, "idle")
+        if name in self._nav_items:
+            self._style_nav(name, "active")
         self._active_nav = name
 
     # ---- Content Area -----------------------------------------------------
@@ -2653,11 +3326,15 @@ class App(ctk.CTk):
     def _build_content_area(self, parent) -> None:
         wrapper = tk.Frame(parent, bg=BG_PRIMARY)
         wrapper.pack(side="left", fill="both", expand=True)
+        # Header + page, frozen together on a swap so the title and the page
+        # change in the same frame.
+        self._content_wrap = wrapper
 
         # page header — icon + title + subtitle, with a right actions slot
         header = tk.Frame(wrapper, bg=BG_PRIMARY, height=70)
         header.pack(fill="x", padx=30, pady=(18, 0))
         header.pack_propagate(False)
+        self._page_header = header
 
         title_row = tk.Frame(header, bg=BG_PRIMARY)
         title_row.pack(side="left", anchor="w", fill="y")
@@ -2684,7 +3361,6 @@ class App(ctk.CTk):
         self._frames: Dict[str, tk.Frame] = {}
         self._build_dashboard()
         self._build_watchlist()
-        self._build_holdings()
         self._build_trade()
         self._build_exits()
         self._build_invest()
@@ -2695,11 +3371,18 @@ class App(ctk.CTk):
         self._build_mirror()
         self._build_accounts()
         self._build_logs()
+        # Every page is placed ONCE, stacked on top of each other, and a visit
+        # just raises one. The old pack_forget/pack swap unmapped and remapped
+        # a whole page tree per click, which is both slow and what made pages
+        # visibly assemble: a remapped page is painted from scratch. Stacked
+        # pages also keep their size while hidden, so a page can be rendered
+        # BEHIND the current one and only raised once it is finished.
+        for f in self._frames.values():
+            f.place(in_=self._content, x=0, y=0, relwidth=1, relheight=1)
 
     _PAGE_META = {
         "dashboard": ("dashboard", "Command Center", "Live portfolio across every connected broker"),
         "watchlist": ("watchlist", "Watchlist", "Reverse-split round-up plays you're buying — live"),
-        "holdings":  ("positions", "Positions", "Allocation of confirmed-bought open positions"),
         "trade":     ("trade", "Trade Desk", "Synchronized multi-broker order execution"),
         "mirror":    ("lightning", "Mirror", "Every order automation placed for you, run by run"),
         "exits":     ("export", "Exits", "Plays that resolved — what to sell, and where"),
@@ -2714,7 +3397,6 @@ class App(ctk.CTk):
     _PAGE_ACTIONS = {
         "dashboard": [("Refresh All", "_dashboard_refresh")],
         "watchlist": [("Refresh Quotes", "_start_quote_loop")],
-        "holdings":  [("Recompute", "_recompute_allocation")],
         "exits":     [("Refresh Board", "_track_pull_now")],
         "mirror":    [("Check Now", "_mirror_check_clicked"), ("Export CSV", "_export_mirror_csv")],
         "stats":     [("Export CSV", "_export_trades_csv")],
@@ -2722,27 +3404,61 @@ class App(ctk.CTk):
     }
 
     def _render_header_actions(self, name: str) -> None:
-        for w in self._header_right.winfo_children():
-            w.destroy()
-        for label, method in reversed(self._PAGE_ACTIONS.get(name, [])):
-            fn = getattr(self, method, None)
-            if fn is None:
-                continue
-            PillButton(self._header_right, text=label, command=fn,
-                       bg_color=BG_CARD_ALT, hover_color=BG_ELEVATED,
-                       width=max(112, len(label) * 8 + 34), height=34,
-                       font_size=9).pack(side="right", padx=(8, 0), pady=16)
+        """Show `name`'s header buttons. Built once per page and then swapped.
+
+        They were destroyed and rebuilt on every visit — a CTkButton each, plus
+        a fresh CTkFont — which is a canvas build and a font lookup per button
+        per click, for buttons that never change.
+        """
+        cache = self.__dict__.setdefault("_header_action_frames", {})
+        shown = self.__dict__.get("_header_action_shown")
+        if shown == name and name in cache:
+            return
+        box = cache.get(name)
+        if box is None:
+            box = tk.Frame(self._header_right, bg=BG_PRIMARY)
+            for label, method in reversed(self._PAGE_ACTIONS.get(name, [])):
+                fn = getattr(self, method, None)
+                if fn is None:
+                    continue
+                PillButton(box, text=label, command=fn,
+                           bg_color=BG_CARD_ALT, hover_color=BG_ELEVATED,
+                           width=max(112, len(label) * 8 + 34), height=34,
+                           font_size=9).pack(side="right", padx=(8, 0), pady=16)
+            cache[name] = box
+        old = cache.get(shown) if shown is not None else None
+        box.pack(side="right", fill="y")
+        if old is not None and old is not box:
+            old.pack_forget()
+        self._header_action_shown = name
+
+    def _page_renderer(self, name: str):
+        return {
+            "stats": self._refresh_stats,
+            "invest": self._render_invest,
+            "watchlist": self._render_watchlist,
+            "exits": self._render_exits_now,
+            "mirror": self._render_mirror,
+        }.get(name)
 
     def _show_frame(self, name: str) -> None:
-        for f in self._frames.values():
-            f.pack_forget()
-        self._frames[name].pack(in_=self._content, fill="both", expand=True)
-        ic, title, subtitle = self._PAGE_META.get(name, ("dashboard", name.title(), ""))
-        self._page_icon.configure(text=icon(ic))
-        self._page_title.configure(text=title)
-        self._page_subtitle.configure(text=subtitle)
-        self._render_header_actions(name)
+        """Switch pages as ONE visual step.
+
+        The sidebar highlight moves immediately so the click feels answered.
+        If the page is stale it is re-rendered while still hidden behind the
+        current one, and only raised once it has finished drawing — so what
+        you see is the old page, then the new page, never the new page being
+        assembled box by box. The raise itself happens with painting suspended
+        (_frozen), which is what keeps the swap from tearing.
+        """
+        if self.__dict__.get("_painting"):
+            # A click that landed while the previous swap was painting (see
+            # _paint_now). Run it right after, never inside that swap.
+            self.after(1, lambda n=name: self._show_frame(n))
+            return
         self._set_active_nav(name)
+        token = self.__dict__.get("_show_token", 0) + 1
+        self._show_token = token
 
         if name == "exits":
             # Opening the page before the hourly tick has fired should not show
@@ -2750,26 +3466,309 @@ class App(ctk.CTk):
             if not self._track_rows and not self._track_busy and self._track_available():
                 self.after(60, self._track_pull_now)
 
-        renderer = {
-            "stats": self._refresh_stats,
-            "invest": self._render_invest,
-            "watchlist": self._render_watchlist,
-            "holdings": self._render_allocation,
-            "exits": self._render_exits,
-            "mirror": self._render_mirror,
-        }.get(name)
+        base = self._page_renderer(name)
+        base_stale = False
+        parked_raise = False
+        sig = None
+        if base is not None:
+            # Rebuilding a page costs real time — Exits builds a widget per
+            # broker per play, Analytics redraws six charts. Doing that on
+            # every visit is what made moving around feel slow, and it is pure
+            # waste when nothing underneath has changed.
+            #
+            # The signature is recorded only once the render has SUCCEEDED
+            # (below), the way _prewarm_pages does it. Recording it up front
+            # meant a render that raised was remembered as done, and the page
+            # stayed broken on every later visit until something else changed.
+            # A render already queued for this same signature by an earlier
+            # click is not queued twice.
+            sig = self._page_signature(name)
+            pending = self.__dict__.setdefault("_page_pending", {})
+            base_stale = sig is None or (self._page_sig.get(name) != sig
+                                         and pending.get(name, _NO_SIG) != sig)
+            if base_stale:
+                pending[name] = sig
+            elif sig is not None and pending.get(name, _NO_SIG) == sig:
+                parked_raise = True
+        # Sections that asked to be drawn while this page was hidden.
+        parked = list((self.__dict__.get("_deferred") or {}).pop(name, {}).values())
+        # parked_raise: an earlier click's render of this page is still queued;
+        # raise behind it (after(1) callbacks run in order) rather than now,
+        # on top of the unrendered page.
+        stale = base_stale or bool(parked) or parked_raise
+
+        def renderer():
+            for fn in parked:
+                fn()
+            if base_stale:
+                try:
+                    base()
+                finally:
+                    if self.__dict__.get("_page_pending", {}).get(name, _NO_SIG) == sig:
+                        self._page_pending.pop(name, None)
+                self._page_sig[name] = sig          # reached only on success
+        if not stale:
+            self._raise_page(name)
+            return
+        # Paint the sidebar highlight now: the render below can take a moment,
+        # and the click has to look answered while it does.
+        self.update_idletasks()
+
+        # Let the sidebar repaint first, then render behind and raise. A later
+        # click supersedes this one: the render still lands (and records its
+        # signature when it does) but the raise belongs to the newer click, so
+        # rapid clicking never flashes an intermediate page.
+        def _render_then_raise():
+            try:
+                renderer()
+            finally:
+                if self.__dict__.get("_show_token") == token:
+                    self._raise_page(name)
+        self.after(1, _render_then_raise)
+
+    def _raise_page(self, name: str) -> None:
+        """Bring a (rendered) page to the front along with its header."""
+        frame = self._frames.get(name)
+        if frame is None:
+            return
+        # Repaint only what a swap changes -- the header and the page being
+        # raised -- not every window under the content area.
+        with _frozen(self._content_wrap,
+                     repaint=(self._page_header, frame) if _RAISE_SCOPED else None):
+            ic, title, subtitle = self._PAGE_META.get(name, ("dashboard", name.title(), ""))
+            self._page_icon.configure(text=icon(ic))
+            self._page_title.configure(text=title)
+            self._page_subtitle.configure(text=subtitle)
+            self._render_header_actions(name)
+            # Let this page follow the window again and catch up on any resize
+            # it sat out while hidden -- laid out and redrawn now, unseen.
+            if self._unpin_page(frame):
+                self.update_idletasks()
+            self._flush_resize(name)
+            frame.tkraise()
+            self._pin_hidden_pages(frame)
+            # Inside the freeze: Tk paints from idle callbacks, so this is the
+            # moment the page actually draws — while it still cannot be seen.
+            self.update_idletasks()
+        # ...except Windows discards drawing done while WM_SETREDRAW is off, so
+        # the lift above asks every window to repaint and Tk only QUEUES that
+        # (Expose events, then idle redraws). Until the event loop gets round to
+        # it, nothing erases the old page, and its text shows through the new
+        # one for up to a second on a heavy page. Paint it now instead.
+        self._paint_now()
+
+    def _paint_now(self, budget_s: float = 0.15) -> None:
+        """Service the repaints a page swap just queued, before returning.
+
+        Window events only (Expose and friends, no timers or file events), then
+        the idle redraws they schedule. Bounded by count and time so a flood of
+        input can never hold the swap. Input that arrives in the window is
+        handled as usual, but a page switch it triggers is deferred until this
+        returns — see _show_frame — so a swap never nests inside another.
+        """
+        import time as _time
+        import _tkinter
+        flags = _tkinter.WINDOW_EVENTS | _tkinter.DONT_WAIT
+        end = _time.perf_counter() + budget_s
+        self._painting = True
+        try:
+            for _ in range(2000):
+                if _time.perf_counter() >= end or not self.tk.dooneevent(flags):
+                    break
+            self.update_idletasks()
+        except (tk.TclError, AttributeError):
+            pass
+        finally:
+            self._painting = False
+
+    # ---- Hidden pages sit out window resizes --------------------------------
+    #
+    # Every page is placed at relwidth=1/relheight=1 on the same spot, so ALL
+    # of them used to follow the window: each step of a window drag re-laid-out
+    # and repainted ten pages' worth of widgets and ~100 rounded CTk frames to
+    # show one of them -- 1.1-2.0s per step. A hidden page is now pinned at the
+    # absolute size it last had, so a resize only reaches the page on screen;
+    # the one being raised is unpinned first and catches up, inside the freeze.
+
+    def _pin_hidden_pages(self, shown) -> None:
+        pinned = self.__dict__.setdefault("_pinned_pages", set())
+        try:
+            w, h = self._content.winfo_width(), self._content.winfo_height()
+        except tk.TclError:
+            return
+        if w < 50 or h < 50:
+            return                      # not laid out yet: nothing to pin to
+        for f in self._frames.values():
+            if f is shown or f in pinned:
+                continue
+            try:
+                f.place_configure(relwidth=0, relheight=0, width=w, height=h)
+                pinned.add(f)
+            except tk.TclError:
+                pass
+
+    def _unpin_page(self, frame) -> bool:
+        """Make `frame` follow the content area again. True if it was pinned."""
+        pinned = self.__dict__.get("_pinned_pages") or set()
+        if frame not in pinned:
+            return False
+        pinned.discard(frame)
+        try:
+            frame.place_configure(relwidth=1, relheight=1, width=0, height=0)
+        except tk.TclError:
+            return False
+        return True
+
+    # ---- Deferred teardown ----------------------------------------------------
+    #
+    # Destroying Tk widgets is by far the most expensive thing these pages do:
+    # measured on the target machine at ~1-2ms PER WIDGET (a 400-widget list
+    # took 0.5-0.9s to destroy, whether or not it was on screen), against
+    # ~0.15ms to create one. A redraw that destroyed the old rows first froze
+    # the UI for most of a second before the new rows could even start.
+    #
+    # So old content is unmapped (a few ms) and handed to a graveyard that
+    # destroys it a widget at a time in short idle slices, yielding to input
+    # between slices. Nothing buried is ever shown again.
+
+    _BURY_SLICE_S = 0.008       # destroy for at most this long per tick
+    _BURY_GAP_MS = 12           # then give input/paint this long
+
+    def _bury(self, *widgets) -> None:
+        graves = self.__dict__.setdefault("_graveyard", [])
+        for w in widgets:
+            if w is None:
+                continue
+            try:
+                mgr = w.winfo_manager()
+                if mgr == "pack":
+                    w.pack_forget()
+                elif mgr == "grid":
+                    w.grid_forget()
+                elif mgr == "place":
+                    w.place_forget()
+            except tk.TclError:
+                continue
+            graves.append(w)
+        if graves and not self.__dict__.get("_dig_id"):
+            self._dig_id = self.after(self._BURY_GAP_MS, self._dig_graves)
+
+    def _dig_graves(self) -> None:
+        import time as _time
+        self._dig_id = None
+        graves = self.__dict__.get("_graveyard") or []
+        deadline = _time.perf_counter() + self._BURY_SLICE_S
+        while graves and _time.perf_counter() < deadline:
+            root = w = graves[-1]
+            try:
+                # Leaf first: one widget per destroy call keeps each step
+                # small, where destroying a row destroys its whole subtree.
+                # A CTk widget is taken whole — it tears down its own canvas
+                # and would trip over one already destroyed underneath it.
+                while not _is_ctk(w):
+                    kids = w.winfo_children()
+                    if not kids:
+                        break
+                    w = kids[-1]
+                if w is root:
+                    graves.pop()
+                w.destroy()
+            except Exception:
+                # Anything odd: drop the whole grave in one go rather than
+                # retrying the same widget forever.
+                if graves and graves[-1] is root:
+                    graves.pop()
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+        if graves:
+            self._dig_id = self.after(self._BURY_GAP_MS, self._dig_graves)
+
+    # Pages worth drawing ahead of time, cheapest first. Invest is left out on
+    # purpose: its first render fetches ETF quotes, and a prewarm must not
+    # start network work the user did not ask for.
+    _PREWARM_ORDER = ("watchlist", "mirror", "exits", "stats")
+
+    def _prewarm_pages(self, queue: Optional[List[str]] = None) -> None:
+        """Render each stale page once, hidden, one page per idle slice.
+
+        One page per tick with a gap in between, so a click that arrives
+        mid-prewarm waits for at most one page, never all of them.
+        """
+        if queue is None:
+            queue = list(self._PREWARM_ORDER)
+        while queue:
+            name = queue.pop(0)
+            if name == self._active_nav or name not in self._frames:
+                continue
+            renderer = self._page_renderer(name)
+            if renderer is None:
+                continue
+            try:
+                sig = self._page_signature(name)
+                if sig is not None and self._page_sig.get(name) == sig:
+                    continue
+                renderer()
+                self._page_sig[name] = sig
+            except Exception as exc:        # noqa: BLE001
+                # A prewarm is an optimisation; the visit renders it anyway.
+                self._invalidate_page(name)
+                _crash_note("PREWARM", f"{name}: {exc!r}")
+            break
+        if queue:
+            self.after(150, lambda q=queue: self._prewarm_pages(q))
+
+    def _defer_if_hidden(self, page: str, fn) -> bool:
+        """Park `fn` until `page` is next shown, if it is not on screen now.
+        True when parked — the caller should return without drawing.
+
+        For the dashboard's own sections, which have no page renderer: they
+        were redrawn on every quote merge and every sells pull, wherever you
+        were in the app. Parked calls are keyed by function, so ten merges
+        while you are elsewhere cost one draw when you come back.
+        """
+        if self._active_nav == page or self._active_nav is None:
+            return False
+        self.__dict__.setdefault("_deferred", {}).setdefault(page, {})[
+            getattr(fn, "__name__", repr(fn))] = fn
+        return True
+
+    def _widget_hidden(self, w) -> bool:
+        """True when `w` sits on a page that is not the one on screen. False
+        for anything outside the pages (header, dialogs) and before the first
+        page is shown, so nothing ever waits on a page that does not exist."""
+        active = (self.__dict__.get("_frames") or {}).get(
+            self.__dict__.get("_active_nav") or "")
+        if active is None:
+            return False
+        page = self._page_of(w)
+        return page is not None and page is not active
+
+    def _page_hidden(self, name: str) -> bool:
+        """True when `name` is not the page on screen. With stacked pages every
+        page is mapped, so winfo_ismapped() can no longer answer this."""
+        return self._active_nav != name
+
+    def _render_or_defer(self, name: str) -> None:
+        """Render `name` now if it is on screen; otherwise just mark it stale.
+
+        Background paths (a quote merge, a batch landing, a sells pull) used to
+        render hidden pages outright — paying for a full rebuild nobody sees,
+        and without updating the page cache, so the next visit rebuilt it again.
+        Marking it stale means exactly one render, on the next visit.
+        """
+        if self._page_hidden(name):
+            self._invalidate_page(name)
+            return
+        renderer = self._page_renderer(name)
         if renderer is None:
             return
-
-        # Rebuilding a page costs real time — Positions redraws a donut and its
-        # legend, Exits builds a widget per broker per play, Analytics redraws
-        # six charts. Doing that on every visit is what made moving around feel
-        # slow, and it is pure waste when nothing underneath has changed.
-        sig = self._page_signature(name)
-        if sig is not None and self._page_sig.get(name) == sig:
-            return
-        self._page_sig[name] = sig
-        self.after(50 if name != "stats" else 100, renderer)
+        with _frozen(self._frames[name]):
+            renderer()
+            self.update_idletasks()
+        # Record what it rendered from, so the next visit can skip it.
+        self._page_sig[name] = self._page_signature(name)
 
     def _journal_version(self) -> tuple:
         """Cheap fingerprint of the trade journal — no parse.
@@ -2794,7 +3793,14 @@ class App(ctk.CTk):
                     tuple(sorted(getattr(self, "_mirror_selected_brokers", ()))),
                     len(getattr(self, "_mirror_failed", ())),
                     self._mirror_max_age_days(),
-                    len(getattr(self, "_mirror_queue", ())))
+                    len(getattr(self, "_mirror_queue", ())),
+                    # NEEDS ATTENTION drops a pick once the journal shows it
+                    # bought, or once it is dismissed — see _mirror_needs_attention.
+                    self._journal_version(),
+                    len(getattr(self, "_mirror_attention_dismissed", ())),
+                    # A run turns "interrupted" 30 min after it stalls with
+                    # nothing else changing; a 10-minute bucket lets it show.
+                    datetime.now().strftime("%Y%m%d%H") + str(datetime.now().minute // 10))
         if name == "invest":
             return ("invest", balances.version(), etf_journal.version(),
                     self._etf_symbol, self._etf_mode, self._etf_auto.get(),
@@ -2802,14 +3808,20 @@ class App(ctk.CTk):
         if name == "stats":
             # The ETF journal is in here too: Analytics carries an Investments
             # card, so a buy on the Invest page has to be able to redraw it.
+            # Today's date too: its "today" / "this week" figures roll over
+            # at midnight with no journal change to notice it by.
             return ("stats", self._journal_version(), etf_journal.version(),
-                    len(getattr(self, "_etf_quotes", ())))
-        if name == "holdings":
-            return (name, self._journal_version())
+                    len(getattr(self, "_etf_quotes", ())),
+                    date.today().isoformat())
         if name == "watchlist":
-            return ("watchlist", tuple(self._watchlist),
-                    len(self._quick_picks), self._quotes_rev,
-                    self._journal_version())
+            # The picks' CONTENT, not their count: a pick whose note or date
+            # changed (a re-alert, a conditional turning standard) leaves the
+            # count alone and used to leave the page showing the old one.
+            picks = hash(tuple((str(p.get("symbol") or ""), str(p.get("note") or ""),
+                               str(p.get("date") or ""))
+                              for p in self._quick_picks))
+            return ("watchlist", tuple(self._watchlist), picks,
+                    self._quotes_rev, self._journal_version())
         return None
 
     def _invalidate_page(self, *names: str) -> None:
@@ -2916,42 +3928,72 @@ class App(ctk.CTk):
         self._render_ticker_tape()
 
     def _render_ticker_tape(self) -> None:
+        """The quote chips under the top bar, drawn on one canvas.
+
+        This strip is on screen on every page and redrew on every quote merge
+        and pick sync — 12 chips of ~6 widgets each torn down and rebuilt in
+        view. Now it is skipped when nothing it shows changed, and drawn as
+        canvas items when something did.
+        """
         if not hasattr(self, "_tape_body"):
             return
-        for w in self._tape_body.winfo_children():
-            w.destroy()
-        shown = 0
-        for sym in self._watchlist:
+        info_by_sym: Dict[str, Dict[str, str]] = {}
+        for p in self._quick_picks:
+            sym = (p.get("symbol") or "").upper()
+            best = info_by_sym.get(sym)
+            if best is None or p.get("date", "") >= best.get("date", ""):
+                info_by_sym[sym] = p
+        chips = []
+        for sym in self._watchlist[:12]:
             q = self._quotes.get(sym)
-            # bordered chip cell — reads as instrumentation, not loose text
-            cell = tk.Frame(self._tape_body, bg=BG_SECONDARY,
-                            highlightbackground=BORDER, highlightthickness=1)
-            cell.pack(side="left", padx=(0, 8), pady=4)
-            pad = tk.Frame(cell, bg=BG_SECONDARY)
-            pad.pack(padx=9, pady=2)
-            tk.Label(pad, text=sym, bg=BG_SECONDARY, fg=TEXT_PRIMARY,
-                     font=(FONT_FAMILY, 9, "bold")).pack(side="left")
             if q:
-                tk.Label(pad, text=f"  {q['price']:,.2f}", bg=BG_SECONDARY,
-                         fg=TEXT_SECONDARY, font=(FONT_MONO, 9)).pack(side="left")
-                up = q["pct"] >= 0
-                col = GREEN if up else RED
-                tk.Label(pad, text=f"  {icon('up') if up else icon('down')}",
-                         bg=BG_SECONDARY, fg=col, font=(ICON_FONT, 7)).pack(side="left")
-                tk.Label(pad, text=f"{abs(q['pct']):.2f}%", bg=BG_SECONDARY, fg=col,
-                         font=(FONT_MONO, 9, "bold")).pack(side="left")
+                chips.append((sym, round(q["price"], 2), round(q["pct"], 2), None))
             else:
                 # RSA/OTC names often have no public quote — show the pick note tag
-                info = self._pick_info(sym)
-                note = (info or {}).get("note", "") if info else ""
+                note = (info_by_sym.get(sym) or {}).get("note", "")
+                chips.append((sym, None, None, note))
+        sig = tuple(chips)
+        cv = getattr(self, "_tape_canvas", None)
+        if cv is not None and getattr(self, "_tape_sig", None) == sig:
+            return
+        self._tape_sig = sig
+        if cv is None:
+            cv = tk.Canvas(self._tape_body, bg=BG_PRIMARY, highlightthickness=0,
+                           bd=0, height=34)
+            cv.pack(side="left", fill="both", expand=True)
+            self._tape_canvas = cv
+        cv.delete("all")
+        f_sym = (FONT_FAMILY, 9, "bold")
+        f_px = (FONT_MONO, 9)
+        f_pct = (FONT_MONO, 9, "bold")
+        f_ico = (ICON_FONT, 7)
+        f_tag = (FONT_FAMILY, 8, "bold")
+        rc = RowCanvas.measure_with(cv)
+        x = 0
+        cy = 17
+        for sym, price, pct, note in chips:
+            # bordered chip cell — reads as instrumentation, not loose text
+            parts = [(sym, f_sym, TEXT_PRIMARY)]
+            if price is not None:
+                up = pct >= 0
+                col = GREEN if up else RED
+                parts += [(f"  {price:,.2f}", f_px, TEXT_SECONDARY),
+                          (f"  {icon('up') if up else icon('down')}", f_ico, col),
+                          (f"{abs(pct):.2f}%", f_pct, col)]
+            else:
                 tag = self._NOTE_DISPLAY.get(note.lower(), note) if note else "RSA"
                 is_reg = note.lower() in ("reg alert", "alert", "early access")
-                tk.Label(pad, text=f"  {tag or 'RSA'}", bg=BG_SECONDARY,
-                         fg=ACCENT if is_reg else TEXT_MUTED,
-                         font=(FONT_FAMILY, 8, "bold")).pack(side="left")
-            shown += 1
-            if shown >= 12:
-                break
+                parts.append((f"  {tag or 'RSA'}", f_tag,
+                              ACCENT if is_reg else TEXT_MUTED))
+            wtxt = sum(rc(t, f) for t, f, _c in parts)
+            cell_w = wtxt + 2 * 9 + 2
+            cv.create_rectangle(x, cy - 12, x + cell_w, cy + 12, fill=BG_SECONDARY,
+                                outline=BORDER)
+            tx = x + 1 + 9
+            for t, f, c in parts:
+                cv.create_text(tx, cy, text=t, font=f, fill=c, anchor="w")
+                tx += rc(t, f)
+            x += cell_w + 8
 
     # ---- Live clock + quote loop ------------------------------------------
 
@@ -3023,8 +4065,9 @@ class App(ctk.CTk):
         self._check_roundup_radar(results)
         self._render_ticker_tape()
         self._render_dash_movers()
-        if self._active_nav == "watchlist":
-            self._render_watchlist()
+        # On screen: redraw and record the page signature, so the next visit
+        # does not redraw it again. Hidden: just marked stale for that visit.
+        self._render_or_defer("watchlist")
 
     def _check_roundup_radar(self, results: Dict[str, Dict[str, Any]]) -> None:
         """Reverse-split detector: an open position quoting far above our
@@ -3046,7 +4089,11 @@ class App(ctk.CTk):
                                 {"qty": 0.0, "cost": 0.0})
             d["qty"] += float(t.get("qty") or 0)
             d["cost"] += float(t["fill_price"]) * float(t.get("qty") or 0)
-        changed = False
+        # Positions that closed since they were flagged stop counting, so the
+        # persisted set cannot grow for the life of the install.
+        changed = bool(self._roundup_flagged - open_syms)
+        self._roundup_flagged &= open_syms
+        new: List[tuple] = []
         for sym, q in results.items():
             if sym not in open_syms or sym in self._roundup_flagged:
                 continue
@@ -3056,17 +4103,27 @@ class App(ctk.CTk):
             avg = d["cost"] / d["qty"]
             if avg > 0 and q["price"] >= avg * 2.5:
                 self._roundup_flagged.add(sym)
-                changed = True
-                mult = q["price"] / avg
-                self._push_notification(
-                    f"⚡ {sym} is quoting {mult:.1f}× your avg cost — reverse "
-                    f"split likely executed. Review and sell.", "warning")
-                self._log(f"Round-up radar: {sym} at {mult:.1f}× cost — "
-                          f"check & sell", "warn")
+                new.append((sym, q["price"] / avg))
+        if new:
+            changed = True
+            # ONE notification per pass, never one per position. The first
+            # quote merge after launch used to flag a dozen positions at once,
+            # and each toast is a new window: a ~4s freeze on startup, and a
+            # dozen toasts the user dismissed one by one.
+            new.sort(key=lambda sm: -sm[1])
+            names = ", ".join(f"{s} {m:.1f}×" for s, m in new[:6])
+            more = f" +{len(new) - 6} more" if len(new) > 6 else ""
+            head = (f"⚡ {new[0][0]} is quoting {new[0][1]:.1f}× your avg cost"
+                    if len(new) == 1 else
+                    f"⚡ Round-up radar: {len(new)} positions flagged — {names}{more}")
+            self._push_notification(
+                f"{head} — reverse split likely executed. Review and sell.",
+                "warning")
+            self._log(f"Round-up radar: {', '.join(f'{s} at {m:.1f}× cost' for s, m in new)}"
+                      f" — check & sell", "warn")
         if changed:
+            _save_roundup_flagged(self._roundup_flagged)
             self._render_pipeline()
-            if self._active_nav == "holdings":
-                self._render_allocation()
 
     def _sync_watchlist_from_picks(self) -> None:
         """Rebuild the watchlist/ticker from the RSA Quick Picks (the tickers we
@@ -3086,8 +4143,7 @@ class App(ctk.CTk):
         self._watchlist = new_list
         self._render_ticker_tape()
         self._render_dash_movers()
-        if self._active_nav == "watchlist":
-            self._render_watchlist()
+        self._render_or_defer("watchlist")
         if added:
             self._run_in_thread(self._quote_many_worker, added)
 
@@ -3110,8 +4166,6 @@ class App(ctk.CTk):
         self._start_quote_loop()
         if self._active_nav == "dashboard":
             self._dashboard_refresh()
-        elif self._active_nav == "holdings":
-            self._holdings_refresh()
         elif self._active_nav == "stats":
             self._refresh_stats()
         self._push_notification("Refreshing live market data", "info")
@@ -3171,19 +4225,7 @@ class App(ctk.CTk):
             tk.Label(body, text=message[:120], bg=BG_ELEVATED, fg=TEXT_PRIMARY,
                      font=(FONT_FAMILY, 9, "bold"), wraplength=300,
                      justify="left").pack(side="left", padx=(0, 16), pady=11)
-            t.update_idletasks()
-            # withdrawn windows report winfo_width()==1, so use the requested size
-            w, h = t.winfo_reqwidth(), t.winfo_reqheight()
-            stack = sum(tt.winfo_reqheight() + 10 for tt in self._toasts
-                        if tt.winfo_exists())
-            x = self.winfo_rootx() + self.winfo_width() - w - 26
-            y = self.winfo_rooty() + self.winfo_height() - h - 26 - stack
-            t.geometry(f"{w}x{h}+{x}+{y}")
-            try:
-                t.attributes("-alpha", 0.0)
-            except Exception:
-                pass
-            t.deiconify()
+            others = list(self._toasts)
 
             def _fade(step: int = 0) -> None:
                 try:
@@ -3192,7 +4234,40 @@ class App(ctk.CTk):
                         t.after(18, _fade, step + 1)
                 except Exception:
                     pass
-            _fade()
+
+            # Placed from a short timer rather than after t.update_idletasks().
+            # That call is not local to the toast: it runs the WHOLE app's
+            # pending idle work -- every layout and redraw queued anywhere --
+            # right here, synchronously. A dozen toasts in one tick (the round-
+            # up radar at launch) made it a multi-second freeze. Tk works out
+            # the toast's size in idle callbacks of its own, level by level
+            # (the label, then the body, then the window), so this looks again
+            # every few ms until the size is real -- a bare after_idle ran
+            # between those levels and placed a 3x3 toast.
+            def _place(tries: int = 0) -> None:
+                try:
+                    if not t.winfo_exists():
+                        return
+                    # withdrawn windows report winfo_width()==1, so use the
+                    # requested size
+                    w, h = t.winfo_reqwidth(), t.winfo_reqheight()
+                    if (w < 40 or h < 20) and tries < 40:
+                        t.after(5, _place, tries + 1)
+                        return
+                    stack = sum(tt.winfo_reqheight() + 10 for tt in others
+                                if tt.winfo_exists())
+                    x = self.winfo_rootx() + self.winfo_width() - w - 26
+                    y = self.winfo_rooty() + self.winfo_height() - h - 26 - stack
+                    t.geometry(f"{w}x{h}+{x}+{y}")
+                    try:
+                        t.attributes("-alpha", 0.0)
+                    except Exception:
+                        pass
+                    t.deiconify()
+                    _fade()
+                except Exception:
+                    pass
+            t.after(1, _place)
             self._toasts.append(t)
             t.bind("<Button-1>", lambda e: t.destroy())
 
@@ -3452,10 +4527,22 @@ class App(ctk.CTk):
         inner = tk.Frame(canvas, bg=BG_PRIMARY)
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        _bind_scrollregion(canvas, inner)
         self._attach_wheel(canvas, outer)
         return outer, inner
+
+    def _page_of(self, w):
+        """The page frame `w` lives on, or None (header, popups, dialogs)."""
+        content = getattr(self, "_content", None)
+        try:
+            while w is not None:
+                parent = getattr(w, "master", None)
+                if parent is content:
+                    return w
+                w = parent
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _pointer_in(w) -> bool:
@@ -3500,11 +4587,17 @@ class App(ctk.CTk):
         did anything at all.
 
         So bind once, for the life of the window, and ask at wheel time
-        whether the pointer is inside the region. Pages that are packed away
-        are unmapped and answer no, which is what keeps several scrollers
+        whether the pointer is inside the region, and whether the region's
+        page is the one on screen — which is what keeps several scrollers
         from fighting over one wheel.
         """
         def _wheel(e):
+            # Stacked pages are ALL mapped, and a hidden page's scroller would
+            # still answer the rectangle fallback in _pointer_in — so a region
+            # that lives on a page only scrolls while that page is up.
+            page = self._page_of(region)
+            if page is not None and page is not self._frames.get(self._active_nav):
+                return None
             if not self._pointer_in(region):
                 return None
             canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
@@ -3556,73 +4649,6 @@ class App(ctk.CTk):
                  wraplength=480, justify="center").pack(pady=(3, pad))
         return box
 
-    def _bind_row_click(self, row: tk.Frame, handler) -> None:
-        """Make a whole row clickable, including its labels.
-
-        Skips any widget that already has its own <Button-1> — the action chips
-        ("Top up", "Mark done") must keep their handler, and binding with add
-        would fire both, so a click meant to expand a row would also buy.
-        """
-        def _walk(w) -> None:
-            if w.__class__.__module__.startswith("customtkinter"):
-                return
-            try:
-                if not w.bind("<Button-1>"):
-                    w.bind("<Button-1>", handler)
-                    w.configure(cursor="hand2")
-            except Exception:
-                pass
-            for ch in w.winfo_children():
-                _walk(ch)
-        _walk(row)
-
-    def _bind_row_hover(self, row: tk.Frame, base: str, hover: str) -> None:
-        """Repaint a flat row's matching-bg widgets on pointer enter/leave.
-        Only widgets whose bg equals the row surface are touched, so badges,
-        stripes and CTk children keep their own colors."""
-        def _paint(col: str) -> None:
-            def walk(w) -> None:
-                if w.__class__.__module__.startswith("customtkinter"):
-                    return
-                try:
-                    if str(w.cget("bg")) in (base, hover):
-                        w.configure(bg=col)
-                except Exception:
-                    pass
-                for ch in w.winfo_children():
-                    walk(ch)
-            walk(row)
-
-        def _on_leave(_e) -> None:
-            try:
-                x, y = row.winfo_pointerxy()
-                rx, ry = row.winfo_rootx(), row.winfo_rooty()
-                inside = (rx <= x < rx + row.winfo_width()
-                          and ry <= y < ry + row.winfo_height())
-            except Exception:
-                inside = False
-            if not inside:
-                _paint(base)
-
-        # Bound on the row ONLY, not on every descendant.
-        #
-        # Tk sends crossing events to the ancestor chain, so entering any child
-        # from outside still fires <Enter> here (NotifyVirtual/NotifyInferior),
-        # and moving between children inside the row fires nothing — which is
-        # exactly the behaviour wanted. Leaving for a child would also fire
-        # <Leave>, and that is precisely what the pointer-position check in
-        # `_on_leave` above is for: it repaints only once the pointer is really
-        # outside the row.
-        #
-        # Binding the whole subtree instead put an <Enter> and a <Leave> on all
-        # ~18 widgets of every row. Each binding is a Tcl command that has to be
-        # registered on create and individually deleted on destroy, and these
-        # lists are torn down and rebuilt wholesale on every render — which made
-        # widget *destruction* 82% of the Watchlist's render cost. A 79-pick
-        # feed was paying for ~2,800 bindings it did not need.
-        row.bind("<Enter>", lambda e: _paint(hover), add="+")
-        row.bind("<Leave>", _on_leave, add="+")
-
     # ---- Watchlist --------------------------------------------------------
 
     def _build_watchlist(self) -> None:
@@ -3654,8 +4680,8 @@ class App(ctk.CTk):
         if not hasattr(self, "_wl_list"):
             return
         if not self._watchlist:
-            for w in self._wl_list.winfo_children():
-                w.destroy()
+            self._bury(*self._wl_list.winfo_children())
+            self._wl_canvas = None
             self._empty_state(
                 self._wl_list, "watchlist", "No picks on the radar yet",
                 "Your RSA picks appear here automatically once they sync — "
@@ -3663,118 +4689,166 @@ class App(ctk.CTk):
             self._wl_sig = None
             return
         purchased = {s for (s, d) in self._get_purchased_pick_set(self._quick_picks)}
+        # One pass over the picks, not one per row: _pick_info scanned the
+        # whole feed for every symbol, twice per render.
+        info_by_sym: Dict[str, Dict[str, str]] = {}
+        for p in self._quick_picks:
+            sym = (p.get("symbol") or "").upper()
+            best = info_by_sym.get(sym)
+            if best is None or p.get("date", "") >= best.get("date", ""):
+                info_by_sym[sym] = p
 
-        # Skip the rebuild when every value on screen would come out identical.
+        # Skip the redraw when every value on screen would come out identical.
         #
-        # A row is ~18 widgets, so a 79-pick feed tears down and recreates ~1,460
-        # of them per render — and Tk widget teardown, not creation, was the
-        # single most expensive thing this page did. Meanwhile the page is
-        # re-rendered on every visit and on every quote merge, and most of those
-        # renders produce pixel-identical output: OTC names have no quote to
-        # move, and switching tabs changes nothing at all.
+        # The page is re-rendered on every visit and on every quote merge, and
+        # most of those renders produce pixel-identical output: OTC names have
+        # no quote to move, and switching tabs changes nothing at all.
         #
         # The signature covers exactly what a row draws, so anything that would
         # actually look different still redraws. Prices are rounded to the two
         # decimals they are displayed at — a sub-cent tick is not a visible
-        # change and must not cost a full rebuild.
+        # change and must not cost a redraw.
         sig = tuple(
             (sym,
              sym in purchased,
              sym in self._pick_symbols,
              (lambda i: (i.get("note", ""), i.get("date", "")) if i else None)(
-                 self._pick_info(sym)),
+                 info_by_sym.get(sym)),
              (lambda q: (round(q["price"], 2), round(q["change"], 2),
                          round(q["pct"], 2), len(q.get("spark") or ()))
               if q else None)(self._quotes.get(sym)))
             for sym in self._watchlist)
-        if (getattr(self, "_wl_sig", None) == sig
-                and self._wl_list.winfo_children()):
+        rc = getattr(self, "_wl_canvas", None)
+        if getattr(self, "_wl_sig", None) == sig and rc is not None:
             return
         self._wl_sig = sig
 
-        for w in self._wl_list.winfo_children():
-            w.destroy()
-        reg_notes = ("reg alert", "alert", "early access")
-        # Flat rows (tk.Frame, no per-row CTk canvas) keep a 39-row list snappy.
-        for sym in self._watchlist:
-            q = self._quotes.get(sym)
-            info = self._pick_info(sym)
-            is_pick = sym in self._pick_symbols
-            is_bought = sym in purchased
-            is_reg = bool(info) and info.get("note", "").lower() in reg_notes
+        if rc is None:
+            # First draw, or coming back from the empty state.
+            self._bury(*self._wl_list.winfo_children())
+            rc = RowCanvas(self._wl_list, bg=BG_PRIMARY)
+            rc.pack(fill="x")
+            self._wl_canvas = rc
+        # Drawn on one canvas: a row used to be ~18 widgets, so a 118-pick feed
+        # was ~2,100 child windows to map, repaint and tear down — the single
+        # most expensive thing this page did. See modules/canvas_rows.
+        rc.set_rows([self._wl_row_recipe(sym, self._quotes.get(sym),
+                                         info_by_sym.get(sym),
+                                         sym in self._pick_symbols,
+                                         sym in purchased)
+                     for sym in self._watchlist])
 
-            row = tk.Frame(self._wl_list, bg=BG_CARD)
-            row.pack(fill="x", pady=(0, 6))
-            tk.Frame(row, bg=ACCENT if is_reg else BORDER, width=3).pack(
-                side="left", fill="y")
-            body = tk.Frame(row, bg=BG_CARD)
-            body.pack(side="left", fill="x", expand=True, padx=16, pady=12)
+    _WF_SYM = (FONT_FAMILY, 16, "bold")
+    _WF_BADGE = (FONT_FAMILY, 8, "bold")
+    _WF_META = (FONT_FAMILY, 8)
+    _WF_PRICE = (FONT_MONO, 16, "bold")
+    _WF_CHG = (FONT_MONO, 9, "bold")
+    _WF_NOQ = (FONT_FAMILY, 9)
+    _WF_BTN = (FONT_FAMILY, 9, "bold")
+
+    def _wl_row_recipe(self, sym: str, q: Optional[Dict[str, Any]],
+                       info: Optional[Dict[str, str]], is_pick: bool,
+                       is_bought: bool):
+        reg_notes = ("reg alert", "alert", "early access")
+        is_reg = bool(info) and info.get("note", "").lower() in reg_notes
+
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            left_h = rc.line_height(self._WF_SYM) + 2 + rc.line_height(self._WF_BADGE)
+            price_h = rc.line_height(self._WF_PRICE) + rc.line_height(self._WF_CHG)
+            content_h = max(left_h, price_h if q else 0, 36)
+            h = 12 + content_h + 12
+            cy = y + h / 2
+            row_tag = rc.new_tag()
+            bg = rc.rect(0, y, w, y + h, BG_CARD, tags=(row_tag,))
+            rc.rect(0, y, 3, y + h, ACCENT if is_reg else BORDER, tags=(row_tag,))
+            rc.on_hover(row_tag, [bg], BG_CARD, BG_CARD_ALT)
+            tags = (row_tag,)
 
             # left: symbol + RSA note / date / purchased badge
-            left = tk.Frame(body, bg=BG_CARD)
-            left.pack(side="left")
-            sym_row = tk.Frame(left, bg=BG_CARD)
-            sym_row.pack(anchor="w")
-            tk.Label(sym_row, text=sym, bg=BG_CARD, fg=TEXT_PRIMARY,
-                     font=(FONT_FAMILY, 16, "bold")).pack(side="left")
+            x = 3 + 16
+            top = cy - left_h / 2
+            sy = top + rc.line_height(self._WF_SYM) / 2
+            x2 = rc.text_run(x, sy, [(sym, self._WF_SYM, TEXT_PRIMARY)], tags=tags)
             if is_bought:
-                badge = tk.Frame(sym_row, bg=GREEN_SOFT)
-                badge.pack(side="left", padx=(8, 0))
-                tk.Label(badge, text=f" {icon('check')} Bought ", bg=GREEN_SOFT,
-                         fg=GREEN, font=(FONT_FAMILY, 8, "bold")).pack()
-            meta = tk.Frame(left, bg=BG_CARD)
-            meta.pack(anchor="w", pady=(2, 0))
+                rc.pill(x2 + 8, sy, f" {icon('check')} Bought ", self._WF_BADGE,
+                        GREEN_SOFT, GREEN, padx=0, pady=0, tags=tags)
+            my = top + rc.line_height(self._WF_SYM) + 2 + rc.line_height(self._WF_BADGE) / 2
             if info:
                 note = info.get("note", "")
                 disp = self._NOTE_DISPLAY.get(note.lower(), note) if note else "RSA pick"
-                ncol = ACCENT if is_reg else TEXT_SECONDARY
-                tk.Label(meta, text=disp or "RSA pick", bg=BG_CARD, fg=ncol,
-                         font=(FONT_FAMILY, 8, "bold")).pack(side="left")
                 d = info.get("date", "")
-                if d:
-                    tk.Label(meta, text=f"   ·   {d}", bg=BG_CARD, fg=TEXT_MUTED,
-                             font=(FONT_FAMILY, 8)).pack(side="left")
+                rc.text_run(x, my, [
+                    (disp or "RSA pick", self._WF_BADGE, ACCENT if is_reg else TEXT_SECONDARY),
+                    (f"   ·   {d}" if d else "", self._WF_META, TEXT_MUTED)], tags=tags)
             else:
-                tk.Label(meta, text="Tracked", bg=BG_CARD, fg=TEXT_MUTED,
-                         font=(FONT_FAMILY, 8)).pack(side="left")
+                rc.text_run(x, my, [("Tracked", self._WF_META, TEXT_MUTED)], tags=tags)
 
-            # right: actions
-            act = tk.Frame(body, bg=BG_CARD)
-            act.pack(side="right")
+            # right: actions. FIXED columns from here in: the quote block and
+            # the sparkline sit at the same x on every row, whatever the price
+            # string's width and whether the row has a delete icon. They used
+            # to be laid out right-to-left from whatever was drawn last, so the
+            # sparklines zig-zagged down the page.
+            x0, _ = rc.pill(w - 16, cy, "Buy 1", self._WF_BTN, ACCENT, TEXT_PRIMARY,
+                            padx=10, pady=5, anchor="e", tags=tags,
+                            hover_bg=ACCENT_HOVER,
+                            on_click=lambda s=sym: self._palette_trade(s))
+            del_w = rc.measure(icon("delete"), (ICON_FONT, 12))
             if not is_pick:  # only manually-pinned extras can be removed
-                rm = tk.Label(act, text=icon("delete"), bg=BG_CARD, fg=TEXT_MUTED,
-                              font=(ICON_FONT, 12), cursor="hand2")
-                rm.pack(side="right", padx=(16, 0))
-                rm.bind("<Button-1>", lambda e, s=sym: self._remove_watchlist_symbol(s))
-            FlatPillButton(act, text="Buy 1",
-                           command=lambda s=sym: self._palette_trade(s),
-                           font_size=9).pack(side="right")
+                rc.link(x0 - 14, cy, icon("delete"), (ICON_FONT, 12),
+                        TEXT_MUTED, TEXT_PRIMARY, anchor="e", tags=tags,
+                        on_click=lambda s=sym: self._remove_watchlist_symbol(s))
+            right = x0 - 14 - del_w - 26          # the slot is reserved either way
+            price_col = max(rc.measure("$00,000.00", self._WF_PRICE),
+                            rc.measure(" +000.00 (+000.00%)", self._WF_CHG)
+                            + rc.measure(icon("up"), (ICON_FONT, 8)))
+            spark_x = right - price_col - 26 - 96
 
             # quote + change (many RSA/OTC names have no public quote)
             if q:
-                pcol = GREEN if q["pct"] >= 0 else RED
-                pr = tk.Frame(body, bg=BG_CARD)
-                pr.pack(side="right", padx=(0, 30))
-                tk.Label(pr, text=f"${q['price']:,.2f}", bg=BG_CARD, fg=TEXT_PRIMARY,
-                         font=(FONT_MONO, 16, "bold")).pack(anchor="e")
-                chg = tk.Frame(pr, bg=BG_CARD)
-                chg.pack(anchor="e")
-                tk.Label(chg, text=icon("up") if q["pct"] >= 0 else icon("down"),
-                         bg=BG_CARD, fg=pcol, font=(ICON_FONT, 8)).pack(side="left")
-                tk.Label(chg, text=f" {q['change']:+.2f} ({q['pct']:+.2f}%)",
-                         bg=BG_CARD, fg=pcol, font=(FONT_MONO, 9, "bold")).pack(side="left")
+                up = q["pct"] >= 0
+                pcol = GREEN if up else RED
+                ptop = cy - price_h / 2
+                rc.text(right, ptop + rc.line_height(self._WF_PRICE) / 2,
+                        f"${q['price']:,.2f}", self._WF_PRICE, TEXT_PRIMARY,
+                        anchor="e", tags=tags)
+                chg = f" {q['change']:+.2f} ({q['pct']:+.2f}%)"
+                chy = ptop + rc.line_height(self._WF_PRICE) + rc.line_height(self._WF_CHG) / 2
+                rc.text(right, chy, chg, self._WF_CHG, pcol, anchor="e", tags=tags)
+                rc.text(right - rc.measure(chg, self._WF_CHG), chy,
+                        icon("up") if up else icon("down"), (ICON_FONT, 8), pcol,
+                        anchor="e", tags=tags)
+                # intraday sparkline (only names Yahoo actually quotes)
+                spark = list(q.get("spark") or [])
+                if len(spark) >= 2 and spark_x > x + 160:
+                    self._draw_spark_items(rc, spark_x, cy - 15, 96, 30, spark,
+                                           pcol, tags)
             else:
-                tk.Label(body, text="no public quote", bg=BG_CARD, fg=TEXT_MUTED,
-                         font=(FONT_FAMILY, 9)).pack(side="right", padx=(0, 30))
+                rc.text(right, cy, "no public quote", self._WF_NOQ, TEXT_MUTED,
+                        anchor="e", tags=tags)
+            return h + 6
+        return draw
 
-            # intraday sparkline (only names Yahoo actually quotes)
-            if q and len(q.get("spark") or []) >= 2:
-                sc = tk.Canvas(body, bg=BG_CARD, width=96, height=30,
-                               highlightthickness=0, bd=0)
-                sc.pack(side="right", padx=(0, 26), pady=3)
-                self._draw_sparkline(sc, list(q["spark"]),
-                                     GREEN if q["pct"] >= 0 else RED)
-            self._bind_row_hover(row, BG_CARD, BG_CARD_ALT)
+    @staticmethod
+    def _draw_spark_items(rc, x0: float, y0: float, w: int, h: int, data: list,
+                          color: str, tags=()) -> None:
+        """An intraday sparkline (filled area + line) drawn as items at (x0, y0)."""
+        try:
+            pad = 4
+            lo, hi = min(data), max(data)
+            rng = (hi - lo) or 1.0
+            n = len(data)
+            pts = []
+            for i, v in enumerate(data):
+                x = x0 + pad + (w - 2 * pad) * i / (n - 1)
+                y = y0 + (h - pad) - (h - 2 * pad) * (v - lo) / rng
+                pts.append((x, y))
+            poly = ([x0 + pad, y0 + h - pad] + [c for p in pts for c in p]
+                    + [x0 + w - pad, y0 + h - pad])
+            rc.create_polygon(poly, fill=_blend(color, BG_CARD, 0.82), outline="",
+                              tags=tags)
+            rc.create_line([c for p in pts for c in p], fill=color, width=2, tags=tags)
+        except Exception:
+            pass
 
     def _add_watchlist_symbol(self, raw: str) -> None:
         sym = (raw or "").strip().upper()
@@ -3808,28 +4882,6 @@ class App(ctk.CTk):
         self._render_watchlist()
         self._render_ticker_tape()
         self._log(f"Watchlist: removed {sym}")
-
-    def _draw_sparkline(self, canvas: tk.Canvas, data: list, color: str) -> None:
-        try:
-            canvas.delete("all")
-            w = int(canvas.cget("width")) or canvas.winfo_width()
-            h = int(canvas.cget("height")) or canvas.winfo_height()
-            pad = 4
-            lo, hi = min(data), max(data)
-            rng = (hi - lo) or 1.0
-            n = len(data)
-            pts = []
-            for i, v in enumerate(data):
-                x = pad + (w - 2 * pad) * i / (n - 1)
-                y = (h - pad) - (h - 2 * pad) * (v - lo) / rng
-                pts.append((x, y))
-            fill = _blend(color, BG_CARD, 0.82)
-            poly = [pad, h - pad] + [c for p in pts for c in p] + [w - pad, h - pad]
-            canvas.create_polygon(poly, fill=fill, outline="")
-            flat = [c for p in pts for c in p]
-            canvas.create_line(flat, fill=color, width=2)
-        except Exception:
-            pass
 
     # ---- CSV export -------------------------------------------------------
 
@@ -3903,6 +4955,7 @@ class App(ctk.CTk):
     def _log(self, msg: str, tag: Optional[str] = None) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         self._log_lines.append((f"{ts}  {msg}", tag))
+        _activity_note(f"{ts}  {msg}")
         if len(self._log_lines) > self.LOG_MAX_LINES:
             # Trim in one slice rather than popping per line.
             del self._log_lines[:len(self._log_lines) - self.LOG_MAX_LINES]
@@ -3979,8 +5032,10 @@ class App(ctk.CTk):
         """Top movers panel on the dashboard, driven by live watchlist quotes."""
         if not hasattr(self, "_dash_movers"):
             return
-        for w in self._dash_movers.winfo_children():
-            w.destroy()
+        # Every 45s quote merge asks for this; nobody sees it off the dashboard.
+        if self._defer_if_hidden("dashboard", self._render_dash_movers):
+            return
+        self._bury(*self._dash_movers.winfo_children())
         quotes = [self._quotes[s] for s in self._watchlist if s in self._quotes]
         quotes.sort(key=lambda q: abs(q.get("pct", 0.0)), reverse=True)
         if not quotes:
@@ -4013,9 +5068,7 @@ class App(ctk.CTk):
         frame = tk.Frame(canvas, bg=BG_PRIMARY)
         win_id = canvas.create_window((0, 0), window=frame, anchor="nw")
 
-        def _on_configure(e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        frame.bind("<Configure>", _on_configure)
+        _bind_scrollregion(canvas, frame)
 
         def _on_canvas_configure(e):
             canvas.itemconfig(win_id, width=e.width)
@@ -4176,7 +5229,7 @@ class App(ctk.CTk):
                 continue
 
             n = _KNOWN_ACCOUNT_COUNTS.get(broker)
-            status_text = f"{n} account(s)" if n else "credentials set"
+            status_text = f"{_plural(n, 'account')}" if n else "credentials set"
             self._broker_status_labels[broker] = _status_row(broker.capitalize(), status_text)
 
         # ---- Custom Accounts card ----
@@ -4208,6 +5261,15 @@ class App(ctk.CTk):
         self._picks_tab_active = "picks"  # "picks", "partial" or "purchased"
         # (SYMBOL, date) rows showing their missing-account breakdown.
         self._pick_expanded: set = set()
+        # Partial/Purchased tabs showing picks older than PICK_TAB_RECENT_DAYS.
+        self._picks_show_older: set = set()
+        # tab -> what it was last drawn from; an identical redraw is skipped.
+        self._pick_tab_sig: Dict[str, Any] = {}
+        # tab -> the pick lists it draws (set by _render_quick_picks).
+        self._pick_tab_lists: Dict[str, list] = {}
+        # tab -> the RowCanvas its rows are drawn on, so a detail toggle can
+        # redraw the list in place instead of rebuilding all three tabs.
+        self._pick_canvases: Dict[str, RowCanvas] = {}
 
         tk.Label(picks_header, text=icon("starfill"), bg=BG_CARD, fg=ACCENT,
                  font=(ICON_FONT, 12)).pack(side="left", padx=(0, 8))
@@ -4242,6 +5304,7 @@ class App(ctk.CTk):
         # (no nested canvas, which was the source of the scroll lag).
         picks_body = tk.Frame(picks_card.inner, bg=BG_CARD)
         picks_body.pack(fill="x", padx=20, pady=(0, 16))
+        self._picks_body = picks_body
         self._picks_grid = tk.Frame(picks_body, bg=BG_CARD)
         self._picks_grid.pack(fill="x")
         # hidden until their tab is selected
@@ -4380,9 +5443,11 @@ class App(ctk.CTk):
                  "closed": getattr(self, "_sell_closed_grid", None)}
         if grids["now"] is None:
             return
+        if self._defer_if_hidden("dashboard", self._render_sell_alerts):
+            return
+        # Old rows are unmapped now and destroyed in idle slices (see _bury).
         for g in grids.values():
-            for w in g.winfo_children():
-                w.destroy()
+            self._bury(*g.winfo_children())
 
         sells = _load_sells()
         if not sells:
@@ -4406,9 +5471,9 @@ class App(ctk.CTk):
         ready_cash = sum(p.ready_value for p in buckets["now"])
         ready_sh = sum(l.left for p in buckets["now"] for l in p.of(SELL_NOW))
         self._sell_count_lbl.configure(
-            text=(f"{_qty_text(ready_sh)} share(s) ready  -  ~${ready_cash:,.2f}"
+            text=(f"{_plural(_qty_text(ready_sh), 'share')} ready  -  ~${ready_cash:,.2f}"
                   if ready_sh else
-                  f"{len(sells)} exit(s) in the last {SELL_MAX_AGE_DAYS} days"))
+                  f"{_plural(len(sells), 'exit')} in the last {SELL_MAX_AGE_DAYS} days"))
 
         for lbl, key, word in ((self._sells_tab_lbl, "now", "Sell now"),
                                (self._sells_holding_lbl, "holding", "Holding"),
@@ -4430,27 +5495,53 @@ class App(ctk.CTk):
                        if hidden_closed else
                        "A play moves here once you are out of it everywhere."),
         }
+        status_map = self._board_status_map()
         for name, rows in buckets.items():
+            # One canvas per tab — see modules/canvas_rows for why rows are
+            # drawn rather than built out of widgets.
+            recipes: list = []
             if name == "closed" and (rows or hidden_closed):
-                self._closed_actions(grids[name], rows, hidden_closed, bg=BG_CARD)
+                recipes.append(self._closed_actions_recipe(rows, hidden_closed,
+                                                           bg=BG_CARD))
             if rows:
                 for play in rows[:SELL_ALERTS_SHOWN]:
-                    self._sell_play_card(grids[name], play,
-                                         closed=(name == "closed"))
+                    recipes.append(self._sell_play_recipe(
+                        play, status_map, closed=(name == "closed")))
                 if len(rows) > SELL_ALERTS_SHOWN:
-                    tk.Label(grids[name],
-                             text=f"+{len(rows) - SELL_ALERTS_SHOWN} more - the "
-                                  f"Exits tab has the full board",
-                             bg=BG_CARD, fg=TEXT_MUTED,
-                             font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(10, 0))
-            else:
+                    recipes.append(self._note_recipe(
+                        f"+{len(rows) - SELL_ALERTS_SHOWN} more - the "
+                        f"Exits tab has the full board", pady_top=10))
+            if recipes:
+                rc = RowCanvas(grids[name], bg=BG_CARD)
+                rc.pack(fill="x")
+                rc.set_rows(recipes)
+            if not rows:
                 title, body = empties[name]
                 self._empty_state(grids[name], "check", title, body,
                                   bg=BG_CARD, pad=14).pack(fill="x")
 
         self._switch_sells_tab(getattr(self, "_sells_tab_active", "now"))
 
-    def _sell_play_card(self, parent, play, task=None, closed=False) -> None:
+    _SF_SYM = (FONT_FAMILY, 13, "bold")
+    _SF_MONO = (FONT_MONO, 9)
+    _SF_CHIP = (FONT_FAMILY, 7, "bold")
+    _SF_BODY = (FONT_FAMILY, 9)
+    _SF_LEG = (FONT_FAMILY, 10, "bold")
+    _SF_SMALL = (FONT_FAMILY, 8)
+    _SF_SMALLB = (FONT_FAMILY, 8, "bold")
+    _SF_BTN = (FONT_FAMILY, 9, "bold")
+    _SF_TINY = (FONT_FAMILY, 7)
+
+    def _note_recipe(self, text: str, pady_top: int = 0, bg: Optional[str] = None):
+        """A muted one-line note (the "+N more" under a capped board)."""
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            lh = rc.line_height(self._SF_SMALL)
+            rc.text(0, y + pady_top + lh / 2, text, self._SF_SMALL, TEXT_MUTED)
+            return pady_top + lh
+        return draw
+
+    def _sell_play_recipe(self, play, status_map: Dict[str, str], task=None,
+                          closed: bool = False):
         """One play: a headline, then a line per brokerage state.
 
         `task` is the SellTask for this play when the caller wants the
@@ -4462,32 +5553,17 @@ class App(ctk.CTk):
         `closed` adds the Confirm control. Both boards pass it for the closed
         bucket and nowhere else: a play you still hold must not be dismissable,
         or a live position disappears off the only page that lists it.
+
+        Drawn, not built: same layout the widget card had, as canvas items.
         """
         row_bg = BG_INPUT
         ready = play.of(SELL_NOW)
-        card = tk.Frame(parent, bg=row_bg)
-        card.pack(fill="x", pady=(0, 6))
         stripe = (RED if ready else YELLOW if play.left
                   else GREEN if play.bought > 1e-9 else BORDER_LIGHT)
-        tk.Frame(card, bg=stripe, width=3).pack(side="left", fill="y")
-        inner = tk.Frame(card, bg=row_bg)
-        inner.pack(side="left", fill="x", expand=True, padx=(12, 14), pady=9)
-
-        head = tk.Frame(inner, bg=row_bg)
-        head.pack(fill="x")
-        tk.Label(head, text=play.symbol, bg=row_bg, fg=TEXT_PRIMARY,
-                 font=(FONT_FAMILY, 13, "bold")).pack(side="left")
-        if play.exit_price is not None:
-            px = f"  @ ${float(play.exit_price):,.4f}".rstrip("0").rstrip(".")
-            tk.Label(head, text=px, bg=row_bg, fg=TEXT_SECONDARY,
-                     font=(FONT_MONO, 9)).pack(side="left")
-        status = self._board_status_map().get(play.symbol, "")
+        status = status_map.get(play.symbol, "")
         chip_text, chip_col = self._SELL_STATUS_CHIP.get(
             status, ("NOT ON THE BOARD", TEXT_MUTED) if not status
             else (status.replace("_", " ").upper(), TEXT_MUTED))
-        tk.Label(head, text=f" {chip_text} ", bg=_blend(chip_col, row_bg, 0.86),
-                 fg=chip_col, font=(FONT_FAMILY, 7, "bold"), pady=1).pack(
-                     side="left", padx=(8, 0))
         # Shares, always. Counting accounts is what told you LBGJ was "3/3
         # sold" while three shares were still sitting at Robinhood.
         if play.bought <= 1e-9:
@@ -4500,140 +5576,153 @@ class App(ctk.CTk):
             summary_fg = TEXT_SECONDARY
         else:
             summary, summary_fg = f"all {_qty_text(play.bought)} shares sold", GREEN
-        tk.Label(head, text=summary, bg=row_bg, fg=summary_fg,
-                 font=(FONT_FAMILY, 9)).pack(side="right")
-
-        for leg in ready:
-            line = tk.Frame(inner, bg=row_bg)
-            line.pack(fill="x", pady=(6, 0))
-            tk.Label(line, text="●", bg=row_bg, fg=RED,
-                     font=(FONT_FAMILY, 9)).pack(side="left", padx=(2, 7))
-            tk.Label(line, text=leg.label, bg=row_bg, fg=TEXT_PRIMARY,
-                     font=(FONT_FAMILY, 10, "bold")).pack(side="left")
-            tk.Label(line, text=f"   {_qty_text(leg.left)} sh", bg=row_bg,
-                     fg=TEXT_SECONDARY, font=(FONT_MONO, 9)).pack(side="left")
-            if leg.sold:
-                tk.Label(line, text=f"   ({_qty_text(leg.sold)} already sold)",
-                         bg=row_bg, fg=TEXT_MUTED,
-                         font=(FONT_FAMILY, 8)).pack(side="left")
-            act = tk.Label(line, text=f"Sell {_qty_text(leg.left)} →",
-                           bg=_blend(RED, row_bg, 0.82), fg=RED,
-                           font=(FONT_FAMILY, 9, "bold"), padx=10, pady=3,
-                           cursor="hand2")
-            act.pack(side="right")
-            act.bind("<Button-1>",
-                     lambda e, sy=play.symbol, k=[leg.broker]:
-                     self._sell_alert_trade(sy, k))
-            # Queue THIS brokerage on its own. Orders at one broker have to run
-            # one at a time anyway — they share a browser profile — so lining
-            # them up is the only way to ask for several without sitting and
-            # watching each one finish before clicking the next.
-            q = tk.Label(line, text="Queue", bg=row_bg, fg=ACCENT,
-                         font=(FONT_FAMILY, 8, "bold"), padx=8, pady=3,
-                         cursor="hand2")
-            q.pack(side="right", padx=(0, 8))
-            q.bind("<Button-1>",
-                   lambda e, pl=play, lg=leg: self._queue_sell_leg(pl, lg))
-            q.bind("<Enter>", lambda e, w=q: w.configure(fg=TEXT_PRIMARY))
-            q.bind("<Leave>", lambda e, w=q: w.configure(fg=ACCENT))
-            # The escape hatch, on every sellable leg rather than only the
-            # rejected ones: a leg the desk has never been pointed at is
-            # exactly as stuck when you already sold it by hand, and it is the
-            # rejected ones that prove the position can be gone without the
-            # journal hearing about it.
-            fix = tk.Label(line, text="Resolve", bg=row_bg, fg=TEXT_MUTED,
-                           font=(FONT_FAMILY, 8, "bold"), padx=8, pady=3,
-                           cursor="hand2")
-            fix.pack(side="right", padx=(0, 8))
-            fix.bind("<Button-1>",
-                     lambda e, pl=play, lg=leg: self._resolve_sell_leg(pl, lg))
-            fix.bind("<Enter>", lambda e, w=fix: w.configure(fg=TEXT_PRIMARY))
-            fix.bind("<Leave>", lambda e, w=fix: w.configure(fg=TEXT_MUTED))
-            if leg.failed_accounts:
-                # The only thing worse than an exit you missed is one you think
-                # you took. Fidelity has rejected ONFO ten times.
-                tk.Label(line,
-                         text=f"  {icon('warning')} rejected {leg.failed_accounts}x",
-                         bg=row_bg, fg=YELLOW,
-                         font=(FONT_FAMILY, 8, "bold")).pack(side="right",
-                                                             padx=(0, 10))
-        for leg in ready:
-            if leg.fail_reason:
-                tk.Label(inner, text=f"      {leg.label}: {leg.fail_reason}",
-                         bg=row_bg, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
-                         justify="left", wraplength=740).pack(anchor="w")
-
         waiting = play.of(SELL_WAIT)
-        if waiting:
-            where = "  ".join(f"{l.label} {_qty_text(l.left)}" for l in waiting)
-            tk.Label(inner, text=f"○  holding, no exit called yet:  {where}",
-                     bg=row_bg, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
-                     justify="left", wraplength=740).pack(anchor="w", pady=(6, 0))
-        done = play.of(SELL_DONE)
-        if done:
-            where = "  ".join(f"{l.label} {_qty_text(l.sold)}" for l in done)
-            tk.Label(inner, text=f"{icon('check')}  sold:  {where}",
-                     bg=row_bg, fg=GREEN, font=(FONT_FAMILY, 8),
-                     justify="left", wraplength=740).pack(anchor="w", pady=(4, 0))
-        # Last, because it is context rather than a position: the exit that WAS
-        # called, at a brokerage holding none of it. Without this the card
-        # showed only "holding, no exit called yet" and flatly contradicted the
-        # feed the exit was read from.
+        done_legs = play.of(SELL_DONE)
         missed = play.of(SELL_NONE)
-        if missed:
-            where = "  ".join(l.label for l in missed)
-            tk.Label(inner,
-                     text=f"–  exit called at {where}, but you hold none there",
-                     bg=row_bg, fg=TEXT_SECONDARY, font=(FONT_FAMILY, 8),
-                     justify="left", wraplength=740).pack(anchor="w", pady=(6, 0))
-            for l in missed:
-                if l.fail_reason:
-                    tk.Label(inner,
-                             text=f"      {l.label} never filled: {l.fail_reason}",
-                             bg=row_bg, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
-                             justify="left", wraplength=740).pack(anchor="w")
+        confirmed = _sell_play_key(play) in self._confirmed_sells
 
-        if closed:
-            done = _sell_play_key(play) in self._confirmed_sells
-            bar = tk.Frame(inner, bg=row_bg)
-            bar.pack(fill="x", pady=(8, 0))
-            btn = tk.Label(
-                bar, text="Confirmed — show again" if done else "Confirm",
-                bg=row_bg, fg=TEXT_MUTED if done else GREEN,
-                font=(FONT_FAMILY, 8, "bold"), padx=10, pady=3, cursor="hand2")
-            btn.pack(side="right")
-            btn.bind("<Button-1>", lambda e, pl=play, d=done: (
-                self._unconfirm_sell_play(pl) if d else self._confirm_sell_play(pl)))
-            btn.bind("<Enter>", lambda e, w=btn: w.configure(fg=TEXT_PRIMARY))
-            btn.bind("<Leave>", lambda e, w=btn, d=done:
-                     w.configure(fg=TEXT_MUTED if d else GREEN))
-            tk.Label(bar, text="tick it off — nothing is traded", bg=row_bg,
-                     fg=TEXT_MUTED, font=(FONT_FAMILY, 7)).pack(side="right",
-                                                                padx=(0, 8))
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            top = y
+            x0 = 3 + 12
+            right = w - 14
+            wrap_w = max(200, min(740, right - x0))
+            y += 9
 
-        if task is not None and ready:
-            # The whole play in one go, sized off live balances. The per-leg
-            # buttons above only prime the ticket; this is the same path
-            # auto-sell takes, with the confirmation dialog left in.
-            act = tk.Frame(inner, bg=row_bg)
-            act.pack(fill="x", pady=(9, 0))
-            PillButton(act, text=f"Sell all {_qty_text(sum(l.left for l in ready))}",
-                       command=lambda t=task: self._exit_sell(t),
-                       width=120, height=30, font_size=9).pack(side="left")
-            qall = tk.Label(act, text="Queue all", bg=row_bg, fg=ACCENT,
-                            font=(FONT_FAMILY, 9, "bold"), padx=10, pady=4,
-                            cursor="hand2")
-            qall.pack(side="left", padx=(8, 0))
-            qall.bind("<Button-1>", lambda e, t=task: self._queue_sell(
-                t, source="queued from the board"))
-            qall.bind("<Enter>", lambda e, w=qall: w.configure(fg=TEXT_PRIMARY))
-            qall.bind("<Leave>", lambda e, w=qall: w.configure(fg=ACCENT))
-            desk = tk.Label(act, text=f"  {icon('trade')}  ticket", bg=row_bg,
-                            fg=TEXT_MUTED, font=(ICON_FONT, 9), cursor="hand2")
-            desk.pack(side="left", padx=(10, 0))
-            desk.bind("<Button-1>", lambda e, t=task: self._exit_trade(t))
-            desk.bind("<Enter>", lambda e, w=desk: w.configure(fg=TEXT_PRIMARY))
-            desk.bind("<Leave>", lambda e, w=desk: w.configure(fg=TEXT_MUTED))
+            # headline
+            lh = rc.line_height(self._SF_SYM)
+            cy = y + lh / 2
+            parts = [(play.symbol, self._SF_SYM, TEXT_PRIMARY)]
+            if play.exit_price is not None:
+                px = f"  @ ${float(play.exit_price):,.4f}".rstrip("0").rstrip(".")
+                parts.append((px, self._SF_MONO, TEXT_SECONDARY))
+            x = rc.text_run(x0, cy, parts)
+            rc.pill(x + 8, cy, f" {chip_text} ", self._SF_CHIP,
+                    _blend(chip_col, row_bg, 0.86), chip_col, padx=0, pady=1)
+            rc.text(right, cy, summary, self._SF_BODY, summary_fg, anchor="e")
+            y += lh
+
+            # a line per sellable brokerage
+            for leg in ready:
+                y += 6
+                btn_h = rc.line_height(self._SF_BTN) + 6
+                lh = max(rc.line_height(self._SF_LEG), btn_h)
+                cy = y + lh / 2
+                parts = [("●", self._SF_BODY, RED)]
+                x = rc.text_run(x0 + 2, cy, parts) + 7
+                # A Public late round-up (see _sell_plays) shows 0 left in the
+                # adjusted ledger, so "Sell 0" would be both wrong and useless.
+                # Its only honest action is the holdings-sized queue: read each
+                # account now and sell what arrived, capped at what we bought.
+                late = leg.left <= 1e-9
+                parts = [(leg.label, self._SF_LEG, TEXT_PRIMARY),
+                         ("   possible late round-up" if late
+                          else f"   {_qty_text(leg.left)} sh",
+                          self._SF_MONO, TEXT_SECONDARY)]
+                if leg.sold:
+                    parts.append((f"   ({_qty_text(leg.sold)} already sold)",
+                                  self._SF_SMALL, TEXT_MUTED))
+                rc.text_run(x, cy, parts)
+                bx, _ = rc.pill(right, cy,
+                                "Check & sell →" if late
+                                else f"Sell {_qty_text(leg.left)} →", self._SF_BTN,
+                                _blend(RED, row_bg, 0.82), RED, padx=10, pady=3,
+                                anchor="e",
+                                on_click=(lambda pl=play, lg=leg: self._queue_sell_leg(pl, lg))
+                                if late else
+                                (lambda sy=play.symbol, k=[leg.broker]:
+                                 self._sell_alert_trade(sy, k)))
+                # Queue THIS brokerage on its own. Orders at one broker have to
+                # run one at a time anyway — they share a browser profile — so
+                # lining them up is the only way to ask for several without
+                # sitting and watching each one finish before clicking the next.
+                qx, _ = rc.link(bx - 8 - 8, cy, "Queue", self._SF_SMALLB, ACCENT,
+                                TEXT_PRIMARY, anchor="e",
+                                on_click=lambda pl=play, lg=leg: self._queue_sell_leg(pl, lg))
+                # The escape hatch, on every sellable leg rather than only the
+                # rejected ones: a leg the desk has never been pointed at is
+                # exactly as stuck when you already sold it by hand.
+                fx, _ = rc.link(qx - 8 - 16, cy, "Resolve", self._SF_SMALLB,
+                                TEXT_MUTED, TEXT_PRIMARY, anchor="e",
+                                on_click=lambda pl=play, lg=leg: self._resolve_sell_leg(pl, lg))
+                if leg.failed_accounts:
+                    # The only thing worse than an exit you missed is one you
+                    # think you took. Fidelity has rejected ONFO ten times.
+                    rc.text(fx - 8 - 10, cy,
+                            f"  {icon('warning')} rejected {leg.failed_accounts}x",
+                            self._SF_SMALLB, YELLOW, anchor="e")
+                y += lh
+
+            slh = rc.line_height(self._SF_SMALL)
+
+            def para(text, fg, gap):
+                nonlocal y
+                y += gap
+                for ln in wrap_lines(rc, text, self._SF_SMALL, wrap_w):
+                    rc.text(x0, y + slh / 2, ln, self._SF_SMALL, fg)
+                    y += slh
+
+            for leg in ready:
+                if leg.fail_reason:
+                    para(f"      {leg.label}: {leg.fail_reason}", TEXT_MUTED, 0)
+            if waiting:
+                where = "  ".join(f"{l.label} {_qty_text(l.left)}" for l in waiting)
+                para(f"○  holding, no exit called yet:  {where}", TEXT_MUTED, 6)
+            if done_legs:
+                where = "  ".join(f"{l.label} {_qty_text(l.sold)}" for l in done_legs)
+                para(f"{icon('check')}  sold:  {where}", GREEN, 4)
+            # Last, because it is context rather than a position: the exit that
+            # WAS called, at a brokerage holding none of it.
+            if missed:
+                where = "  ".join(l.label for l in missed)
+                para(f"–  exit called at {where}, but you hold none there",
+                     TEXT_SECONDARY, 6)
+                for l in missed:
+                    if l.fail_reason:
+                        para(f"      {l.label} never filled: {l.fail_reason}",
+                             TEXT_MUTED, 0)
+
+            if closed:
+                y += 8
+                lh = rc.line_height(self._SF_SMALLB) + 6
+                cy = y + lh / 2
+                cx, _ = rc.link(right - 10, cy,
+                                "Confirmed — show again" if confirmed else "Confirm",
+                                self._SF_SMALLB, TEXT_MUTED if confirmed else GREEN,
+                                TEXT_PRIMARY, anchor="e",
+                                on_click=lambda pl=play, d=confirmed: (
+                                    self._unconfirm_sell_play(pl) if d
+                                    else self._confirm_sell_play(pl)))
+                rc.text(cx - 10 - 8, cy, "tick it off — nothing is traded",
+                        self._SF_TINY, TEXT_MUTED, anchor="e")
+                y += lh
+
+            if task is not None and ready:
+                # The whole play in one go, sized off live balances. The per-leg
+                # buttons above only prime the ticket; this is the same path
+                # auto-sell takes, with the confirmation dialog left in.
+                y += 9
+                cy = y + 15
+                label = f"Sell all {_qty_text(sum(l.left for l in ready))}"
+                # PillButton was 120 wide; keep the button at least that.
+                pad = max(10, (120 - rc.measure(label, self._SF_BTN)) // 2)
+                _, x = rc.pill(x0, cy, label, self._SF_BTN, ACCENT, TEXT_PRIMARY,
+                               padx=pad, pady=7, hover_bg=ACCENT_HOVER,
+                               on_click=lambda t=task: self._exit_sell(t))
+                _, x = rc.link(x + 8 + 10, cy, "Queue all", self._SF_BTN, ACCENT,
+                               TEXT_PRIMARY,
+                               on_click=lambda t=task: self._queue_sell(
+                                   t, source="queued from the board"))
+                rc.link(x + 10 + 10, cy, f"  {icon('trade')}  ticket", (ICON_FONT, 9),
+                        TEXT_MUTED, TEXT_PRIMARY,
+                        on_click=lambda t=task: self._exit_trade(t))
+                y += 30
+
+            y += 9
+            bg = rc.rect(0, top, w, y, row_bg)
+            rc.tag_lower(bg)
+            rc.rect(0, top, 3, y, stripe)
+            return (y - top) + 6
+        return draw
 
     def _resolve_sell_leg(self, play, leg) -> None:
         """Close one brokerage's leg by hand, when the tool cannot.
@@ -4673,8 +5762,8 @@ class App(ctk.CTk):
                  fg=TEXT_PRIMARY, font=(FONT_FAMILY, 13, "bold")).pack(
                      anchor="w", padx=20, pady=(18, 2))
         tk.Label(dlg,
-                 text=f"{_qty_text(open_qty)} share(s) still open across "
-                      f"{len(accounts)} account(s). Nothing is sent to "
+                 text=f"{_plural(_qty_text(open_qty), 'share')} still open across "
+                      f"{_plural(len(accounts), 'account')}. Nothing is sent to "
                       f"{leg.label} - this only corrects the journal.",
                  bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9),
                  justify="left", wraplength=430).pack(anchor="w", padx=20)
@@ -4777,7 +5866,7 @@ class App(ctk.CTk):
 
             what = (f"sold at ${price:,.4f}".rstrip("0").rstrip(".") if sold
                     else "gone - recorded with no price")
-            msg = (f"{play.symbol} at {leg.label}: {_qty_text(qty)} share(s) "
+            msg = (f"{play.symbol} at {leg.label}: {_plural(_qty_text(qty), 'share')} "
                    f"marked {what}")
             self._log(msg)
             self._push_notification(msg, "success" if sold else "info")
@@ -4814,21 +5903,34 @@ class App(ctk.CTk):
             self._log(f"Sell alert {symbol}: no brokerage named — "
                       f"pick brokers by hand", "warn")
 
+    def _pick_grids(self) -> Dict[str, tk.Frame]:
+        return {"picks": self._picks_grid,
+                "partial": self._partial_grid,
+                "purchased": self._purchased_grid}
+
     def _switch_picks_tab(self, tab: str) -> None:
-        """Switch between Quick Picks and Purchased tabs."""
+        """Switch between Quick Picks and Purchased tabs.
+
+        The grids are all pre-rendered, so this is a pack swap — done with the
+        dashboard's painting held, so the new tab appears whole instead of
+        mapping in row by row.
+        """
         self._picks_tab_active = tab
-        grids = {"picks": self._picks_grid,
-                 "partial": self._partial_grid,
-                 "purchased": self._purchased_grid}
-        for g in grids.values():
-            g.pack_forget()
-        grids.get(tab, self._picks_grid).pack(fill="x")
-        self._picks_tab_lbl.configure(
-            fg=TEXT_PRIMARY if tab == "picks" else TEXT_MUTED)
-        self._partial_tab_lbl.configure(
-            fg=YELLOW if tab == "partial" else TEXT_MUTED)
-        self._purchased_tab_lbl.configure(
-            fg=GREEN if tab == "purchased" else TEXT_MUTED)
+        grids = self._pick_grids()
+        target = grids.get(tab, self._picks_grid)
+        with _frozen(self._frames["dashboard"]):
+            for g in grids.values():
+                if g is not target:
+                    g.pack_forget()
+            if not target.winfo_manager():
+                target.pack(fill="x")
+            self._picks_tab_lbl.configure(
+                fg=TEXT_PRIMARY if tab == "picks" else TEXT_MUTED)
+            self._partial_tab_lbl.configure(
+                fg=YELLOW if tab == "partial" else TEXT_MUTED)
+            self._purchased_tab_lbl.configure(
+                fg=GREEN if tab == "purchased" else TEXT_MUTED)
+            self.update_idletasks()
 
     def _reload_quick_picks(self) -> None:
         """Fetch quick picks from remote gist in a background thread."""
@@ -4877,11 +5979,38 @@ class App(ctk.CTk):
         self._render_quick_picks(self._quick_picks)
         self._switch_picks_tab("purchased")
 
+    def _swap_pick_grid(self, tab: str) -> tk.Frame:
+        """A fresh, unpacked grid for `tab`, swapped in for the old one when the
+        caller has filled it (see _commit_pick_grid). The old rows stay on
+        screen until the new ones are complete."""
+        return tk.Frame(self._picks_body, bg=BG_CARD)
+
+    def _commit_pick_grid(self, tab: str, new: tk.Frame) -> None:
+        attr = {"picks": "_picks_grid", "partial": "_partial_grid",
+                "purchased": "_purchased_grid"}[tab]
+        old = getattr(self, attr)
+        if old.winfo_manager():
+            new.pack(fill="x", before=old)
+            old.pack_forget()
+        setattr(self, attr, new)
+        self._bury(old)
+
     def _render_quick_picks(self, picks: List[Dict[str, str]]) -> None:
-        """Render picks into the three tabs (available / partial / purchased)."""
-        for grid in (self._picks_grid, self._partial_grid, self._purchased_grid):
-            for w in grid.winfo_children():
-                w.destroy()
+        """Render picks into the three tabs (available / partial / purchased).
+
+        Each tab is rebuilt only if what it shows changed, into a fresh grid
+        that replaces the old one in a single step with painting held — so a
+        feed poll or a trade landing never shows the list assembling.
+        """
+        dash = self._frames.get("dashboard") if hasattr(self, "_frames") else None
+        if dash is None:
+            self._render_quick_picks_body(picks)
+            return
+        with _frozen(dash):
+            self._render_quick_picks_body(picks)
+            self.update_idletasks()
+
+    def _render_quick_picks_body(self, picks: List[Dict[str, str]]) -> None:
         self._quick_picks = picks
         if picks:
             self._repair_mirror_executed()
@@ -4894,41 +6023,14 @@ class App(ctk.CTk):
         self._render_pipeline()
 
         if not picks:
-            # Empty has two very different causes and the user can act on only
-            # one of them, so never show the same message for both: "nothing is
-            # open today" is normal, "we can't reach the feed" is a problem.
-            # There is deliberately nothing to sign up for here — the plays
-            # arrive on their own.
-            if _PICKS_AUTH_ERROR:
-                # The one empty state the user MUST act on. Waiting will not
-                # fix it, so this says the opposite of the message below — and
-                # carries the button that fixes it, rather than describing a
-                # file they would have to go and find.
-                box = self._empty_state(
-                    self._picks_grid, "warning", "Add your plays password",
-                    "This copy has no plays password yet, so the feed won't "
-                    "send anything. Paste the one you were given — the same "
-                    "one that opens rsamaxxed.com/plays. Waiting will not fix "
-                    "this on its own.",
-                    bg=BG_CARD, pad=18)
-                PillButton(box, text="Enter password",
-                           command=self._prompt_plays_key,
-                           width=150, height=32).pack(pady=(0, 18))
-                box.pack(fill="x")
-            elif getattr(self, "_feed_fail_streak", 0) or self._feed_last_ok is None:
-                self._empty_state(
-                    self._picks_grid, "warning", "Waiting for the play feed",
-                    "Couldn't reach the feed just now. It retries by itself "
-                    "every few minutes — nothing for you to do, and nothing to "
-                    "sign up for. Your saved plays stay put in the meantime.",
-                    bg=BG_CARD, pad=18).pack(fill="x")
-            else:
-                self._empty_state(
-                    self._picks_grid, "starfill", "No open plays right now",
-                    f"Nothing is live today. New alerts land here on their own — "
-                    f"the feed is checked every hour "
-                    f"(last at {self._feed_last_ok:%H:%M}).",
-                    bg=BG_CARD, pad=18).pack(fill="x")
+            # Empty-feed states are drawn straight into fresh grids; the tab
+            # cache is dropped so the next real list always draws.
+            self._pick_tab_sig.clear()
+            self._pick_canvases.clear()
+            grids = {t: self._swap_pick_grid(t) for t in ("picks", "partial", "purchased")}
+            self._render_empty_picks(grids["picks"])
+            for t, g in grids.items():
+                self._commit_pick_grid(t, g)
             return
 
         purchased_pick_set = self._get_purchased_pick_set(picks)
@@ -4949,33 +6051,126 @@ class App(ctk.CTk):
             text=f"Purchased ({len(purchased_picks)})" if purchased_picks
             else "Purchased")
 
-        # ---- Not started (main tab) ----
-        if available_picks:
-            self._render_picks_list(self._picks_grid, available_picks, "available")
-        else:
-            self._empty_state(
-                self._picks_grid, "check", "Nothing left to open",
-                "Every live pick has at least one confirmed buy — "
-                "check Partial for the ones still owed accounts.",
-                bg=BG_CARD, pad=14).pack(fill="x")
+        self._pick_tab_lists = {"picks": available_picks,
+                                "partial": partial_picks,
+                                "purchased": purchased_picks}
+        for tab in ("picks", "partial", "purchased"):
+            self._render_pick_tab(tab)
 
-        # ---- Partially filled ----
-        if partial_picks:
-            self._render_picks_list(self._partial_grid, partial_picks, "partial")
-        else:
-            self._empty_state(
-                self._partial_grid, "check", "Nothing part-filled",
-                "Picks bought on some accounts but not all show up here.",
-                bg=BG_CARD, pad=14).pack(fill="x")
+    def _pick_tab_signature(self, tab: str) -> tuple:
+        """Everything a tab's rows are drawn from. Same signature, same pixels."""
+        rows = self._pick_tab_lists.get(tab, [])
+        return (tuple((str(p.get("symbol", "")).upper(), p.get("date", ""),
+                       p.get("note", "")) for p in rows),
+                trade_journal.version(),
+                frozenset(_load_done_picks()),
+                frozenset(self._pick_expanded),
+                tab in self._picks_show_older,
+                self._account_universe(),
+                date.today())          # the "3d old" labels move at midnight
 
-        # ---- Fully covered / marked done ----
-        if purchased_picks:
-            self._render_picks_list(self._purchased_grid, purchased_picks, "purchased")
+    def _render_pick_tab(self, tab: str, force: bool = False) -> None:
+        """(Re)draw one tab's grid if its inputs changed."""
+        sig = self._pick_tab_signature(tab)
+        if not force and self._pick_tab_sig.get(tab) == sig:
+            return
+        self._pick_tab_sig[tab] = sig
+        self._pick_canvases.pop(tab, None)
+        grid = self._swap_pick_grid(tab)
+        rows = self._pick_tab_lists.get(tab, [])
+        if tab == "picks":
+            if rows:
+                self._render_picks_list(grid, rows, "available")
+            else:
+                self._empty_state(
+                    grid, "check", "Nothing left to open",
+                    "Every live pick has at least one confirmed buy — "
+                    "check Partial for the ones still owed accounts.",
+                    bg=BG_CARD, pad=14).pack(fill="x")
+        else:
+            mode = tab
+            recent, older = _split_recent_picks(rows)
+            show = rows if tab in self._picks_show_older else recent
+            if show:
+                self._render_picks_list(grid, show, mode)
+            elif not older:
+                if mode == "partial":
+                    self._empty_state(
+                        grid, "check", "Nothing part-filled",
+                        "Picks bought on some accounts but not all show up here.",
+                        bg=BG_CARD, pad=14).pack(fill="x")
+                else:
+                    self._empty_state(
+                        grid, "check", "Nothing bought yet",
+                        "Picks move here once a buy is confirmed in the journal.",
+                        bg=BG_CARD, pad=14).pack(fill="x")
+            else:
+                tk.Label(grid, text=f"Nothing in the last {PICK_TAB_RECENT_DAYS} days.",
+                         bg=BG_CARD, fg=TEXT_MUTED,
+                         font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(12, 0))
+            if older:
+                self._pick_older_link(grid, tab, len(older))
+        self._commit_pick_grid(tab, grid)
+
+    def _pick_older_link(self, parent, tab: str, n_older: int) -> None:
+        showing = tab in self._picks_show_older
+        text = (f"Hide older ({n_older})" if showing
+                else f"Show older ({n_older})  ·  alerted more than "
+                     f"{PICK_TAB_RECENT_DAYS} days ago")
+        link = tk.Label(parent, text=text, bg=BG_CARD, fg=ACCENT,
+                        font=(FONT_FAMILY, 9, "bold"), cursor="hand2",
+                        padx=2, pady=4)
+        link.pack(anchor="w", pady=(10, 0))
+        link.bind("<Button-1>", lambda _e: self._toggle_older_picks(tab))
+        link.bind("<Enter>", lambda _e: link.configure(fg=ACCENT_HOVER))
+        link.bind("<Leave>", lambda _e: link.configure(fg=ACCENT))
+
+    def _toggle_older_picks(self, tab: str) -> None:
+        if tab in self._picks_show_older:
+            self._picks_show_older.discard(tab)
+        else:
+            self._picks_show_older.add(tab)
+        with _frozen(self._frames["dashboard"]):
+            self._render_pick_tab(tab)
+            self.update_idletasks()
+
+    def _render_empty_picks(self, grid: tk.Frame) -> None:
+        """The feed itself is empty."""
+        # Empty has two very different causes and the user can act on only
+        # one of them, so never show the same message for both: "nothing is
+        # open today" is normal, "we can't reach the feed" is a problem.
+        # There is deliberately nothing to sign up for here — the plays
+        # arrive on their own.
+        if _PICKS_AUTH_ERROR:
+            # The one empty state the user MUST act on. Waiting will not
+            # fix it, so this says the opposite of the message below — and
+            # carries the button that fixes it, rather than describing a
+            # file they would have to go and find.
+            box = self._empty_state(
+                grid, "warning", "Add your plays password",
+                "This copy has no plays password yet, so the feed won't "
+                "send anything. Paste the one you were given — the same "
+                "one that opens rsamaxxed.com/plays. Waiting will not fix "
+                "this on its own.",
+                bg=BG_CARD, pad=18)
+            PillButton(box, text="Enter password",
+                       command=self._prompt_plays_key,
+                       width=150, height=32).pack(pady=(0, 18))
+            box.pack(fill="x")
+        elif getattr(self, "_feed_fail_streak", 0) or self._feed_last_ok is None:
+            self._empty_state(
+                grid, "warning", "Waiting for the play feed",
+                "Couldn't reach the feed just now. It retries by itself "
+                "every few minutes — nothing for you to do, and nothing to "
+                "sign up for. Your saved plays stay put in the meantime.",
+                bg=BG_CARD, pad=18).pack(fill="x")
         else:
             self._empty_state(
-                self._purchased_grid, "check", "Nothing bought yet",
-                "Picks move here once a buy is confirmed in the journal.",
-                bg=BG_CARD, pad=14).pack(fill="x")
+                grid, "starfill", "No open plays right now",
+                f"Nothing is live today. New alerts land here on their own — "
+                f"the feed is checked every hour "
+                f"(last at {self._feed_last_ok:%H:%M}).",
+                bg=BG_CARD, pad=18).pack(fill="x")
 
     # Pick note -> (badge text, badge color). Coverage + badges are the core of
     # the RSA pick rows: profit scales linearly with accounts filled.
@@ -5056,7 +6251,7 @@ class App(ctk.CTk):
             except Exception:
                 n_tr = 0
             self._status_journal.configure(
-                text=f"JOURNAL · {n_tr} TRADES · REALIZED ${s['realized']:+,.2f}")
+                text=f"JOURNAL · {n_tr} TRADES · REALIZED {_money_signed(s['realized'], 2)}")
 
     def _render_picks_list(self, parent: tk.Frame, picks: List[Dict[str, str]],
                            mode: str = "available") -> None:
@@ -5065,6 +6260,11 @@ class App(ctk.CTk):
 
         mode is 'available' (nothing bought yet), 'partial' (some accounts) or
         'purchased' (every account, or manually marked done).
+
+        Drawn on one RowCanvas rather than ~12 widgets a row: a 118-pick tab
+        was ~1,500 child windows, and on Windows each one costs more to map,
+        repaint and destroy than the whole list costs to draw as canvas items
+        (see modules/canvas_rows). Same rows, same colours, same clicks.
         """
         purchased = mode == "purchased"
         done_keys = _load_done_picks()
@@ -5085,208 +6285,255 @@ class App(ctk.CTk):
         for pick in picks:
             grouped.setdefault(pick.get("date", "Unknown"), []).append(pick)
 
+        recipes: list = []
         for date_str in sorted(grouped.keys(), reverse=True):
             try:
                 display_date = datetime.strptime(
                     date_str, "%Y-%m-%d").strftime("%B %d, %Y")
             except (ValueError, TypeError):
                 display_date = str(date_str)
-
-            hdr = tk.Frame(parent, bg=BG_CARD)
-            hdr.pack(fill="x", pady=(12, 5))
-            tk.Label(hdr, text=display_date.upper(), bg=BG_CARD, fg=TEXT_MUTED,
-                     font=(FONT_FAMILY, 8, "bold")).pack(side="left")
-            age = self._pick_age_label(date_str)
-            if age:
-                tk.Label(hdr, text=f"   ·   {age}", bg=BG_CARD, fg=TEXT_MUTED,
-                         font=(FONT_FAMILY, 8)).pack(side="left")
-            tk.Frame(parent, bg=GREEN if purchased else (
-                YELLOW if mode == "partial" else BORDER), height=1).pack(
-                    fill="x", pady=(0, 6))
+            recipes.append(self._pick_date_recipe(
+                display_date.upper(), self._pick_age_label(date_str),
+                GREEN if purchased else (YELLOW if mode == "partial" else BORDER)))
 
             pdate = date_str if re.fullmatch(r"\d{4}-\d{2}-\d{2}",
                                              str(date_str)) else ""
             for pick in grouped[date_str]:
                 sym = pick.get("symbol", "???").upper()
-                btxt, bcol = self._note_style(pick.get("note", ""))
                 n_acct = len({(b, a) for (d, b, a) in buys_by_sym.get(sym, [])
                               if not pdate or (d and d >= pdate)})
+                recipes.append(self._pick_row_recipe(
+                    pick, sym, pdate, mode, n_acct, universe,
+                    (sym, pdate) in done_keys))
+                if pdate:
+                    recipes.append(self._pick_detail_recipe(sym, pdate))
 
-                row_bg = BG_INPUT
-                # Every row does something on click now: available -> buy,
-                # partial/purchased -> open the missing-account breakdown.
-                row = tk.Frame(parent, bg=row_bg, cursor="hand2")
-                row.pack(fill="x", pady=(0, 5))
-                stripe = GREEN if purchased else (
-                    YELLOW if mode == "partial" else bcol)
-                tk.Frame(row, bg=stripe, width=3).pack(side="left", fill="y")
-                inner = tk.Frame(row, bg=row_bg)
-                inner.pack(side="left", fill="x", expand=True,
-                           padx=(12, 14), pady=9)
+        rc = RowCanvas(parent, bg=BG_CARD)
+        rc.pack(fill="x")
+        rc.set_rows(recipes)
+        tab = {"available": "picks"}.get(mode, mode)
+        self._pick_canvases[tab] = rc
 
-                tk.Label(inner, text=sym, bg=row_bg, fg=TEXT_PRIMARY,
-                         font=(FONT_FAMILY, 13, "bold")).pack(side="left")
-                tk.Label(inner, text=f" {btxt} ", bg=_blend(bcol, row_bg, 0.82),
-                         fg=bcol, font=(FONT_FAMILY, 7, "bold"), pady=1).pack(
-                             side="left", padx=(10, 0))
+    # Fonts the pick rows draw with (tuples, so RowCanvas caches one Font each).
+    _PF_DATE = (FONT_FAMILY, 8, "bold")
+    _PF_AGE = (FONT_FAMILY, 8)
+    _PF_SYM = (FONT_FAMILY, 13, "bold")
+    _PF_BADGE = (FONT_FAMILY, 7, "bold")
+    _PF_BTN = (FONT_FAMILY, 9, "bold")
+    _PF_SMALL = (FONT_FAMILY, 8)
+    _PF_CAP = (FONT_MONO, 7)
 
-                if purchased:
-                    if universe and n_acct >= universe:
-                        tk.Label(inner, text=f"{icon('check')} Filled", bg=row_bg,
-                                 fg=GREEN, font=(FONT_FAMILY, 9, "bold")).pack(
-                                     side="right")
-                    elif (sym, pdate) in done_keys:
-                        # Called finished by hand rather than fully covered —
-                        # say so, and let it be undone.
-                        undo = tk.Label(inner, text="Marked done · reopen",
-                                        bg=row_bg, fg=TEXT_MUTED,
-                                        font=(FONT_FAMILY, 8), cursor="hand2")
-                        undo.pack(side="right")
-                        undo.bind("<Button-1>",
-                                  lambda e, s=sym, d=pdate: self._unmark_pick_done(s, d))
-                    else:
-                        top = tk.Label(inner, text="Top up →",
-                                       bg=_blend(ACCENT, row_bg, 0.82),
-                                       fg=ACCENT_HOVER,
-                                       font=(FONT_FAMILY, 9, "bold"),
-                                       padx=10, pady=3, cursor="hand2")
-                        top.pack(side="right")
-                        top.bind("<Button-1>",
-                                 lambda e, s=sym: self._prefill_trade(s, "buy", "1"))
-                elif mode == "partial":
-                    done = tk.Label(inner, text=f"{icon('check')} Mark done",
-                                    bg=_blend(GREEN, row_bg, 0.82), fg=GREEN,
-                                    font=(FONT_FAMILY, 9, "bold"),
-                                    padx=10, pady=3, cursor="hand2")
-                    done.pack(side="right")
-                    done.bind("<Button-1>",
-                              lambda e, s=sym, d=pdate: self._mark_pick_done(s, d))
-                    top = tk.Label(inner, text="Top up →",
-                                   bg=_blend(ACCENT, row_bg, 0.82),
-                                   fg=ACCENT_HOVER,
-                                   font=(FONT_FAMILY, 9, "bold"),
-                                   padx=10, pady=3, cursor="hand2")
-                    top.pack(side="right", padx=(0, 8))
-                    top.bind("<Button-1>",
-                             lambda e, s=sym: self._prefill_trade(s, "buy", "1"))
+    def _pick_date_recipe(self, title: str, age: str, rule: str):
+        """Date heading + coloured rule. pady (12,5) above/below the text, then
+        the 1px rule and 6px — what the packed header used."""
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            lh = rc.line_height(self._PF_DATE)
+            cy = y + 12 + lh / 2
+            rc.text_run(0, cy, [(title, self._PF_DATE, TEXT_MUTED),
+                                (f"   ·   {age}" if age else "", self._PF_AGE, TEXT_MUTED)])
+            ry = y + 12 + lh + 5
+            rc.rect(0, ry, w, ry + 1, rule)
+            return 12 + lh + 5 + 1 + 6
+        return draw
+
+    def _pick_row_recipe(self, pick: Dict[str, str], sym: str, pdate: str,
+                         mode: str, n_acct: int, universe: int, is_done: bool):
+        purchased = mode == "purchased"
+        btxt, bcol = self._note_style(pick.get("note", ""))
+        stripe = GREEN if purchased else (YELLOW if mode == "partial" else bcol)
+        row_bg = BG_INPUT
+
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            content_h = max(rc.line_height(self._PF_SYM),
+                            3 + 5 + 2 + rc.line_height(self._PF_CAP))
+            h = 9 + content_h + 9
+            cy = y + h / 2
+            row_tag = rc.new_tag()      # hover: everything on the row
+            click_tag = rc.new_tag()    # whole-row click: not the buttons
+            base = (row_tag, click_tag)
+            bg = rc.rect(0, y, w, y + h, row_bg, tags=base)
+            rc.rect(0, y, 3, y + h, stripe, tags=base)
+            rc.on_hover(row_tag, [bg], row_bg, BG_CARD_ALT)
+
+            x = 3 + 12
+            x = rc.text_run(x, cy, [(sym, self._PF_SYM, TEXT_PRIMARY)], tags=base)
+            rc.pill(x + 10, cy, f" {btxt} ", self._PF_BADGE,
+                    _blend(bcol, row_bg, 0.82), bcol, padx=0, pady=1, tags=base)
+
+            right = w - 14
+            btn = dict(padx=10, pady=3, anchor="e")
+            if purchased:
+                if universe and n_acct >= universe:
+                    t = rc.text(right, cy, f"{icon('check')} Filled", self._PF_BTN,
+                                GREEN, anchor="e", tags=base)
+                    right -= rc.measure(f"{icon('check')} Filled", self._PF_BTN)
+                elif is_done:
+                    # Called finished by hand rather than fully covered —
+                    # say so, and let it be undone.
+                    x0, _ = rc.link(right, cy, "Marked done · reopen", self._PF_SMALL,
+                                    TEXT_MUTED, TEXT_MUTED, anchor="e", tags=(row_tag,),
+                                    on_click=lambda s=sym, d=pdate: self._unmark_pick_done(s, d))
+                    right = x0
                 else:
-                    tk.Label(inner, text="Buy →", bg=_blend(GREEN, row_bg, 0.82),
-                             fg=GREEN, font=(FONT_FAMILY, 9, "bold"),
-                             padx=10, pady=3, cursor="hand2").pack(side="right")
+                    x0, _ = rc.pill(right, cy, "Top up →", self._PF_BTN,
+                                    _blend(ACCENT, row_bg, 0.82), ACCENT_HOVER,
+                                    tags=(row_tag,), **btn,
+                                    on_click=lambda s=sym: self._prefill_trade(s, "buy", "1"))
+                    right = x0
+            elif mode == "partial":
+                x0, _ = rc.pill(right, cy, f"{icon('check')} Mark done", self._PF_BTN,
+                                _blend(GREEN, row_bg, 0.82), GREEN,
+                                tags=(row_tag,), **btn,
+                                on_click=lambda s=sym, d=pdate: self._mark_pick_done(s, d))
+                x0, _ = rc.pill(x0 - 8, cy, "Top up →", self._PF_BTN,
+                                _blend(ACCENT, row_bg, 0.82), ACCENT_HOVER,
+                                tags=(row_tag,), **btn,
+                                on_click=lambda s=sym: self._prefill_trade(s, "buy", "1"))
+                right = x0
+            else:
+                # Plain "Buy →": the whole row is the buy, this just says so.
+                # Shaped and lit like every other button, though the click
+                # itself belongs to the row (the tags keep it that way).
+                x0, _ = rc.pill(right, cy, "Buy →", self._PF_BTN,
+                                _blend(GREEN, row_bg, 0.82), GREEN, tags=base, **btn,
+                                hover_bg=_blend(GREEN, row_bg, 0.68),
+                                radius=RowCanvas.CAPSULE)
+                right = x0
 
-                # account-coverage bar — the operational number that matters
-                if n_acct or purchased:
-                    covw = tk.Frame(inner, bg=row_bg)
-                    covw.pack(side="right", padx=(0, 18))
-                    cv = tk.Canvas(covw, width=110, height=5, bg=row_bg,
-                                   highlightthickness=0, bd=0)
-                    cv.pack(anchor="e", pady=(3, 2))
-                    frac = (n_acct / universe) if universe else 0.0
-                    self._draw_coverage_bar(cv, frac, stripe if mode == "partial"
-                                            else (GREEN if purchased else ACCENT))
-                    cap = tk.Frame(covw, bg=row_bg)
-                    cap.pack(anchor="e")
-                    tk.Label(cap, text=f"{n_acct}/{universe} accounts",
-                             bg=row_bg, fg=TEXT_SECONDARY,
-                             font=(FONT_MONO, 7)).pack(side="left")
-                    n_missing = max(0, universe - n_acct)
-                    if n_missing and pdate:
-                        expanded = (sym, pdate) in self._pick_expanded
-                        miss_lbl = tk.Label(
-                            cap,
-                            text=f"  ·  {n_missing} missing "
-                                 f"{icon('chevdown') if expanded else icon('chevright')}",
-                            bg=row_bg, fg=YELLOW, font=(FONT_MONO, 7),
-                            cursor="hand2")
-                        miss_lbl.pack(side="left")
-                        miss_lbl.bind(
-                            "<Button-1>",
-                            lambda e, s=sym, d=pdate: self._toggle_pick_detail(s, d))
+            # account-coverage bar — the operational number that matters
+            if n_acct or purchased:
+                right -= 18
+                cap_h = rc.line_height(self._PF_CAP)
+                top = cy - (3 + 5 + 2 + cap_h) / 2
+                frac = (n_acct / universe) if universe else 0.0
+                frac = max(0.0, min(1.0, frac))
+                color = stripe if mode == "partial" else (GREEN if purchased else ACCENT)
+                rc.rect(right - 110, top + 3, right, top + 8, BG_ELEVATED, tags=base)
+                if frac > 0:
+                    rc.rect(right - 110, top + 3, right - 110 + max(2, 110 * frac),
+                            top + 8, color, tags=base)
+                ccy = top + 10 + cap_h / 2
+                n_missing = max(0, universe - n_acct)
+                cap = f"{n_acct}/{universe} accounts"
+                if n_missing and pdate:
+                    expanded = (sym, pdate) in self._pick_expanded
+                    miss = (f"  ·  {n_missing} missing "
+                            f"{icon('chevdown') if expanded else icon('chevright')}")
+                    mx0, _ = rc.link(right, ccy, miss, self._PF_CAP, YELLOW, YELLOW,
+                                     anchor="e", tags=(row_tag,),
+                                     on_click=lambda s=sym, d=pdate: self._toggle_pick_detail(s, d))
+                    rc.text(mx0, ccy, cap, self._PF_CAP, TEXT_SECONDARY, anchor="e",
+                            tags=base)
+                else:
+                    rc.text(right, ccy, cap, self._PF_CAP, TEXT_SECONDARY, anchor="e",
+                            tags=base)
 
-                if mode == "available":
-                    self._bind_row_click(
-                        row, lambda e, s=sym: self._quick_pick_buy(s))
-                elif pdate:
-                    # Once a pick has any fills, the useful thing to see is
-                    # which brokers still owe it and why — buying is the
-                    # explicit "Top up" button, not a whole-row click that
-                    # could fire by accident.
-                    self._bind_row_click(
-                        row, lambda e, s=sym, d=pdate: self._toggle_pick_detail(s, d))
-                self._bind_row_hover(row, row_bg, BG_CARD_ALT)
+            if mode == "available":
+                rc.on_click(click_tag, lambda s=sym: self._quick_pick_buy(s))
+            elif pdate:
+                # Once a pick has any fills, the useful thing to see is which
+                # brokers still owe it and why — buying is the explicit "Top up"
+                # button, not a whole-row click that could fire by accident.
+                rc.on_click(click_tag, lambda s=sym, d=pdate: self._toggle_pick_detail(s, d))
+            return h + 5
+        return draw
 
-                if pdate and (sym, pdate) in self._pick_expanded:
-                    self._render_pick_detail(parent, sym, pdate)
+    def _pick_detail_recipe(self, sym: str, pdate: str):
+        """The missing-account breakdown under a row; zero height when closed.
+        The journal is read the first time the panel is drawn, not per redraw."""
+        cache: Dict[str, Any] = {}
+
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            if (sym, pdate) not in self._pick_expanded:
+                return 0
+            if "missing" not in cache:
+                cache["missing"] = _pick_missing_accounts(sym, pdate)
+            return self._draw_pick_detail(rc, y, w, sym, cache["missing"])
+        return draw
 
     def _toggle_pick_detail(self, symbol: str, date_str: str) -> None:
+        """Open/close a pick's missing-account breakdown, in place.
+
+        It used to redraw all three tabs to open one panel. The rows are canvas
+        items now, so the list it sits in is simply redrawn — a few ms.
+        """
         key = (str(symbol).upper(), str(date_str))
         if key in self._pick_expanded:
             self._pick_expanded.discard(key)
         else:
             self._pick_expanded.add(key)
-        tab = self._picks_tab_active
-        self._render_quick_picks(self._quick_picks)
-        self._switch_picks_tab(tab)
+        for rc in list(self._pick_canvases.values()):
+            try:
+                rc.redraw()
+            except tk.TclError:
+                continue
+        # The expanded set is part of what a tab draws, and it now matches
+        # what is on screen without a rebuild.
+        for tab in list(self._pick_tab_sig):
+            self._pick_tab_sig[tab] = self._pick_tab_signature(tab)
 
-    def _render_pick_detail(self, parent: tk.Frame, symbol: str,
-                            date_str: str) -> None:
+    def _draw_pick_detail(self, rc: RowCanvas, y: int, w: int, symbol: str,
+                          missing: List[Dict[str, str]]) -> int:
         """Which accounts are missing this pick, grouped by broker and reason.
 
         Grouped rather than one row per account: 38 identical "not attempted"
         lines is noise, "wellsfargo · 10 accounts · symbol not eligible for
         online trading" is the answer.
         """
-        missing = _pick_missing_accounts(symbol, date_str)
-        panel = tk.Frame(parent, bg=BG_CARD_ALT)
-        panel.pack(fill="x", pady=(0, 6), padx=(3, 0))
-        body = tk.Frame(panel, bg=BG_CARD_ALT)
-        body.pack(fill="x", padx=16, pady=(10, 12))
-
+        x0 = 3
+        top = y
+        y += 10
+        x = x0 + 16
+        items: list = []
         if not missing:
-            tk.Label(body, text=f"{icon('check')}  Every account holds {symbol}",
-                     bg=BG_CARD_ALT, fg=GREEN,
-                     font=(FONT_FAMILY, 9, "bold")).pack(anchor="w")
-            return
+            lh = rc.line_height(self._PF_DETAIL_HEAD_OK)
+            items.append(rc.text(x, y + lh / 2, f"{icon('check')}  Every account holds {symbol}",
+                                 self._PF_DETAIL_HEAD_OK, GREEN))
+            y += lh
+        else:
+            n_failed = sum(1 for m in missing if m["status"] == "failed")
+            head = f"{len(missing)} ACCOUNT{'S' if len(missing) != 1 else ''} MISSING"
+            if n_failed:
+                head += f"  ·  {n_failed} REJECTED BY THE BROKER"
+            lh = rc.line_height(self._PF_DATE)
+            items.append(rc.text(x, y + lh / 2, head, self._PF_DATE, TEXT_SECONDARY))
+            y += lh + 7
 
-        n_failed = sum(1 for m in missing if m["status"] == "failed")
-        head = f"{len(missing)} ACCOUNT{'S' if len(missing) != 1 else ''} MISSING"
-        if n_failed:
-            head += f"  ·  {n_failed} REJECTED BY THE BROKER"
-        tk.Label(body, text=head, bg=BG_CARD_ALT, fg=TEXT_SECONDARY,
-                 font=(FONT_FAMILY, 8, "bold")).pack(anchor="w", pady=(0, 7))
+            # (broker, tidied reason) -> accounts sharing it
+            groups: Dict[tuple, List[str]] = {}
+            for m in missing:
+                reason = _tidy_reason(m["reason"]) if m["status"] == "failed" else ""
+                groups.setdefault((m["broker"], reason), []).append(m["account"])
 
-        # (broker, tidied reason) -> accounts sharing it
-        groups: Dict[tuple, List[str]] = {}
-        for m in missing:
-            reason = _tidy_reason(m["reason"]) if m["status"] == "failed" else ""
-            groups.setdefault((m["broker"], reason), []).append(m["account"])
+            # Broker rejections first — they are the ones needing a decision.
+            for (broker, reason), accts in sorted(
+                    groups.items(), key=lambda kv: (not kv[0][1], kv[0][0])):
+                line_top = y
+                tx = x + 2 + 9
+                blh = rc.line_height((FONT_FAMILY, 9, "bold"))
+                cy = y + blh / 2
+                rc.text_run(tx, cy, [
+                    (broker.capitalize(), (FONT_FAMILY, 9, "bold"), TEXT_PRIMARY),
+                    (f"  {len(accts)} account{'s' if len(accts) != 1 else ''}",
+                     (FONT_MONO, 8), TEXT_MUTED),
+                    ("  REJECTED" if reason else "  NOT ATTEMPTED",
+                     (FONT_FAMILY, 7, "bold"), RED if reason else TEXT_MUTED)])
+                y += blh + 1
+                body = reason or "No order was ever sent for this pick."
+                rlh = rc.line_height(self._PF_SMALL)
+                for ln in wrap_lines(rc, body, self._PF_SMALL, 620):
+                    rc.text(tx, y + rlh / 2, ln, self._PF_SMALL,
+                            TEXT_SECONDARY if reason else TEXT_MUTED)
+                    y += rlh
+                rc.rect(x, line_top, x + 2, y, RED if reason else TEXT_MUTED)
+                y += 5
+            y -= 5
+        y += 12
+        panel = rc.rect(x0, top, w, y, BG_CARD_ALT)
+        rc.tag_lower(panel)
+        return (y - top) + 6
 
-        # Broker rejections first — they are the ones needing a decision.
-        for (broker, reason), accts in sorted(
-                groups.items(), key=lambda kv: (not kv[0][1], kv[0][0])):
-            line = tk.Frame(body, bg=BG_CARD_ALT)
-            line.pack(fill="x", pady=(0, 5))
-            tk.Frame(line, bg=RED if reason else TEXT_MUTED, width=2).pack(
-                side="left", fill="y", padx=(0, 9))
-            txt = tk.Frame(line, bg=BG_CARD_ALT)
-            txt.pack(side="left", fill="x", expand=True)
-
-            top = tk.Frame(txt, bg=BG_CARD_ALT)
-            top.pack(fill="x")
-            tk.Label(top, text=broker.capitalize(), bg=BG_CARD_ALT,
-                     fg=TEXT_PRIMARY, font=(FONT_FAMILY, 9, "bold")).pack(side="left")
-            tk.Label(top, text=f"  {len(accts)} account"
-                              f"{'s' if len(accts) != 1 else ''}",
-                     bg=BG_CARD_ALT, fg=TEXT_MUTED,
-                     font=(FONT_MONO, 8)).pack(side="left")
-            tk.Label(top, text="  REJECTED" if reason else "  NOT ATTEMPTED",
-                     bg=BG_CARD_ALT, fg=RED if reason else TEXT_MUTED,
-                     font=(FONT_FAMILY, 7, "bold")).pack(side="left")
-
-            tk.Label(txt, text=reason or "No order was ever sent for this pick.",
-                     bg=BG_CARD_ALT, fg=TEXT_SECONDARY if reason else TEXT_MUTED,
-                     font=(FONT_FAMILY, 8), justify="left",
-                     wraplength=620).pack(anchor="w", pady=(1, 0))
+    _PF_DETAIL_HEAD_OK = (FONT_FAMILY, 9, "bold")
 
     def _prefill_trade(self, ticker: str, side: str = "buy", qty: str = "1",
                        brokers: Optional[List[str]] = None) -> None:
@@ -5450,7 +6697,7 @@ class App(ctk.CTk):
             if parsed:
                 lines = [f"  {p['symbol']}  —  {p['note']}" for p in parsed]
                 preview_lbl.configure(
-                    text=f"Found {len(parsed)} ticker(s):\n" + "\n".join(lines),
+                    text=f"Found {_plural(len(parsed), 'ticker')}:\n" + "\n".join(lines),
                     fg=TEXT_PRIMARY)
             else:
                 preview_lbl.configure(text="No tickers found — use (TICKER) format", fg=RED)
@@ -5506,7 +6753,7 @@ class App(ctk.CTk):
 
                 self.after(0, lambda: self._render_quick_picks(all_picks))
                 self.after(0, lambda: status_lbl.configure(
-                    text=f"Added {len(parsed)} pick(s) for {date_str}!", fg=GREEN))
+                    text=f"Added {_plural(len(parsed), 'pick')} for {date_str}!", fg=GREEN))
                 self.after(0, lambda: self._log(
                     f"Quick Picks: added {len(parsed)} tickers for {date_str}"))
 
@@ -5604,7 +6851,7 @@ class App(ctk.CTk):
             tk.Label(row, text=f"${value:,.2f}", bg=BG_CARD, fg=TEXT_PRIMARY,
                      font=(FONT_MONO, 9), width=12, anchor="w").pack(side="left")
             pl_color = GREEN if pl >= 0 else RED
-            tk.Label(row, text=f"${pl:+,.2f}", bg=BG_CARD, fg=pl_color,
+            tk.Label(row, text=f"{_money_signed(pl, 2)}", bg=BG_CARD, fg=pl_color,
                      font=(FONT_MONO, 9), width=12, anchor="w").pack(side="left")
 
             edit_btn = tk.Label(row, text="edit", bg=BG_CARD, fg=ACCENT,
@@ -5864,7 +7111,7 @@ class App(ctk.CTk):
                 labels = self._broker_status_labels.get(broker)
                 if labels and out.state == "success":
                     labels["dot"].set_color(GREEN)
-                    labels["status"].configure(text=f"{n} account(s) connected", fg=GREEN)
+                    labels["status"].configure(text=f"{_plural(n, 'account')} connected", fg=GREEN)
             self._log("Dashboard: API brokers restored")
         self.after(0, update_api)
 
@@ -5902,7 +7149,7 @@ class App(ctk.CTk):
             connected = [a for a in (accs or []) if getattr(a, "ok", False)]
             if connected:
                 labels["dot"].set_color(GREEN)
-                labels["status"].configure(text=f"{len(connected)} account(s) connected", fg=GREEN)
+                labels["status"].configure(text=f"{_plural(len(connected), 'account')} connected", fg=GREEN)
             elif accs:
                 labels["dot"].set_color(RED)
                 labels["status"].configure(text=(accs[0].message or "failed"), fg=RED)
@@ -5914,14 +7161,14 @@ class App(ctk.CTk):
         """Trade-journal truth for reverse-split arbitrage. The ONLY real profit
         is a recorded buy matched with a confirmed sell at a higher price
         (realized P/L) — live prices can't tell you whether a name rounded up.
-        Also returns the OPEN positions (bought, not yet sold) for allocation.
+        Also returns the OPEN positions (bought, not yet sold).
         Realized P/L matches the Analytics tab (all-time avg-buy basis).
 
         Reads the journal through split_adjusted(): a reverse split changes the
         share count with no trade to record, and without that lens a fractional
         sell is priced against a tenth of what was paid for it (see the rule in
         trade_journal). It also leaves the position permanently open, so the
-        allocation donut below would keep drawing shares the split destroyed."""
+        open-position counts would keep including shares the split destroyed."""
         trades = trade_journal.split_adjusted()
         buys: Dict[str, Dict[str, float]] = {}   # symbol -> {qty, cost}
         sells: Dict[str, Dict[str, float]] = {}  # symbol -> {qty, rev}
@@ -5986,7 +7233,7 @@ class App(ctk.CTk):
             self._log(f"Dashboard summary failed: {e}")
             return
         realized = s["realized"]
-        self._dash_value.configure(text=f"${realized:+,.2f}",
+        self._dash_value.configure(text=f"{_money_signed(realized, 2)}",
                                    fg=GREEN if realized >= 0 else RED)
         self._dash_invested.configure(text=f"${s['deployed']:,.2f}")
         self._dash_pl.configure(text=str(s["open_count"]), fg=TEXT_PRIMARY)
@@ -6074,7 +7321,7 @@ class App(ctk.CTk):
                     if out.state == "success":
                         self._update_total_accounts(broker, n)
                         labels["dot"].set_color(GREEN)
-                        labels["status"].configure(text=f"{n} account(s) connected", fg=GREEN)
+                        labels["status"].configure(text=f"{_plural(n, 'account')} connected", fg=GREEN)
                     else:
                         labels["dot"].set_color(RED)
                         labels["status"].configure(text=out.message or "failed", fg=RED)
@@ -6270,7 +7517,7 @@ class App(ctk.CTk):
         tk.Label(left, text=f"${t['total']:,.2f}", bg=BG_CARD,
                  fg=GREEN if t["total"] > 0 else TEXT_MUTED,
                  font=(FONT_MONO, 30, "bold")).pack(anchor="w", pady=(2, 0))
-        sub = f"{t['known_accounts']} account(s) reporting"
+        sub = f"{_plural(t['known_accounts'], 'account')} reporting"
         if t["unknown_accounts"]:
             sub += f"   ·   {t['unknown_accounts']} with no figure"
         tk.Label(left, text=sub, bg=BG_CARD, fg=TEXT_SECONDARY,
@@ -6339,7 +7586,7 @@ class App(ctk.CTk):
                 if b in _BROWSER_BROKERS else "asking…")
             for b in brokers}
         self._render_invest("pull")
-        self._log(f"Invest: pulling cash from {len(brokers)} broker(s)...")
+        self._log(f"Invest: pulling cash from {_plural(len(brokers), 'broker')}...")
 
         remaining = {"n": len(brokers)}
         lock = threading.Lock()
@@ -6360,10 +7607,10 @@ class App(ctk.CTk):
                 got = sum(1 for a in out.accounts
                           if balances.cash_from_extra(broker, a.extra) is not None)
                 if got:
-                    state, text = "ok", f"{got} of {len(out.accounts)} account(s)"
+                    state, text = "ok", f"{got} of {_plural(len(out.accounts), 'account')}"
                 else:
                     state, text = ("none",
-                                   f"{len(out.accounts)} account(s), no cash "
+                                   f"{_plural(len(out.accounts), 'account')}, no cash "
                                    f"figure — type one in below")
             except Exception as exc:
                 state, text = "fail", str(exc)[:70]
@@ -6383,7 +7630,7 @@ class App(ctk.CTk):
                     self._etf_cash_busy = False
                     tot = balances.totals()
                     self._log(f"Invest: ${tot['total']:,.2f} across "
-                              f"{tot['known_accounts']} account(s)", "success")
+                              f"{_plural(tot['known_accounts'], 'account')}", "success")
                 self._render_invest("pull", "cash", "picker", "detail")
             self.after(0, _land)
 
@@ -6771,7 +8018,7 @@ class App(ctk.CTk):
             tk.Label(sub, text=f"{'':12}{why}", bg=BG_HERO, fg=TEXT_MUTED,
                      font=(FONT_FAMILY, 8), anchor="w").pack(side="left")
             if bp.short:
-                tk.Label(sub, text=f"{len(bp.short)} account(s) short  ",
+                tk.Label(sub, text=f"{_plural(len(bp.short), 'account')} short  ",
                          bg=BG_HERO, fg=YELLOW,
                          font=(FONT_FAMILY, 8)).pack(side="right")
 
@@ -6792,7 +8039,7 @@ class App(ctk.CTk):
                  fg=GREEN if plan.deployed > 0 else TEXT_MUTED,
                  font=(FONT_MONO, 22, "bold")).pack(side="right")
         tk.Label(box,
-                 text=f"{plan.account_count} account(s) · "
+                 text=f"{_plural(plan.account_count, 'account')} · "
                       f"${plan.idle:,.2f} stays in cash"
                       + (f" · {plan.short_count} short"
                          if plan.short_count else ""),
@@ -7087,7 +8334,7 @@ class App(ctk.CTk):
                          bg=BG_CARD, fg=GREEN if r["pl"] >= 0 else RED,
                          font=(FONT_MONO, 10, "bold"),
                          anchor="w").pack(side="left")
-            tk.Label(row, text=f"  {r['accounts']} acct(s)", bg=BG_CARD,
+            tk.Label(row, text=f"  {_plural(r['accounts'], 'account')}", bg=BG_CARD,
                      fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).pack(side="right")
 
         if s["unquoted"]:
@@ -7100,7 +8347,7 @@ class App(ctk.CTk):
                                                           pady=(SP_SM, 0))
         if s["unpriced_buys"]:
             tk.Label(box,
-                     text=f"{s['unpriced_buys']} buy(s) recorded with no fill "
+                     text=f"{_plural(s['unpriced_buys'], 'buy')} recorded with no fill "
                           f"price contribute no cost basis, so the profit "
                           f"above is overstated by whatever they cost.",
                      bg=BG_CARD, fg=YELLOW, font=(FONT_FAMILY, 8),
@@ -7122,13 +8369,13 @@ class App(ctk.CTk):
         legs = plan.actionable
         body = "\n".join(
             f"{bp.broker.capitalize()}: BUY {etf_plan.qty_text(bp.qty)} "
-            f"{bp.ticker} on {len(bp.participating)} account(s) "
+            f"{bp.ticker} on {_plural(len(bp.participating), 'account')} "
             f"— ${bp.deployed:,.2f}" for bp in legs)
         if not messagebox.askyesno(
                 "Dry run" if dry else "Invest",
                 f"{fund.symbol} — {fund.name}\n\n{body}\n\n"
                 f"Total: ${plan.deployed:,.2f} across "
-                f"{plan.account_count} account(s)."
+                f"{_plural(plan.account_count, 'account')}."
                 + ("\n\nDry run — no order will be placed."
                    if dry else "\n\nThis places real orders."),
                 parent=self):
@@ -7175,140 +8422,6 @@ class App(ctk.CTk):
             self._invalidate_page("invest")
             if self._frames.get("invest") is not None:
                 self._render_invest("holdings", "detail")
-
-    # ---- Holdings ---------------------------------------------------------
-
-    def _build_holdings(self) -> None:
-        frame = tk.Frame(self._content, bg=BG_PRIMARY)
-        self._frames["holdings"] = frame
-
-        top = tk.Frame(frame, bg=BG_PRIMARY)
-        top.pack(fill="x", pady=(0, 12))
-        self._holdings_status_lbl = tk.Label(top, text="", bg=BG_PRIMARY,
-                                             fg=TEXT_MUTED, font=(FONT_FAMILY, 9))
-        self._holdings_status_lbl.pack(side="left")
-
-        outer, scroll = self._make_vscroll(frame)
-        outer.pack(fill="both", expand=True)
-
-        card = RoundedFrame(scroll, bg_color=BG_CARD, border_color=BORDER, radius=RAD_LG)
-        card.pack(fill="x")
-        head = tk.Frame(card.inner, bg=BG_CARD)
-        head.pack(fill="x", padx=24, pady=(18, 2))
-        tk.Label(head, text=icon("pie"), bg=BG_CARD, fg=ACCENT,
-                 font=(ICON_FONT, 12)).pack(side="left", padx=(0, 8))
-        tk.Label(head, text="Open Positions — Allocation", bg=BG_CARD,
-                 fg=TEXT_PRIMARY, font=(FONT_FAMILY, 13, "bold")).pack(side="left")
-        tk.Label(head, text="Shares bought and not yet sold — round-up bets in play",
-                 bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).pack(
-                     side="left", padx=(10, 0))
-
-        body = tk.Frame(card.inner, bg=BG_CARD)
-        body.pack(fill="x", padx=24, pady=(12, 24))
-        self._alloc_canvas = tk.Canvas(body, bg=BG_CARD, width=300, height=300,
-                                       highlightthickness=0, bd=0)
-        self._alloc_canvas.pack(side="left", padx=(0, 28), anchor="n")
-        self._alloc_legend = tk.Frame(body, bg=BG_CARD)
-        self._alloc_legend.pack(side="left", fill="x", expand=True, anchor="n")
-        self._alloc_positions: list = []
-        self._alloc_canvas.bind("<Configure>", lambda e: self._draw_allocation_pie())
-
-    def _holdings_refresh(self, *args, **kwargs) -> None:
-        """Positions is an allocation view now — recomputed locally from the
-        trade journal (confirmed buys, net of sells). No broker login / prices."""
-        self._render_allocation()
-
-    def _recompute_allocation(self) -> None:
-        """The header button: always rebuild, even if the fingerprint matches."""
-        self._invalidate_page("holdings")
-        self._render_allocation()
-
-    def _render_allocation(self) -> None:
-        if not hasattr(self, "_alloc_legend"):
-            return
-        positions = sorted(self._portfolio_summary()["open_positions"],
-                           key=lambda p: p["qty"], reverse=True)
-        self._alloc_positions = positions
-        self._draw_allocation_pie()
-        for w in self._alloc_legend.winfo_children():
-            w.destroy()
-        total = sum(p["qty"] for p in positions)
-        if not positions:
-            self._empty_state(
-                self._alloc_legend, "pie", "No open positions",
-                "Confirmed buys appear here until you sell them.",
-                bg=BG_CARD, pad=18).pack(fill="x")
-        else:
-            tk.Label(self._alloc_legend,
-                     text=f"{len(positions)} open position"
-                          f"{'s' if len(positions) != 1 else ''}  ·  "
-                          f"{int(total)} shares in play",
-                     bg=BG_CARD, fg=TEXT_SECONDARY,
-                     font=(FONT_FAMILY, 9, "bold")).pack(anchor="w", pady=(2, 10))
-            for i, p in enumerate(positions):
-                col = CHART_PALETTE[i % len(CHART_PALETTE)]
-                r = tk.Frame(self._alloc_legend, bg=BG_CARD)
-                r.pack(fill="x", pady=2)
-                tk.Frame(r, bg=col, width=11, height=11).pack(side="left",
-                                                              padx=(0, 9), pady=2)
-                tk.Label(r, text=p["symbol"], bg=BG_CARD, fg=TEXT_PRIMARY,
-                         font=(FONT_FAMILY, 9, "bold"), width=8, anchor="w").pack(side="left")
-                tk.Label(r, text=f"{p['qty']:.0f} sh", bg=BG_CARD, fg=TEXT_SECONDARY,
-                         font=(FONT_MONO, 9)).pack(side="left")
-                if p["symbol"] in self._roundup_flagged:
-                    tk.Label(r, text=f" {icon('lightning')} SPLIT? ",
-                             bg=_blend(YELLOW, BG_CARD, 0.84), fg=YELLOW,
-                             font=(FONT_FAMILY, 7, "bold")).pack(side="left",
-                                                                 padx=(8, 0))
-                sell = tk.Label(r, text="Sell 1 ea →",
-                                bg=_blend(RED, BG_CARD, 0.86), fg=RED,
-                                font=(FONT_FAMILY, 8, "bold"), padx=9, pady=2,
-                                cursor="hand2")
-                sell.pack(side="right", padx=(0, 6))
-                sell.bind("<Button-1>",
-                          lambda e, s=p["symbol"]: self._prefill_trade(s, "sell", "1"))
-                pct = (p["qty"] / total * 100) if total else 0
-                tk.Label(r, text=f"{pct:.1f}%", bg=BG_CARD, fg=TEXT_MUTED,
-                         font=(FONT_MONO, 9)).pack(side="right", padx=(0, 14))
-        self._holdings_status_lbl.configure(
-            text=f"Updated {datetime.now():%H:%M:%S}", fg=TEXT_MUTED)
-
-    def _draw_allocation_pie(self) -> None:
-        c = getattr(self, "_alloc_canvas", None)
-        if c is None:
-            return
-        c.delete("all")
-        # No update_idletasks(): see _draw_equity_curve. The `or 320` below
-        # already covers a canvas that has not been sized yet.
-        w = c.winfo_width() or 320
-        h = c.winfo_height() or 320
-        positions = getattr(self, "_alloc_positions", [])
-        total = sum(p["qty"] for p in positions)
-        cx, cy = w / 2, h / 2
-        r = min(w, h) / 2 - 14
-        inner = r * 0.60
-        if total <= 0 or r <= 10:
-            c.create_text(cx, cy, text="No open positions", fill=TEXT_MUTED,
-                          font=(FONT_FAMILY, 10))
-            return
-        if len(positions) == 1:
-            c.create_oval(cx - r, cy - r, cx + r, cy + r,
-                          fill=CHART_PALETTE[0], outline=BG_CARD, width=2)
-        else:
-            start = 90.0
-            for i, p in enumerate(positions):
-                ext = -(p["qty"] / total) * 360.0
-                col = CHART_PALETTE[i % len(CHART_PALETTE)]
-                c.create_arc(cx - r, cy - r, cx + r, cy + r, start=start, extent=ext,
-                             fill=col, outline=BG_CARD, width=2, style="pieslice")
-                start += ext
-        c.create_oval(cx - inner, cy - inner, cx + inner, cy + inner,
-                      fill=BG_CARD, outline="")
-        c.create_text(cx, cy - 10, text=str(len(positions)), fill=TEXT_PRIMARY,
-                      font=(FONT_MONO, 22, "bold"))
-        c.create_text(cx, cy + 14, text="OPEN POSITIONS", fill=TEXT_MUTED,
-                      font=(FONT_FAMILY, 7, "bold"))
-
 
     # ---- Trade ------------------------------------------------------------
 
@@ -7497,6 +8610,7 @@ class App(ctk.CTk):
         self._trade_result.tag_configure("success", foreground=GREEN)
         self._trade_result.tag_configure("error", foreground=RED)
         self._trade_result.tag_configure("warn", foreground=YELLOW)
+        self._trade_result.tag_configure("meta", foreground=TEXT_SECONDARY)
         self._trade_result.tag_configure(
             "banner_ok", foreground=GREEN, font=(FONT_MONO, 13, "bold"))
         self._trade_result.tag_configure(
@@ -7828,6 +8942,9 @@ class App(ctk.CTk):
 
             try:
                 kw = {"side": side, "qty": qty, "symbol": symbol, "dry_run": dry_run}
+                # Per-broker options a batch asked for (Public's holdings-sized
+                # sells). Only ever set for a module that takes them.
+                kw.update((batch or {}).get("broker_kwargs", {}).get(broker, {}))
                 if only_accounts:
                     # Not every broker module can narrow to a subset of its
                     # accounts. Ask, and if the module doesn't take the kwarg,
@@ -7865,6 +8982,7 @@ class App(ctk.CTk):
             ok_accounts = 0
             fail_accounts = 0
             unjournaled: List[str] = []
+            shares_done = 0.0
             for acct in output.accounts:
                 status = "OK" if acct.ok else "FAIL"
                 lines.append(f"  [{status}] {acct.account_id}: {acct.message}")
@@ -7873,8 +8991,17 @@ class App(ctk.CTk):
                     "ok": bool(acct.ok),
                     "message": acct.message or "",
                 })
+                # What THIS account traded. A holdings-sized sell (Public) sends
+                # each account its own balance and says so in extra["qty"];
+                # everything else sends the batch qty to every account.
+                acct_qty = float(qty)
+                try:
+                    acct_qty = float((getattr(acct, "extra", None) or {}).get("qty") or qty)
+                except (TypeError, ValueError):
+                    pass
                 if acct.ok:
                     ok_accounts += 1
+                    shares_done += acct_qty
                 else:
                     fail_accounts += 1
                     summary["errors"].append(f"{acct.account_id}: {acct.message}")
@@ -7913,9 +9040,16 @@ class App(ctk.CTk):
                                 plan_id=str(batch.get("plan_id") or ""),
                             )
                         else:
+                            # A holdings-sized Public sell can fall back to the
+                            # pre-split ticker when that is where the account's
+                            # shares are listed, and says so in extra["symbol"].
+                            # Journal it under the ticker that actually sold, so
+                            # it nets against the buy it closes.
+                            row_sym = str((getattr(acct, "extra", None) or {})
+                                          .get("symbol") or symbol)
                             trade_journal.record_trade(
                                 broker=broker, account_id=acct.account_id,
-                                side=side, symbol=symbol, qty=float(qty),
+                                side=side, symbol=row_sym, qty=acct_qty,
                                 fill_price=fill_price,
                                 order_id=getattr(acct, "order_id", None),
                                 price_source=trade_journal.PRICE_QUOTE,
@@ -7928,11 +9062,12 @@ class App(ctk.CTk):
             if fill_price is not None:
                 lines.append(f"  Quoted price: ${fill_price:.2f}")
             if unjournaled:
-                lines.append(f"  !! {len(unjournaled)} filled order(s) NOT saved to "
+                lines.append(f"  !! {_plural(len(unjournaled), 'filled order')} NOT saved to "
                              f"the journal - add them by hand:")
                 lines.extend(f"     {u}" for u in unjournaled)
-                _msg = (f"{broker.capitalize()} {symbol}: {len(unjournaled)} filled "
-                        f"order(s) could not be saved to the journal - see Activity")
+                _msg = (f"{broker.capitalize()} {symbol}: "
+                        f"{_plural(len(unjournaled), 'filled order')} could not be "
+                        f"saved to the journal - see Activity")
                 self.after(0, lambda m=_msg: self._push_notification(m, "error"))
                 self.after(0, lambda m=_msg: self._log(m, "error"))
 
@@ -7959,9 +9094,14 @@ class App(ctk.CTk):
             # Record this broker's outcome for the batch DONE banner.
             summary["ok_accounts"] = ok_accounts
             summary["fail_accounts"] = fail_accounts
-            summary["shares"] = float(qty) * ok_accounts if ok_accounts else 0.0
+            summary["shares"] = shares_done
             summary["state"] = output.state
             summary["fill_price"] = fill_price
+            # Accounts a holdings-sized sell deliberately left alone, by
+            # reason. Zero orders with every account skipped is "nothing to
+            # sell", and the completion handlers must not call it a failure.
+            summary["skipped"] = dict(((getattr(output, "extra", None) or {})
+                                       .get("skipped")) or {})
 
             # Color the per-broker output block: red if anything failed, else green.
             block_tag = "error" if fail_accounts else ("success" if ok_accounts else None)
@@ -8047,12 +9187,79 @@ class App(ctk.CTk):
         elif r["ok_accounts"] > 0:
             self._log(f"⚠  {r['broker'].capitalize()}: "
                       f"{r['ok_accounts']} ok, {r['fail_accounts']} failed", "warn")
+        elif _nothing_to_sell(r):
+            self._log(f"–  {r['broker'].capitalize()}: nothing to sell — "
+                      f"{_skip_note(r['skipped'])}", "meta")
         else:
             detail = r["errors"][0][:70] if r["errors"] else "failed"
             self._log(f"✘  {r['broker'].capitalize()}: {detail}", "fail")
         if not batch["pending"]:
             batch["finished"] = True
             self._trade_batch_finish(batch)
+
+    def _exit_batch_settle(self, batch: dict, results: List[dict]) -> None:
+        """What an exit batch's Public leg means for the next one.
+
+        Two things, both keyed off the per-account verdicts Public returned:
+
+        A CLEAN PUBLIC LEG SETTLES THE LATE-ROUND-UP CHECK. Every account was
+        read and either sold what was ours or had nothing, so a leg that
+        _sell_plays reopened for a possible late round-up has had its look.
+        Without this it would sit under Sell now forever, because selling a
+        fraction never brings the RAW journal to zero.
+
+        A POSITION READ THAT FAILED HANDS AN AUTO-SELL BACK. The play was
+        claimed before the holdings read (see _autosell_pump), so an account
+        Public could not read would otherwise never be tried again. Retrying
+        cannot double-sell: accounts that did sell read as empty next time and
+        are skipped, and the raw-journal cap stops any account at what we
+        bought. _autosell_retry's attempt ceiling still ends a read that never
+        works.
+        """
+        task = batch.get("exit_task")
+        if task is None:
+            return
+        owed: List[str] = []
+        pub = next((r for r in results if r.get("broker") == "public"), None)
+        if pub is not None:
+            unread = [a for a in (pub.get("accounts") or [])
+                      if not a.get("ok") and "Could not read the position"
+                      in str(a.get("message") or "")]
+            if (not batch.get("dry_run") and not pub.get("fail_accounts")
+                    and not pub.get("errors")):
+                _mark_public_late_checked((task.symbol, task.alert_symbol))
+            if unread:
+                owed.append(f"Public couldn't read "
+                            f"{_plural(len(unread), 'account')} before selling")
+
+        # A leg that failed outright, or a broker the holdings read never got
+        # into, still holds the shares. Same argument as Public's unread
+        # accounts: a retry re-reads LIVE holdings, so whatever did sell reads
+        # as empty and is skipped, and AUTOSELL_MAX_ATTEMPTS ends a broker that
+        # never works. Without it the play is filed as sold — FEED's Robinhood
+        # leg failed three times on 2026-09-29 and was never tried again.
+        #
+        # Only where nothing suggests the order REACHED the broker. A worker
+        # that crashed after the broker took the order also reads as a failed
+        # leg, and a pending, unfilled order still shows the shares on a live
+        # read — that is the double-sell window. So any account message that
+        # talks about the order existing keeps the play claimed; the play-level
+        # back-off (_autosell_play_key) covers the rest by letting a pending
+        # market order fill before anything looks again.
+        dead = sorted(str(r.get("broker")) for r in results
+                      if r.get("broker") != "public"
+                      and not r.get("ok_accounts")
+                      and (r.get("fail_accounts") or r.get("errors"))
+                      and not _order_may_exist(r))
+        if dead:
+            owed.append(f"the order failed at {', '.join(dead)}")
+        if batch.get("unread_brokers"):
+            owed.append(f"couldn't read {', '.join(batch['unread_brokers'])}")
+
+        # Never on a dry run: nothing was sold, and each hand-back is another
+        # real broker login for an order that will not be placed anyway.
+        if owed and batch.get("autosell") and not batch.get("dry_run"):
+            self._autosell_retry(task, "; ".join(owed))
 
     def _trade_batch_finish(self, batch: dict) -> None:
         """Finalize a batch: hide the live strip, show the completion receipt
@@ -8089,8 +9296,10 @@ class App(ctk.CTk):
             except Exception:
                 pass
             self._invalidate_page("mirror")
+            # On screen: redraw (and record the signature, so the next visit
+            # does not redraw it again). Hidden: it is already marked stale.
             if self._active_nav == "mirror":
-                self.after(80, self._render_mirror)
+                self.after(80, lambda: self._render_or_defer("mirror"))
             # This batch landing is what frees the next queued pick. Nudge the
             # drain rather than leaving it to its own poll — otherwise the last
             # batch of a run leaves the queue counter reading "buying 1" with
@@ -8101,11 +9310,27 @@ class App(ctk.CTk):
             kind = "ok"
         elif total_ok > 0:
             kind = "warn"
+        elif results and not failed and any(_nothing_to_sell(r) for r in results):
+            # Every account was read and none had anything of ours to sell --
+            # an answer, not a failure. "Sold IPDN failed on 0 accounts" in
+            # red was how this used to read.
+            kind = "none"
         else:
             kind = "fail"
+        skipped_all: Dict[str, int] = {}
+        for r in results:
+            for k, v in (r.get("skipped") or {}).items():
+                skipped_all[k] = skipped_all.get(k, 0) + int(v or 0)
+
+        if batch.get("exit_task") is not None:
+            self._exit_batch_settle(batch, results)
 
         # --- Notification center summary ---
-        if kind == "ok":
+        if kind == "none":
+            self._push_notification(
+                f"{symbol}: nothing to sell — {_skip_note(skipped_all)}{dry_tag}",
+                "info")
+        elif kind == "ok":
             self._push_notification(
                 f"{verb} {shares_str} {symbol} across {total_ok} "
                 f"account{'s' if total_ok != 1 else ''}{dry_tag}", "success")
@@ -8126,6 +9351,14 @@ class App(ctk.CTk):
             total_ok=total_ok, total_fail=total_fail, ok_brokers=ok_brokers,
             results=results, dry=dry, elapsed=elapsed, batch=batch)
 
+        # A real sell changes what the Sell-now card and the Exits board should
+        # show — the journal just gained the fills they are computed from. Resolve
+        # and Confirm already repaint through _refresh_sell_views; an order that
+        # actually went through never did, so the card kept offering a sell that
+        # had just happened. Deferred so the receipt paints first.
+        if side == "sell" and total_ok > 0 and not dry:
+            self.after(0, self._refresh_sell_views)
+
         # --- Concise, styled feed summary (no ASCII bars) ---
         if kind == "ok":
             head = (f"✔  {verb} {shares_str} {symbol} — "
@@ -8137,6 +9370,10 @@ class App(ctk.CTk):
             head = (f"⚠  {verb} {symbol} with errors — "
                     f"{total_ok} ok, {total_fail} failed · {elapsed:.1f}s{dry_tag}")
             head_tag = "done_warn"
+        elif kind == "none":
+            head = (f"–  Nothing to sell — {_skip_note(skipped_all)}"
+                    f" · {elapsed:.1f}s{dry_tag}")
+            head_tag = "done_none"
         else:
             head = (f"✘  Nothing {verb.lower()} — "
                     f"{total_fail} account{'s' if total_fail != 1 else ''} failed"
@@ -8154,15 +9391,20 @@ class App(ctk.CTk):
 
         # --- Trade Desk output panel (kept; cleaner separator, no === bars) ---
         rule = "─" * 46
-        banner_tag = "banner_ok" if kind == "ok" else "banner_err"
+        banner_tag = {"ok": "banner_ok", "none": "meta"}.get(kind, "banner_err")
         self._trade_result_write(f"{rule}\n{head.strip()}\n", banner_tag)
         for r in sorted(results, key=lambda x: x["broker"]):
             if r["ok_accounts"] > 0 and not r["fail_accounts"]:
                 self._trade_result_write(
-                    f"  ✔ {r['broker'].capitalize()}: {r['ok_accounts']} account(s)\n", "success")
+                    f"  ✔ {r['broker'].capitalize()}: "
+                    f"{_plural(r['ok_accounts'], 'account')}\n", "success")
             elif r["ok_accounts"] > 0:
                 self._trade_result_write(
                     f"  ⚠ {r['broker'].capitalize()}: {r['ok_accounts']} ok, {r['fail_accounts']} failed\n", "warn")
+            elif _nothing_to_sell(r):
+                self._trade_result_write(
+                    f"  – {r['broker'].capitalize()}: nothing to sell — "
+                    f"{_skip_note(r['skipped'])}\n", "meta")
             else:
                 detail = r["errors"][0][:80] if r["errors"] else "failed"
                 self._trade_result_write(
@@ -8205,8 +9447,7 @@ class App(ctk.CTk):
         # Scrollable container (mousewheel only, no visible scrollbar)
         canvas = tk.Canvas(frame, bg=BG_PRIMARY, bd=0, highlightthickness=0)
         scroll_frame = tk.Frame(canvas, bg=BG_PRIMARY)
-        scroll_frame.bind("<Configure>",
-                          lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        _bind_scrollregion(canvas, scroll_frame)
         cw = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(cw, width=e.width))
         canvas.pack(fill="both", expand=True)
@@ -8757,10 +9998,14 @@ class App(ctk.CTk):
         self._chart_sym_data: dict = {}
         self._chart_broker_data: dict = {}
 
-        # Redraw charts when canvases resize
+        # Redraw charts when canvases resize -- once, and only where seen.
+        # Each of the seven canvases fires its own <Configure>, and each used
+        # to redraw ALL seven charts: 49 chart draws per resize step, on a
+        # page that was usually not even on screen. Dragging the window edge
+        # froze the app for 1-2 seconds at a time. See _schedule_chart_redraw.
         def _on_chart_resize(e):
             if e.width > 10:
-                self._redraw_charts()
+                self._schedule_chart_redraw()
 
         self._chart_monthly: dict = {}
         self._chart_daily_pl: dict = {}
@@ -8781,8 +10026,54 @@ class App(ctk.CTk):
         # Initial load
         self.after(200, self._refresh_stats)
 
+    #: Coalesce a burst of <Configure> events (a window drag sends dozens a
+    #: second, seven canvases at a time) into one redraw this long after the
+    #: last of them.
+    _RESIZE_REDRAW_MS = 60
+
+    def _schedule_chart_redraw(self) -> None:
+        """Redraw the charts once the resizing stops -- or, if Analytics is
+        not the page on screen, not at all until it is (see _flush_resize)."""
+        if self._page_hidden("stats"):
+            self._charts_stale = True
+            return
+        pending = self.__dict__.get("_chart_redraw_id")
+        if pending:
+            try:
+                self.after_cancel(pending)
+            except Exception:
+                pass
+        self._chart_redraw_id = self.after(self._RESIZE_REDRAW_MS,
+                                           self._chart_redraw_due)
+
+    def _chart_redraw_due(self) -> None:
+        self._chart_redraw_id = None
+        if self._page_hidden("stats"):
+            self._charts_stale = True       # navigated away inside the window
+            return
+        self._redraw_charts()
+
+    def _flush_resize(self, name: str) -> None:
+        """Catch a page up on resizes it sat out while hidden. Called from
+        _raise_page inside the freeze, so the catch-up never shows."""
+        if name == "stats":
+            pending = self.__dict__.get("_chart_redraw_id")
+            if pending:                 # a debounced redraw not yet due: now
+                try:
+                    self.after_cancel(pending)
+                except Exception:
+                    pass
+                self._chart_redraw_id = None
+                self._charts_stale = True
+            if self.__dict__.get("_charts_stale"):
+                self._redraw_charts()
+        page = self._frames.get(name)
+        if page is not None:
+            RowCanvas.flush_stale(lambda rc: self._page_of(rc) is page)
+
     def _redraw_charts(self) -> None:
         """Redraw all charts with cached data (called on canvas resize)."""
+        self._charts_stale = False
         if (self._chart_trades or self._chart_sym_data or self._chart_broker_data
                 or self._chart_monthly or self._chart_returns
                 or self._chart_daily_pl):
@@ -8977,7 +10268,7 @@ class App(ctk.CTk):
             y = pad_t + plot_h * i / 4
             val = max_v - spread * i / 4
             c.create_line(pad_l, y, W - pad_r, y, fill=GRID_LINE, dash=(2, 4))
-            c.create_text(pad_l - 6, y, text=f"${val:,.0f}", fill=TEXT_MUTED,
+            c.create_text(pad_l - 6, y, text=_money(val, 0), fill=TEXT_MUTED,
                           font=(FONT_FAMILY, FS_NANO), anchor="e")
 
         # Zero line
@@ -9026,7 +10317,7 @@ class App(ctk.CTk):
             # End dot + value annotation
             ex, ey = points[-1]
             c.create_oval(ex - 4, ey - 4, ex + 4, ey + 4, fill=line_color, outline=BG_CARD, width=2)
-            lbl = f"${cum[-1]:+,.0f}"
+            lbl = f"{_money_signed(cum[-1], 0)}"
             tx = ex - 6
             c.create_text(tx, max(ey - 12, pad_t + 6), text=lbl, fill=line_color,
                           font=(FONT_MONO, FS_MICRO, "bold"), anchor="e")
@@ -9096,7 +10387,7 @@ class App(ctk.CTk):
                           font=(FONT_FAMILY, 8, "bold"), anchor="e")
             c.create_rectangle(pad_l, y - bar_h / 2, pad_l + bar_w, y + bar_h / 2,
                                fill=color, outline="")
-            c.create_text(pad_l + bar_w + 6, y, text=f"${val:+,.2f}",
+            c.create_text(pad_l + bar_w + 6, y, text=f"{_money_signed(val, 2)}",
                           fill=color, font=(FONT_MONO, 8), anchor="w")
 
     def _draw_broker_donut(self, broker_data: dict) -> None:
@@ -9268,7 +10559,7 @@ class App(ctk.CTk):
         c.create_line(pad_l, zero_y, W - pad_r, zero_y, fill=BORDER)
         for val, y in ((hi, pad_t), (lo, pad_t + ih)):
             if val:
-                c.create_text(pad_l - 8, y, text=f"${val:,.0f}", anchor="e",
+                c.create_text(pad_l - 8, y, text=_money(val, 0), anchor="e",
                               fill=TEXT_MUTED, font=(FONT_FAMILY, 8))
 
         # A stable colour per broker, taken from the palette rather than
@@ -9343,7 +10634,7 @@ class App(ctk.CTk):
             y = pad_t + plot_h * i / 4
             val = max_v - spread * i / 4
             c.create_line(pad_l, y, W - pad_r, y, fill=GRID_LINE, dash=(2, 4))
-            c.create_text(pad_l - 6, y, text=f"${val:,.0f}", fill=TEXT_MUTED,
+            c.create_text(pad_l - 6, y, text=_money(val, 0), fill=TEXT_MUTED,
                           font=(FONT_FAMILY, FS_NANO), anchor="e")
 
         slot = plot_w / len(months)
@@ -9355,11 +10646,11 @@ class App(ctk.CTk):
             x0, x1 = cx - bar_w / 2, cx + bar_w / 2
             if v >= 0:
                 c.create_rectangle(x0, bar_top, x1, zero_y, fill=color, outline="")
-                c.create_text(cx, bar_top - 7, text=f"${v:,.0f}", fill=color,
+                c.create_text(cx, bar_top - 7, text=_money(v, 0), fill=color,
                               font=(FONT_MONO, FS_NANO), anchor="s")
             else:
                 c.create_rectangle(x0, zero_y, x1, bar_top, fill=color, outline="")
-                c.create_text(cx, bar_top + 7, text=f"${v:,.0f}", fill=color,
+                c.create_text(cx, bar_top + 7, text=_money(v, 0), fill=color,
                               font=(FONT_MONO, FS_NANO), anchor="n")
             # month label (MM/YY)
             yy, mm = m.split("-")
@@ -9478,7 +10769,7 @@ class App(ctk.CTk):
                                   fg=TEXT_PRIMARY)
         pl = s["pl"]
         self._inv_pl.configure(
-            text=f"${pl:+,.2f}" + (f"  ({s['pl_pct']:+.1f}%)"
+            text=f"{_money_signed(pl, 2)}" + (f"  ({s['pl_pct']:+.1f}%)"
                                    if s["pl_pct"] is not None else ""),
             fg=GREEN if pl > 0 else RED if pl < 0 else TEXT_PRIMARY)
         self._inv_holdings.configure(
@@ -9490,7 +10781,7 @@ class App(ctk.CTk):
             notes.append(f"No quote for {', '.join(s['unquoted'])} — counted "
                          f"at cost, not at value.")
         if s["unpriced_buys"]:
-            notes.append(f"{s['unpriced_buys']} buy(s) have no recorded fill "
+            notes.append(f"{_plural(s['unpriced_buys'], 'buy')} have no recorded fill "
                          f"price and contribute no cost basis.")
         self._inv_note.configure(text="  ".join(notes))
 
@@ -9762,13 +11053,13 @@ class App(ctk.CTk):
                 f"{b.capitalize()} {v:+,.2f}"
                 for b, v in sorted(per.items(), key=lambda kv: -abs(kv[1])))
             self._daily_pl_tree.insert("", "end", values=(
-                day, f"${tot:+,.2f}", where, daily_sells.get(day, 0)),
+                day, f"{_money_signed(tot, 2)}", where, daily_sells.get(day, 0)),
                 tags=("win" if tot > 0 else "loss" if tot < 0 else "",))
         if daily_pl:
             best_day = max(daily_pl, key=lambda d: sum(daily_pl[d].values()))
             self._daily_pl_sub.configure(
                 text=f"{len(daily_pl)} trading days   ·   best "
-                     f"${sum(daily_pl[best_day].values()):+,.2f} on {best_day}")
+                     f"{_money_signed(sum(daily_pl[best_day].values()), 2)} on {best_day}")
         else:
             self._daily_pl_sub.configure(text="")
 
@@ -9776,7 +11067,7 @@ class App(ctk.CTk):
         # UPDATE HERO CARD
         # ================================================================
         pl_color = GREEN if realized_pl >= 0 else RED
-        self._hero_pl.configure(text=f"${realized_pl:+,.2f}", fg=pl_color)
+        self._hero_pl.configure(text=f"{_money_signed(realized_pl, 2)}", fg=pl_color)
         sub_parts = []
         if period_label:
             # Named first, because a hero number that has been narrowed to a
@@ -9795,10 +11086,10 @@ class App(ctk.CTk):
         wr_color = GREEN if win_rate >= 50 else RED if closed_count > 0 else TEXT_PRIMARY
         self._hero_win_rate.configure(text=f"{win_rate:.0f}%", fg=wr_color)
         self._hero_best.configure(
-            text=f"${best:+,.2f}" if best != 0 else "—",
+            text=f"{_money_signed(best, 2)}" if best != 0 else "—",
             fg=GREEN if best > 0 else TEXT_PRIMARY)
         self._hero_worst.configure(
-            text=f"${worst:+,.2f}" if worst != 0 else "—",
+            text=f"{_money_signed(worst, 2)}" if worst != 0 else "—",
             fg=RED if worst < 0 else TEXT_PRIMARY)
         self._hero_trades.configure(text=str(total))
         self._hero_volume.configure(text=f"${total_volume:,.0f}")
@@ -9822,7 +11113,7 @@ class App(ctk.CTk):
                 text="∞" if _inf(profit_factor) else f"{profit_factor:.2f}",
                 fg=GREEN if (profit_factor == float("inf") or profit_factor >= 1) else RED)
             self._adv_expectancy.configure(
-                text=f"${expectancy:+,.2f}",
+                text=f"{_money_signed(expectancy, 2)}",
                 fg=GREEN if expectancy > 0 else RED if expectancy < 0 else TEXT_PRIMARY)
             self._adv_payoff.configure(
                 text="∞" if _inf(payoff) else (f"{payoff:.2f}" if payoff else "—"),
@@ -9844,7 +11135,7 @@ class App(ctk.CTk):
             text=f"${avg_win:,.2f}" if win_p else "—",
             fg=GREEN if win_p else TEXT_PRIMARY)
         self._adv_avg_loss.configure(
-            text=f"${avg_loss:,.2f}" if loss_p else "—",
+            text=_money(avg_loss) if loss_p else "—",
             fg=RED if loss_p else TEXT_PRIMARY)
 
         # ================================================================
@@ -9876,12 +11167,12 @@ class App(ctk.CTk):
                 f"${avg_s:,.4f}",
                 f"${cost_basis:,.2f}",
                 f"${revenue:,.2f}",
-                f"${profit:+,.2f}",
+                f"{_money_signed(profit, 2)}",
                 f"{ret_pct:+,.1f}%"),
                 tags=(tag,))
 
         self._closed_total_label.configure(
-            text=f"${realized_pl:+,.2f}  ({grand_ret:+,.1f}%)",
+            text=f"{_money_signed(realized_pl, 2)}  ({grand_ret:+,.1f}%)",
             fg=pl_color)
 
         # ================================================================
@@ -9914,7 +11205,7 @@ class App(ctk.CTk):
                     avg_b = buy_d["buy_cost"] / buy_d["bought"]
                     b_pl += sell_d["sell_rev"] - avg_b * sell_d["sold"]
                     has_closed = True
-            pl_str = f"${b_pl:+,.2f}" if has_closed else "—"
+            pl_str = f"{_money_signed(b_pl, 2)}" if has_closed else "—"
             tag = "win" if b_pl > 0 else "loss" if b_pl < 0 else ""
             self._broker_stats_tree.insert("", "end", values=(
                 b.capitalize(), d["trades"], d["buys"], d["sells"],
@@ -9933,7 +11224,7 @@ class App(ctk.CTk):
             avg_s = d["sell_rev"] / d["sold"] if d["sold"] else 0
             net = d["bought"] - d["sold"]
             pl = d["sell_rev"] - (avg_b * d["sold"]) if d["sold"] and d["bought"] else 0
-            pl_str = f"${pl:+,.2f}" if d["sold"] and d["bought"] else "—"
+            pl_str = f"{_money_signed(pl, 2)}" if d["sold"] and d["bought"] else "—"
             tag = "win" if pl > 0 else "loss" if pl < 0 else ""
             self._symbol_stats_tree.insert("", "end", values=(
                 s, d["trades"],
@@ -10127,7 +11418,7 @@ class App(ctk.CTk):
             f"Buy  @ ${buy:.4f}  =  ${cost:,.2f}",
             f"Sell @ ${sell:.4f}  =  ${revenue:,.2f}",
             f"",
-            f"Profit: ${profit:+,.2f}  ({pct:+.1f}%)",
+            f"Profit: {_money_signed(profit, 2)}  ({pct:+.1f}%)",
         ]
         color = GREEN if profit >= 0 else RED
         self._sim_result.configure(text="\n".join(lines), fg=color)
@@ -10189,7 +11480,7 @@ class App(ctk.CTk):
         self._mirror_executed -= stale
         self._save_mirror_state()
         syms = ", ".join(sorted(k[1] for k in stale))
-        self._log(f"Mirror: released {len(stale)} pick(s) marked executed but "
+        self._log(f"Mirror: released {_plural(len(stale), 'pick')} marked executed but "
                   f"never bought — {syms}")
 
     def _save_mirror_state(self) -> None:
@@ -10215,6 +11506,10 @@ class App(ctk.CTk):
             "failed_notes": [[d, sym, txt] for (d, sym), txt
                              in self._mirror_failed_notes.items()],
             "max_age_days": self._mirror_max_age_days(),
+            # Run ids taken off the Mirror page's NEEDS ATTENTION by hand.
+            # Bounded: runs older than 30 days drop off the list anyway.
+            "attention_dismissed": sorted(
+                getattr(self, "_mirror_attention_dismissed", ()))[-300:],
         }
         try:
             _write_json(MIRROR_STATE_FILE, state)
@@ -10228,8 +11523,7 @@ class App(ctk.CTk):
         # Scrollable
         canvas = tk.Canvas(frame, bg=BG_PRIMARY, bd=0, highlightthickness=0)
         scroll_frame = tk.Frame(canvas, bg=BG_PRIMARY)
-        scroll_frame.bind("<Configure>",
-                          lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        _bind_scrollregion(canvas, scroll_frame)
         cw = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(cw, width=e.width))
         canvas.pack(fill="both", expand=True)
@@ -10274,6 +11568,8 @@ class App(ctk.CTk):
             except (TypeError, ValueError):
                 continue
             self._mirror_failed_notes[(d, sym)] = str(txt)
+        self._mirror_attention_dismissed: set = {
+            str(x) for x in (saved.get("attention_dismissed") or [])}
         # Repaired once the picks actually land — see _render_quick_picks. The
         # feed is still empty at build time.
         self._mirror_repaired = False
@@ -10420,7 +11716,7 @@ class App(ctk.CTk):
         # Executed picks count
         count = len(self._mirror_executed)
         self._mirror_exec_count = tk.Label(
-            toggle_frame, text=f"{count} pick(s) already executed",
+            toggle_frame, text=f"{_plural(count, 'pick')} already executed",
             bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 8))
         self._mirror_exec_count.pack(side="left", padx=(16, 0))
 
@@ -10614,7 +11910,7 @@ class App(ctk.CTk):
             return
         if result.get("inserted"):
             self.after(0, lambda: self._log(
-                f"Cloud sync: uploaded {result['inserted']} new trade(s)"))
+                f"Cloud sync: uploaded {_plural(result['inserted'], 'new trade')}"))
         self.after(0, self._cloud_refresh_ui)
 
     def _cloud_push_async(self, force: bool = False) -> None:
@@ -10822,7 +12118,7 @@ class App(ctk.CTk):
             f"Checking {_mirror_schedule_label()} on market days · buying picks "
             f"up to {age} day{'s' if age != 1 else ''} old · one pick at a time")
         self._push_notification(
-            f"Mirror trading resumed on {len(self._mirror_selected_brokers)} broker(s)",
+            f"Mirror trading resumed on {_plural(len(self._mirror_selected_brokers), 'broker')}",
             "info")
         self._invalidate_page("mirror")
         self._mirror_poll()
@@ -10848,7 +12144,7 @@ class App(ctk.CTk):
             self._mirror_log_msg("Mirror trading DISABLED")
             if dropped:
                 self._mirror_log_msg(
-                    f"Dropped {len(dropped)} queued pick(s), not bought: "
+                    f"Dropped {_plural(len(dropped), 'queued pick')}, not bought: "
                     + ", ".join(dropped))
             if any(not b.get("finished") for b in self._mirror_active):
                 self._mirror_log_msg(
@@ -10876,12 +12172,12 @@ class App(ctk.CTk):
             # once is the behaviour this dialog used to under-sell.
             mins = max(1, round(len(pending) * (MIRROR_PICK_GAP_MS / 60000.0)))
             pending_txt = (
-                f"{len(pending)} pick(s) have no buy on record yet and will be "
+                f"{_plural(len(pending), 'pick')} have no buy on record yet and will be "
                 f"bought at the next check:\n\n  {names}\n\n"
                 f"They go out ONE AT A TIME — the next only starts once the "
                 f"previous one has reported back, plus a "
                 f"{MIRROR_PICK_GAP_MS // 1000}s gap. Expect this to take "
-                f"noticeably longer than {mins} minute(s).\n\n")
+                f"noticeably longer than {_plural(mins, 'minute')}.\n\n")
         else:
             pending_txt = "Nothing is waiting to be bought right now.\n\n"
 
@@ -10919,7 +12215,7 @@ class App(ctk.CTk):
             f"one pick at a time, {MIRROR_PICK_GAP_MS // 1000}s apart")
         if pending:
             self._mirror_log_msg(
-                f"{len(pending)} unbought pick(s) queued: "
+                f"{_plural(len(pending), 'unbought pick')} queued: "
                 + ", ".join(str(p.get("symbol", "?")) for p in pending))
         self._save_mirror_state()
         self._invalidate_page("mirror")
@@ -11018,8 +12314,8 @@ class App(ctk.CTk):
         who = _names(attempted) or "no broker"
 
         if already:
-            note = f"{who} did not fill · {len(already)} broker(s) already hold it"
-            detail = (f"{symbol}: {who} filled 0 of {total_fail} account(s). The "
+            note = f"{who} did not fill · {_plural(len(already), 'broker')} already hold it"
+            detail = (f"{symbol}: {who} filled 0 of {_plural(total_fail, 'account')}. The "
                       f"other {len(already)} ({_names(already)}) already hold it "
                       f"and were not asked — you are not out of this play, you "
                       f"are short {who}.")
@@ -11027,8 +12323,8 @@ class App(ctk.CTk):
                      f"fill. The rest already hold it.")
             kind = "warning"
         else:
-            note = f"no broker filled · {total_fail} account(s) rejected"
-            detail = (f"{symbol}: filled on NO broker ({total_fail} account(s) "
+            note = f"no broker filled · {_plural(total_fail, 'account')} rejected"
+            detail = (f"{symbol}: filled on NO broker ({_plural(total_fail, 'account')} "
                       f"rejected across {who}) — not retried, handle it manually")
             toast = f"Mirror: {symbol} filled on no broker — needs manual action"
             kind = "error"
@@ -11147,15 +12443,22 @@ class App(ctk.CTk):
             return
         trigger = trigger or ("manual" if when == "manual" else "schedule")
         self._mirror_log_msg(f"Scheduled check ({when})...")
+        # Everything the worker needs from the app, read HERE on the Tk thread.
+        # The age limit is an IntVar, and a Tk variable read from another
+        # thread has to marshal into the main loop — at best a stall while the
+        # UI is busy, at worst a "main thread is not in main loop" error that
+        # silently costs the slot. The executed/queued sets are copied for the
+        # same reason: the main thread keeps changing them while this runs.
+        max_age = self._mirror_max_age_days()
+        executed = set(self._mirror_executed)
+        queued = {self._mirror_key(p) for p in self._mirror_queue}
 
         def _worker():
             try:
                 picks = _fetch_quick_picks()
                 bought = self._mirror_bought_keys(picks)
-                max_age = self._mirror_max_age_days()
                 new_picks = []
                 skipped: List[Dict[str, str]] = []
-                queued = {self._mirror_key(p) for p in self._mirror_queue}
                 for pick in picks:
                     note = pick.get("note", "").lower()
                     sym = str(pick.get("symbol", "")).upper()
@@ -11167,7 +12470,7 @@ class App(ctk.CTk):
                         skipped.append({"symbol": sym,
                                         "reason": _mirror_skip_reason(note)})
                         continue
-                    if self._mirror_key(pick) in self._mirror_executed:
+                    if self._mirror_key(pick) in executed:
                         skipped.append({"symbol": sym, "reason": "already executed"})
                         continue
                     if self._mirror_key(pick) in queued:
@@ -11179,7 +12482,8 @@ class App(ctk.CTk):
                     if self._mirror_journal_key(pick) in bought:
                         skipped.append({"symbol": sym, "reason": "already bought"})
                         continue
-                    if not self._mirror_pick_age_ok(pick):
+                    # _mirror_pick_age_ok, with the limit read up front.
+                    if not _pick_is_fresh(pick, max_age):
                         skipped.append({"symbol": sym,
                                         "reason": f"older than the {max_age}-day limit"})
                         continue
@@ -11239,7 +12543,7 @@ class App(ctk.CTk):
         if len(fresh) > 1 or not was_idle:
             syms = ", ".join(str(p.get("symbol") or "?").upper() for p in fresh)
             self._mirror_log_msg(
-                f"Queued {len(fresh)} pick(s): {syms}")
+                f"Queued {_plural(len(fresh), 'pick')}: {syms}")
             self._mirror_log_msg(
                 f"Executing one at a time, {MIRROR_PICK_GAP_MS // 1000}s "
                 f"after each one reports — this is deliberate, not a stall")
@@ -11259,6 +12563,14 @@ class App(ctk.CTk):
         self._mirror_drain_id = None
         if not self._mirror_enabled.get():
             self._mirror_queue = []
+            # Switched off mid-run: finished batches are dropped here too (they
+            # used to linger, and the sell queue waits on this list), and the
+            # sells get their look now rather than at the next hourly tick.
+            self._mirror_active = [b for b in self._mirror_active
+                                   if not b.get("finished")]
+            if getattr(self, "_mirror_ran", False) and not self._mirror_active:
+                self._mirror_ran = False
+                self._autosell_schedule_check("buys finished", AUTOSELL_RECHECK_MS)
             self._render_mirror_queue_lbl()
             return
 
@@ -11286,6 +12598,12 @@ class App(ctk.CTk):
         self._render_mirror_queue_lbl()
 
         if not self._mirror_queue:
+            # The run is over: buys first, then straight on to the sells. The
+            # sell queue has been holding for us (_autosell_pump), and exits
+            # that arrived mid-run are on the board waiting to be looked at.
+            if not self._mirror_active and getattr(self, "_mirror_ran", False):
+                self._mirror_ran = False
+                self._autosell_schedule_check("buys finished", AUTOSELL_RECHECK_MS)
             return
 
         def _again(ms: int) -> None:
@@ -11308,18 +12626,28 @@ class App(ctk.CTk):
         # Desk has honoured it since the AIFA double-sell.
         busy = sorted(set(self._mirror_selected_brokers)
                       & getattr(self, "_brokers_in_flight", set()))
+        # A sell's holdings read is out: it drives the same broker sessions but
+        # is not a batch, so _brokers_in_flight cannot see it. It is a minute
+        # or two; the order it leads to is caught by the check above.
+        # Bounded like everything else that waits: a read older than the
+        # queue's own wedge threshold is not worth holding the buys for.
+        read_at = getattr(self, "_queue_busy_at", None)
+        if (not busy and getattr(self, "_queue_busy", False) and read_at
+                and (now - read_at).total_seconds() < AUTOSELL_STALL_SECS):
+            busy = ["a sell's holdings read"]
         if busy:
             if (self._mirror_busy_logged is None
                     or (now - self._mirror_busy_logged).total_seconds() >= 120):
                 self._mirror_busy_logged = now
                 self._mirror_log_msg(
                     f"Waiting — {', '.join(busy)} already mid-order "
-                    f"({len(self._mirror_queue)} pick(s) still queued)")
+                    f"({_plural(len(self._mirror_queue), 'pick')} still queued)")
             _again(MIRROR_DRAIN_POLL_MS)
             return
         self._mirror_busy_logged = None
 
         self._mirror_launch_pick(self._mirror_queue.pop(0))
+        self._mirror_ran = True
         self._mirror_settled_at = None
         self._render_mirror_queue_lbl()
         if self._mirror_queue:
@@ -11369,7 +12697,7 @@ class App(ctk.CTk):
         # bury a pick the user cancelled before it ever ran.
         self._mirror_executed.add(key)
         self._mirror_exec_count.configure(
-            text=f"{len(self._mirror_executed)} pick(s) already executed")
+            text=f"{_plural(len(self._mirror_executed), 'pick')} already executed")
         if not selected:
             self._save_mirror_state()
             return
@@ -11709,7 +13037,7 @@ class App(ctk.CTk):
                 ru = sorted({r.symbol for r in batch.roundups})
                 self.after(0, lambda: self._alerts_log_msg(
                     f"SELL — read {len(sell_msgs)} messages, "
-                    f"{len(batch.sells)} exit(s): " + (", ".join(exits) or "none")
+                    f"{_plural(len(batch.sells), 'exit')}: " + (", ".join(exits) or "none")
                     + (f" | round-ups: {', '.join(ru)}" if ru else "")))
             else:
                 self.after(0, lambda: self._alerts_log_msg(
@@ -11829,7 +13157,7 @@ class App(ctk.CTk):
         if added:
             syms = ", ".join(sorted({p["symbol"] for p in added}))
             self.after(0, lambda: self._alerts_log_msg(
-                f"Imported {len(added)} pick(s): {syms}"))
+                f"Imported {_plural(len(added), 'pick')}: {syms}"))
             self.after(0, lambda: self._push_notification(
                 f"Alert feed: imported {syms}", "success"))
             self.after(0, lambda: self._mirror_after_import(added))
@@ -11841,7 +13169,7 @@ class App(ctk.CTk):
             lines = ", ".join(
                 f"{s.symbol} {s.proceeds_text}" for s in batch.sells[-6:])
             self.after(0, lambda: self._alerts_log_msg(
-                f"{len(batch.sells)} exit(s): {lines}"))
+                f"{_plural(len(batch.sells), 'exit')}: {lines}"))
             # Persist them: exits used to exist only as this one log line, so
             # the brokerage each alert named was lost the moment it scrolled.
             incoming = batch.to_json().get("sells") or []
@@ -11984,6 +13312,14 @@ class App(ctk.CTk):
         # Which run rows are open. Held on the app, not the widgets, so a
         # re-render (a new run landing, say) doesn't collapse what you expanded.
         self._mirror_expanded: set = set()
+        # Same for the feed checks whose skip lists are open.
+        self._mirror_scans_open: set = set()
+        # How much history is on screen. The whole log is up to 400 runs and
+        # 400 checks; drawing all of it is what made this page crawl, and the
+        # question it answers is almost always about the last few.
+        self._mirror_runs_limit = self.MIRROR_RUNS_PAGE
+        self._mirror_scans_limit = self.MIRROR_SCANS_PAGE
+        self._mirror_view: Optional[tk.Frame] = None
 
         head = tk.Frame(frame, bg=BG_PRIMARY)
         head.pack(fill="x", pady=(0, 10))
@@ -12034,28 +13370,62 @@ class App(ctk.CTk):
 
     # ---- Mirror page rendering ---------------------------------------------
 
+    MIRROR_RUNS_PAGE = 20
+    MIRROR_SCANS_PAGE = 10
+
     def _render_mirror(self) -> None:
+        """Bring the page up to date.
+
+        The status and KPI cards are built once and then updated in place —
+        they are the same boxes every time, only the numbers move. Everything
+        below them (attention, run history, feed checks) is drawn on ONE
+        RowCanvas in a fresh container that replaces the old one in a single
+        step; the old one is unmapped and destroyed later in idle slices (see
+        _bury). The old page used to be torn down first and rebuilt in view,
+        ~400 widgets at a time.
+        """
         if not hasattr(self, "_mirror_body"):
             return
-        for w in self._mirror_body.winfo_children():
-            w.destroy()
-
+        view = tk.Frame(self._mirror_body, bg=BG_PRIMARY)
         try:
+            self._render_mirror_into(view)
+        except Exception:
+            view.destroy()
+            raise
+        old = self._mirror_view
+        if old is not None and old.winfo_manager():
+            view.pack(fill="x", before=old)
+        else:
+            view.pack(fill="x")
+        self._mirror_view = view
+        keep = {view, getattr(self, "_mirror_status_card", None),
+                getattr(self, "_mirror_kpi_card", None)}
+        # Unmapped now, destroyed in idle.
+        self._bury(*[w for w in self._mirror_body.winfo_children() if w not in keep])
+
+    def _render_mirror_into(self, body) -> None:
+        try:
+            # One parse at most: mirror_journal serves all three from memory.
             runs = mirror_journal.runs()
-            stats = mirror_journal.summary(days=30)
-            scans = mirror_journal.scans(limit=40)
+            stats = dict(mirror_journal.summary(days=30))
+            scans = mirror_journal.scans()
+            # The journal lists every run that filled nowhere for 30 days.
+            # Only the ones still unbought and not dismissed need a human.
+            stats["nowhere"] = self._mirror_needs_attention(runs, stats["nowhere"])
         except Exception as exc:
-            self._empty_state(self._mirror_body, "error", "Could not read the run log",
+            self._mirror_show_cards(status=False, kpis=False)
+            self._empty_state(body, "error", "Could not read the run log",
                               str(exc)[:200]).pack(fill="x")
             return
 
-        self._mirror_render_status(self._mirror_body, stats)
+        self._mirror_update_status(stats)
 
         if not runs and not scans:
+            self._mirror_show_cards(status=True, kpis=False)
             self._mirror_page_summary.configure(text="No automated runs yet")
             self._mirror_page_stamp.configure(text="")
             self._empty_state(
-                self._mirror_body, "lightning", "Automation hasn't run yet",
+                body, "lightning", "Automation hasn't run yet",
                 "Turn Mirror Trading on from Automation and pick your brokers. "
                 "Every check it makes and every order it places is recorded "
                 "here — including the accounts that refuse, and why.").pack(fill="x")
@@ -12064,36 +13434,104 @@ class App(ctk.CTk):
         filled = stats["ok_accounts"]
         attempted = stats["attempted"]
         self._mirror_page_summary.configure(
-            text=f"{stats['runs']} run(s) · {stats['symbols']} symbol(s) · "
+            text=f"{_plural(stats['runs'], 'run')} · {_plural(stats['symbols'], 'symbol')} · "
                  f"{filled}/{attempted} accounts filled   ·   last 30 days")
         last = stats["last_run"] or stats["last_scan"]
         stamp = (last or {}).get("started_at") or (last or {}).get("at") or ""
         self._mirror_page_stamp.configure(
             text=f"last activity {stamp.replace('T', ' ')}" if stamp else "")
 
-        self._mirror_render_kpis(self._mirror_body, stats)
+        self._mirror_update_kpis(stats)
+        self._mirror_show_cards(status=True, kpis=True)
 
+        recipes: list = []
         nowhere = stats["nowhere"]
         if nowhere:
-            self._mirror_render_attention(self._mirror_body, nowhere)
+            recipes += self._mirror_attention_recipes(nowhere)
+        recipes += self._mirror_run_recipes(runs)
+        recipes += self._mirror_scan_recipes(scans)
+        rc = RowCanvas(body, bg=BG_PRIMARY)
+        rc.pack(fill="x")
+        rc.set_rows(recipes)
+        self._mirror_list_canvas = rc
 
-        self._mirror_render_runs(self._mirror_body, runs)
-        self._mirror_render_scans(self._mirror_body, scans)
+    def _mirror_show_more(self, which: str) -> None:
+        if which == "runs":
+            self._mirror_runs_limit += self.MIRROR_RUNS_PAGE
+        else:
+            self._mirror_scans_limit += self.MIRROR_SCANS_PAGE
+        self._render_or_defer("mirror")
 
-    def _mirror_render_status(self, parent, stats: dict) -> None:
+    def _mirror_redraw_lists(self) -> None:
+        rc = getattr(self, "_mirror_list_canvas", None)
+        if rc is not None:
+            try:
+                rc.redraw()
+            except tk.TclError:
+                pass
+
+    def _mirror_show_cards(self, *, status: bool, kpis: bool) -> None:
+        """Pack/unpack the two retained cards, keeping them above the lists."""
+        for card, want in ((getattr(self, "_mirror_status_card", None), status),
+                           (getattr(self, "_mirror_kpi_card", None), kpis)):
+            if card is None:
+                continue
+            if want and not card.winfo_manager():
+                view = self._mirror_view
+                if view is not None and view.winfo_manager():
+                    card.pack(fill="x", pady=(0, SP_MD), before=view)
+                else:
+                    card.pack(fill="x", pady=(0, SP_MD))
+            elif not want and card.winfo_manager():
+                card.pack_forget()
+        # Order matters when both are up: status first.
+        st = getattr(self, "_mirror_status_card", None)
+        kp = getattr(self, "_mirror_kpi_card", None)
+        if st is not None and kp is not None and st.winfo_manager() and kp.winfo_manager():
+            kp.pack_configure(after=st)
+
+    def _mirror_update_status(self, stats: dict) -> None:
         """Is it armed, on what, and when does it next look."""
+        if getattr(self, "_mirror_status_card", None) is None:
+            self._mirror_build_status()
         on = bool(getattr(self, "_mirror_enabled", None) and self._mirror_enabled.get())
         brokers = sorted(getattr(self, "_mirror_selected_brokers", ()))
+        ref = self._mirror_status_refs
+        ref["dot"].set_color(GREEN if on else RED)
+        ref["state"].configure(text="ACTIVE" if on else "OFF", fg=GREEN if on else RED)
+        _age = self._mirror_max_age_days()
+        last_scan = stats.get("last_scan") or {}
+        values = {
+            "BROKERS ARMED": (", ".join(b.capitalize() for b in brokers)
+                              if brokers else "none selected",
+                              TEXT_PRIMARY if brokers else RED),
+            "SCHEDULE": (_mirror_schedule_label(), TEXT_PRIMARY),
+            "BUYS": ("1 share of each new Reg Alert, one pick at a time", TEXT_PRIMARY),
+            "MAX AGE": (f"{_age} day{'s' if _age != 1 else ''}", TEXT_PRIMARY),
+            "LAST CHECK": ((last_scan.get("at") or "—").replace("T", " ")[:16] or "—",
+                           TEXT_PRIMARY),
+        }
+        for label, (text, fg) in values.items():
+            ref["facts"][label].configure(text=text, fg=fg)
+        note = ref["note"]
+        if on and note.winfo_manager():
+            note.pack_forget()
+        elif not on and not note.winfo_manager():
+            note.pack(fill="x", padx=SP_XL, pady=(0, SP_LG))
 
-        card = RoundedFrame(parent, bg_color=BG_CARD, border_color=BORDER, radius=RAD_MD)
-        card.pack(fill="x", pady=(0, SP_MD))
+    def _mirror_build_status(self) -> None:
+        card = RoundedFrame(self._mirror_body, bg_color=BG_CARD, border_color=BORDER,
+                            radius=RAD_MD)
+        self._mirror_status_card = card
+        refs: Dict[str, Any] = {"facts": {}}
 
         row = tk.Frame(card.inner, bg=BG_CARD)
         row.pack(fill="x", padx=SP_XL, pady=(SP_LG, SP_SM))
-        StatusDot(row, color=GREEN if on else RED, size=9).pack(side="left", padx=(0, 9))
-        tk.Label(row, text="ACTIVE" if on else "OFF", bg=BG_CARD,
-                 fg=GREEN if on else RED,
-                 font=(FONT_FAMILY, FS_H2, "bold")).pack(side="left")
+        refs["dot"] = StatusDot(row, color=RED, size=9)
+        refs["dot"].pack(side="left", padx=(0, 9))
+        refs["state"] = tk.Label(row, text="OFF", bg=BG_CARD, fg=RED,
+                                 font=(FONT_FAMILY, FS_H2, "bold"))
+        refs["state"].pack(side="left")
         tk.Label(row, text="   Mirror Trading", bg=BG_CARD, fg=TEXT_PRIMARY,
                  font=(FONT_FAMILY, FS_H2, "bold")).pack(side="left")
         PillButton(row, text="Manage", command=lambda: self._show_frame("settings"),
@@ -12102,39 +13540,47 @@ class App(ctk.CTk):
 
         facts = tk.Frame(card.inner, bg=BG_CARD)
         facts.pack(fill="x", padx=SP_XL, pady=(0, SP_LG))
-
-        def _fact(label: str, value: str, fg: str = TEXT_PRIMARY) -> None:
+        for label in ("BROKERS ARMED", "SCHEDULE", "BUYS", "MAX AGE", "LAST CHECK"):
             box = tk.Frame(facts, bg=BG_CARD)
             box.pack(side="left", padx=(0, SP_2XL))
             tk.Label(box, text=label, bg=BG_CARD, fg=TEXT_MUTED,
                      font=(FONT_FAMILY, FS_NANO, "bold")).pack(anchor="w")
-            tk.Label(box, text=value, bg=BG_CARD, fg=fg,
-                     font=(FONT_FAMILY, FS_BODY)).pack(anchor="w", pady=(2, 0))
+            val = tk.Label(box, text="", bg=BG_CARD, fg=TEXT_PRIMARY,
+                           font=(FONT_FAMILY, FS_BODY))
+            val.pack(anchor="w", pady=(2, 0))
+            refs["facts"][label] = val
 
-        _fact("BROKERS ARMED",
-              ", ".join(b.capitalize() for b in brokers) if brokers else "none selected",
-              TEXT_PRIMARY if brokers else RED)
-        _fact("SCHEDULE", _mirror_schedule_label())
-        _fact("BUYS", "1 share of each new Reg Alert, one pick at a time")
-        _age = self._mirror_max_age_days()
-        _fact("MAX AGE", f"{_age} day{'s' if _age != 1 else ''}")
-        last_scan = stats.get("last_scan") or {}
-        _fact("LAST CHECK",
-              (last_scan.get("at") or "—").replace("T", " ")[:16] or "—")
+        note = tk.Frame(card.inner, bg=BG_INPUT)
+        tk.Label(note, text=icon("info"), bg=BG_INPUT, fg=TEXT_MUTED,
+                 font=(ICON_FONT, 11)).pack(side="left", padx=(12, 8), pady=9)
+        tk.Label(note, text="Automation is off — nothing new will be bought. "
+                            "The history below is kept either way.",
+                 bg=BG_INPUT, fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 9)).pack(side="left", pady=9)
+        refs["note"] = note
+        self._mirror_status_refs = refs
 
-        if not on:
-            note = tk.Frame(card.inner, bg=BG_INPUT)
-            note.pack(fill="x", padx=SP_XL, pady=(0, SP_LG))
-            tk.Label(note, text=icon("info"), bg=BG_INPUT, fg=TEXT_MUTED,
-                     font=(ICON_FONT, 11)).pack(side="left", padx=(12, 8), pady=9)
-            tk.Label(note, text="Automation is off — nothing new will be bought. "
-                                "The history below is kept either way.",
-                     bg=BG_INPUT, fg=TEXT_SECONDARY,
-                     font=(FONT_FAMILY, 9)).pack(side="left", pady=9)
+    def _mirror_update_kpis(self, stats: dict) -> None:
+        if getattr(self, "_mirror_kpi_card", None) is None:
+            self._mirror_build_kpis()
+        rate = stats["fill_rate"]
+        tiles = [
+            (f"{stats['runs']}", f"{_plural(stats['symbols'], 'symbol')} attempted", TEXT_PRIMARY),
+            (f"{stats['ok_accounts']}", f"of {stats['attempted']} attempted", GREEN),
+            (f"{rate * 100:.0f}%" if stats["attempted"] else "—",
+             "accounts filled ÷ attempted",
+             GREEN if rate >= 0.9 else (YELLOW if rate >= 0.6 else RED)),
+            (f"{len(stats['nowhere'])}", "picks no broker took",
+             RED if stats["nowhere"] else TEXT_PRIMARY),
+        ]
+        for (val_lbl, hint_lbl), (value, hint, fg) in zip(self._mirror_kpi_refs, tiles):
+            val_lbl.configure(text=value, fg=fg)
+            hint_lbl.configure(text=hint)
 
-    def _mirror_render_kpis(self, parent, stats: dict) -> None:
-        card = RoundedFrame(parent, bg_color=BG_CARD, border_color=BORDER, radius=RAD_MD)
-        card.pack(fill="x", pady=(0, SP_MD))
+    def _mirror_build_kpis(self) -> None:
+        card = RoundedFrame(self._mirror_body, bg_color=BG_CARD, border_color=BORDER,
+                            radius=RAD_MD)
+        self._mirror_kpi_card = card
         head = tk.Frame(card.inner, bg=BG_CARD)
         head.pack(fill="x", padx=SP_XL, pady=(SP_LG, SP_SM))
         tk.Label(head, text=icon("lightning"), bg=BG_CARD, fg=ACCENT,
@@ -12148,18 +13594,9 @@ class App(ctk.CTk):
         grid.pack(fill="x", padx=SP_XL, pady=(0, SP_LG))
         for i in range(4):
             grid.columnconfigure(i, weight=1, uniform="mkpi")
-
-        rate = stats["fill_rate"]
-        tiles = [
-            ("RUNS", f"{stats['runs']}", f"{stats['symbols']} symbol(s) attempted", TEXT_PRIMARY),
-            ("ACCOUNTS FILLED", f"{stats['ok_accounts']}", f"of {stats['attempted']} attempted", GREEN),
-            ("FILL RATE", f"{rate * 100:.0f}%" if stats["attempted"] else "—",
-             "accounts filled ÷ attempted",
-             GREEN if rate >= 0.9 else (YELLOW if rate >= 0.6 else RED)),
-            ("FILLED NOWHERE", f"{len(stats['nowhere'])}",
-             "picks no broker took", RED if stats["nowhere"] else TEXT_PRIMARY),
-        ]
-        for col, (label, value, hint, fg) in enumerate(tiles):
+        refs = []
+        for col, label in enumerate(("RUNS", "ACCOUNTS FILLED", "FILL RATE",
+                                     "FILLED NOWHERE")):
             tile = tk.Frame(grid, bg=BG_CARD_ALT, highlightbackground=BORDER,
                             highlightthickness=1)
             tile.grid(row=0, column=col, sticky="nsew",
@@ -12169,87 +13606,215 @@ class App(ctk.CTk):
             inner.pack(fill="both", expand=True, padx=SP_MD, pady=SP_MD)
             tk.Label(inner, text=label, bg=BG_CARD_ALT, fg=TEXT_SECONDARY,
                      font=(FONT_FAMILY, FS_MICRO, "bold")).pack(anchor="w")
-            tk.Label(inner, text=value, bg=BG_CARD_ALT, fg=fg,
-                     font=(FONT_MONO, 17, "bold")).pack(anchor="w", pady=(SP_XS, 0))
-            tk.Label(inner, text=hint, bg=BG_CARD_ALT, fg=TEXT_MUTED,
-                     font=(FONT_FAMILY, FS_NANO)).pack(anchor="w")
+            val = tk.Label(inner, text="", bg=BG_CARD_ALT, fg=TEXT_PRIMARY,
+                           font=(FONT_MONO, 17, "bold"))
+            val.pack(anchor="w", pady=(SP_XS, 0))
+            hint = tk.Label(inner, text="", bg=BG_CARD_ALT, fg=TEXT_MUTED,
+                            font=(FONT_FAMILY, FS_NANO))
+            hint.pack(anchor="w")
+            refs.append((val, hint))
+        self._mirror_kpi_refs = refs
 
-    def _mirror_render_attention(self, parent, nowhere: list) -> None:
-        """Runs that filled at no broker. Mirror never retries, so these are
-        the only ones that still need a human."""
-        self._exits_group_header(
-            parent, "NEEDS ATTENTION", "No broker filled these — mirror does not "
-            "retry, so they are still unbought", len(nowhere))
-        for run in reversed(nowhere):
-            row = tk.Frame(parent, bg=BG_INPUT)
-            row.pack(fill="x", pady=(0, 4))
-            tk.Frame(row, bg=RED, width=3).pack(side="left", fill="y")
-            inner = tk.Frame(row, bg=BG_INPUT)
-            inner.pack(side="left", fill="x", expand=True, padx=(12, 12), pady=8)
-            tk.Label(inner, text=run.get("symbol", "?"), bg=BG_INPUT, fg=TEXT_PRIMARY,
-                     font=(FONT_FAMILY, 11, "bold")).pack(side="left")
-            tk.Label(inner,
-                     text=f"   {(run.get('started_at') or '').replace('T', ' ')[:16]}"
-                          f" · {run.get('fail_accounts', 0)} account(s) rejected",
-                     bg=BG_INPUT, fg=TEXT_SECONDARY,
-                     font=(FONT_FAMILY, 9)).pack(side="left")
-            buy = tk.Label(inner, text="Trade manually →",
-                           bg=_blend(ACCENT, BG_INPUT, 0.82), fg=ACCENT_HOVER,
-                           font=(FONT_FAMILY, 9, "bold"), padx=10, pady=3,
-                           cursor="hand2")
-            buy.pack(side="right")
-            buy.bind("<Button-1>",
-                     lambda e, s=run.get("symbol", ""): self._prefill_trade(s, "buy", "1"))
+    def _group_header_recipe(self, title: str, sub: str, count: int):
+        """_exits_group_header, drawn: title + accent count, then the muted
+        sub-line, with the same (14, 8) spacing around it."""
+        tf = (FONT_FAMILY, 11, "bold")
+        sf = (FONT_FAMILY, 8)
 
-    def _mirror_render_runs(self, parent, runs: list) -> None:
-        if not runs:
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            th = rc.line_height(tf)
+            rc.text_run(0, y + 14 + th / 2, [(title, tf, TEXT_PRIMARY),
+                                             (f"  {count}", tf, ACCENT)])
+            sy = y + 14 + th + 2
+            slh = rc.line_height(sf)
+            lines = wrap_lines(rc, sub, sf, min(820, max(200, w)))
+            for i, ln in enumerate(lines):
+                rc.text(0, sy + slh * i + slh / 2, ln, sf, TEXT_MUTED)
+            return 14 + th + 2 + slh * len(lines) + 8
+        return draw
+
+    # The three lists below are drawn on RowCanvases (see modules/canvas_rows):
+    # 20 runs and 10 checks as widgets was ~400 child windows, which took over
+    # a second to map and as long again to tear down on every redraw.
+
+    _MF_SYM = (FONT_FAMILY, 11, "bold")
+    _MF_BODY = (FONT_FAMILY, 9)
+    _MF_MONO = (FONT_MONO, 9)
+    _MF_SMALL = (FONT_FAMILY, 8)
+    _MF_BADGE = (FONT_FAMILY, 8, "bold")
+    _MF_BTN = (FONT_FAMILY, 9, "bold")
+    _MF_DAY = (FONT_FAMILY, 8, "bold")
+    _MF_LEG = (FONT_FAMILY, 10, "bold")
+
+    def _mirror_more_recipe(self, which: str, hidden: int):
+        """'Show N more' under a capped list."""
+        step = self.MIRROR_RUNS_PAGE if which == "runs" else self.MIRROR_SCANS_PAGE
+        text = f"Show {min(step, hidden)} more  ·  {hidden} older"
+
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            lh = rc.line_height(self._MF_BTN)
+            rc.link(4, y + 8 + lh / 2, text, self._MF_BTN, ACCENT, ACCENT_HOVER,
+                    on_click=lambda: self._mirror_show_more(which))
+            return 8 + lh + 14
+        return draw
+
+    @staticmethod
+    def _local_stamp(ts: str) -> str:
+        """A journal timestamp (UTC, with offset) as local 'YYYY-MM-DDTHH:MM:SS',
+        the shape mirror runs are stamped in, so the two compare as strings."""
+        try:
+            dt = datetime.fromisoformat(str(ts))
+        except ValueError:
+            return str(ts)[:19]
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    def _mirror_needs_attention(self, runs: list, nowhere: list) -> list:
+        """The runs that still need a human, out of everything that went wrong.
+
+        The journal keeps every run that filled nowhere for 30 days, and the
+        page used to list all of them — including picks that a later run, or a
+        Trade Desk buy, had since bought. A list that never empties is one you
+        stop reading. A run leaves it when:
+
+          * the trade journal shows the ticker BOUGHT at or after the run
+            started (a later mirror run and a manual buy both land there), or
+          * you dismiss it.
+
+        Also listed: a run that never FINISHED because the app closed under it.
+        Mirror marks a pick executed before its orders go out, so a pick the
+        app died on is never retried — RETO on 2026-09-29 was claimed at
+        08:59:13, no broker ever reported, and nothing said so.
+        """
+        dismissed = getattr(self, "_mirror_attention_dismissed", set())
+        active = {b.get("mirror_run") for b in (getattr(self, "_mirror_active", None) or ())}
+        now = datetime.now()
+        floor = (now - timedelta(days=30)).isoformat(timespec="seconds")
+        stale = (now - timedelta(minutes=30)).isoformat(timespec="seconds")
+        interrupted = [
+            dict(r, _interrupted=True) for r in runs
+            if not r.get("finished_at") and not r.get("dry_run")
+            and (r.get("side") or "buy") == "buy"
+            and floor <= (r.get("started_at") or "") < stale
+            and r.get("id") not in active]
+
+        last_buy: Dict[str, str] = {}               # SYMBOL -> latest buy
+        last_at: Dict[tuple, str] = {}              # (SYMBOL, broker) -> latest
+        try:
+            for t in trade_journal.get_trades():
+                if str(t.get("side", "")).lower() != "buy":
+                    continue
+                sym = str(t.get("symbol", "")).upper()
+                ts = self._local_stamp(t.get("timestamp", ""))
+                if ts > last_buy.get(sym, ""):
+                    last_buy[sym] = ts
+                bk = (sym, str(t.get("broker", "")).lower())
+                if ts > last_at.get(bk, ""):
+                    last_at[bk] = ts
+        except Exception:
+            pass
+
+        out = []
+        for r in list(nowhere) + interrupted:
+            if r.get("id") in dismissed:
+                continue
+            sym = str(r.get("symbol", "")).upper()
+            since = r.get("started_at") or "~"
+            if r.get("_interrupted"):
+                # Its own orders land in the journal too, so "bought anywhere
+                # since" would clear a run that filled at Public and never
+                # reached the other five. Every broker it was going to buy at
+                # has to show the buy.
+                owed = [str(b).lower() for b in (r.get("brokers") or ())]
+                if owed and all(last_at.get((sym, b), "") >= since for b in owed):
+                    continue
+            elif last_buy.get(sym, "") >= since:
+                continue                        # bought since — resolved
+            out.append(r)
+        return out
+
+    def _mirror_dismiss_attention(self, run_id: str) -> None:
+        """Take one run off NEEDS ATTENTION for good. Display only."""
+        if not run_id:
             return
-        self._exits_group_header(
-            parent, "RUN HISTORY",
-            "One row per pick automation acted on — click a row for every "
-            "broker and account it touched", len(runs))
+        if getattr(self, "_mirror_attention_dismissed", None) is None:
+            self._mirror_attention_dismissed = set()
+        self._mirror_attention_dismissed.add(run_id)
+        self._save_mirror_state()
+        self._invalidate_page("mirror")
+        self._render_or_defer("mirror")
 
+    def _mirror_attention_recipes(self, nowhere: list) -> list:
+        """Runs that filled nowhere, or that the app closed under, and that are
+        still unbought. Mirror never retries, so these need a human."""
+        def row(run):
+            if run.get("_interrupted"):
+                reported = len(run.get("legs") or [])
+                what = ("app closed mid-run — no broker reported"
+                        if not reported else
+                        f"app closed mid-run — {reported} of "
+                        f"{len(run.get('brokers') or ())} brokers reported")
+            else:
+                what = f"{_plural(run.get('fail_accounts', 0), 'account')} rejected"
+
+            def draw(rc: RowCanvas, y: int, w: int) -> int:
+                h = 8 + max(rc.line_height(self._MF_SYM),
+                            rc.line_height(self._MF_BTN) + 6) + 8
+                cy = y + h / 2
+                rc.rect(0, y, w, y + h, BG_INPUT)
+                rc.rect(0, y, 3, y + h, YELLOW if run.get("_interrupted") else RED)
+                rc.text_run(3 + 12, cy, [
+                    (run.get("symbol", "?"), self._MF_SYM, TEXT_PRIMARY),
+                    (f"   {(run.get('started_at') or '').replace('T', ' ')[:16]}"
+                     f" · {what}", self._MF_BODY, TEXT_SECONDARY)])
+                x0, _ = rc.pill(w - 12, cy, "Dismiss", self._MF_BTN,
+                                BG_INPUT, TEXT_MUTED, anchor="e",
+                                on_click=lambda i=run.get("id", ""):
+                                    self._mirror_dismiss_attention(i))
+                rc.pill(x0 - 8, cy, "Trade manually →", self._MF_BTN,
+                        _blend(ACCENT, BG_INPUT, 0.82), ACCENT_HOVER, anchor="e",
+                        on_click=lambda s=run.get("symbol", ""): self._prefill_trade(s, "buy", "1"))
+                return h + 4
+            return draw
+
+        return ([self._group_header_recipe(
+                    "NEEDS ATTENTION", "Not bought anywhere yet — mirror does not "
+                    "retry. Clears itself once the ticker is bought", len(nowhere))]
+                + [row(r) for r in reversed(nowhere)])
+
+    def _mirror_run_recipes(self, runs: list) -> list:
+        if not runs:
+            return []
+        recipes = [self._group_header_recipe(
+            "RUN HISTORY",
+            "One row per pick automation acted on — click a row for every "
+            "broker and account it touched", len(runs))]
         day = ""
-        for run in runs:
-            started = (run.get("started_at") or "")
-            rday = started[:10]
+        shown = runs[:self._mirror_runs_limit]
+        for run in shown:
+            rday = (run.get("started_at") or "")[:10]
             if rday != day:
                 day = rday
-                tk.Label(parent, text=rday or "—", bg=BG_PRIMARY, fg=TEXT_MUTED,
-                         font=(FONT_FAMILY, 8, "bold")).pack(anchor="w", pady=(10, 4))
-            self._mirror_run_row(parent, run)
+                recipes.append(self._mirror_day_recipe(rday or "—"))
+            recipes.append(self._mirror_run_recipe(run))
+        if len(runs) > len(shown):
+            recipes.append(self._mirror_more_recipe("runs", len(runs) - len(shown)))
+        return recipes
 
-    def _mirror_run_row(self, parent, run: dict) -> None:
+    def _mirror_day_recipe(self, text: str):
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            lh = rc.line_height(self._MF_DAY)
+            rc.text(0, y + 10 + lh / 2, text, self._MF_DAY, TEXT_MUTED)
+            return 10 + lh + 4
+        return draw
+
+    def _mirror_run_recipe(self, run: dict):
         outcome = mirror_journal.run_outcome(run)
         label, color = self._MIRROR_OUTCOMES.get(outcome, ("—", TEXT_MUTED))
         run_id = run.get("id", "")
-        opened = run_id in self._mirror_expanded
-
-        wrap = tk.Frame(parent, bg=BG_CARD)
-        wrap.pack(fill="x", pady=(0, 4))
-        tk.Frame(wrap, bg=color, width=3).pack(side="left", fill="y")
-        body = tk.Frame(wrap, bg=BG_CARD)
-        body.pack(side="left", fill="x", expand=True)
-
-        row = tk.Frame(body, bg=BG_CARD)
-        row.pack(fill="x", padx=(12, 14), pady=9)
-        tk.Label(row, text=icon("chevdown" if opened else "chevright"), bg=BG_CARD,
-                 fg=TEXT_MUTED, font=(ICON_FONT, 9)).pack(side="left", padx=(0, 8))
-        tk.Label(row, text=(run.get("started_at") or "")[11:16], bg=BG_CARD,
-                 fg=TEXT_MUTED, font=(FONT_MONO, 9)).pack(side="left", padx=(0, 12))
-        tk.Label(row, text=run.get("symbol", "?"), bg=BG_CARD, fg=TEXT_PRIMARY,
-                 font=(FONT_FAMILY, 11, "bold")).pack(side="left")
-        tk.Label(row, text=f"  {run.get('side', 'buy').upper()} {run.get('qty', '1')}",
-                 bg=BG_CARD, fg=TEXT_SECONDARY,
-                 font=(FONT_FAMILY, 9)).pack(side="left", padx=(0, 12))
-        tk.Label(row, text=label, bg=_blend(color, BG_CARD, 0.82), fg=color,
-                 font=(FONT_FAMILY, 8, "bold"), padx=8, pady=2).pack(side="left")
-
         ok = int(run.get("ok_accounts") or 0)
         fail = int(run.get("fail_accounts") or 0)
-        tk.Label(row, text=f"  {ok}/{ok + fail} accounts", bg=BG_CARD,
-                 fg=TEXT_SECONDARY, font=(FONT_MONO, 9)).pack(side="left", padx=(10, 0))
-
         meta = []
         if run.get("dry_run"):
             meta.append("DRY RUN")
@@ -12259,112 +13824,184 @@ class App(ctk.CTk):
             meta.append(run["slot"])
         if run.get("elapsed"):
             meta.append(f"{float(run['elapsed']):.1f}s")
-        tk.Label(row, text=" · ".join(meta), bg=BG_CARD, fg=TEXT_MUTED,
-                 font=(FONT_FAMILY, 8)).pack(side="right")
+        meta_text = " · ".join(meta)
 
-        def _toggle(_e=None, rid=run_id):
-            if rid in self._mirror_expanded:
-                self._mirror_expanded.discard(rid)
-            else:
-                self._mirror_expanded.add(rid)
-            self._invalidate_page("mirror")
-            self._render_mirror()
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            opened = run_id in self._mirror_expanded
+            head_h = 9 + max(rc.line_height(self._MF_SYM),
+                             rc.line_height(self._MF_BADGE) + 4) + 9
+            cy = y + head_h / 2
+            tag = rc.new_tag()
+            rc.rect(0, y, w, y + head_h, BG_CARD, tags=(tag,))
+            x = 3 + 12
+            x = rc.text_run(x, cy, [
+                (icon("chevdown" if opened else "chevright"), (ICON_FONT, 9), TEXT_MUTED),
+            ], tags=(tag,)) + 8
+            x = rc.text_run(x, cy, [((run.get("started_at") or "")[11:16],
+                                     self._MF_MONO, TEXT_MUTED)], tags=(tag,)) + 12
+            x = rc.text_run(x, cy, [
+                (run.get("symbol", "?"), self._MF_SYM, TEXT_PRIMARY),
+                (f"  {run.get('side', 'buy').upper()} {run.get('qty', '1')}",
+                 self._MF_BODY, TEXT_SECONDARY)], tags=(tag,)) + 12
+            _, x = rc.pill(x, cy, label, self._MF_BADGE, _blend(color, BG_CARD, 0.82),
+                           color, padx=8, pady=2, tags=(tag,))
+            rc.text_run(x + 10, cy, [(f"  {ok}/{ok + fail} accounts", self._MF_MONO,
+                                      TEXT_SECONDARY)], tags=(tag,))
+            rc.text(w - 14, cy, meta_text, self._MF_SMALL, TEXT_MUTED, anchor="e",
+                    tags=(tag,))
+            h = head_h
+            if opened:
+                # The detail is not part of the click target: only the header
+                # toggles, as before.
+                h += self._mirror_draw_run_detail(rc, y + head_h, w, run, None)
+                rc.tag_lower(rc.rect(0, y + head_h, w, y + h, BG_CARD))
+            rc.rect(0, y, 3, y + h, color)
+            rc.on_click(tag, lambda rid=run_id: self._mirror_toggle_run(rid))
+            return h + 4
+        return draw
 
-        self._bind_row_click(row, _toggle)
+    def _mirror_toggle_run(self, run_id: str) -> None:
+        """Open/close a run in place: its list is redrawn, nothing rebuilt."""
+        if run_id in self._mirror_expanded:
+            self._mirror_expanded.discard(run_id)
+        else:
+            self._mirror_expanded.add(run_id)
+        self._mirror_redraw_lists()
 
-        if not opened:
-            return
-
-        detail = tk.Frame(body, bg=BG_CARD)
-        detail.pack(fill="x", padx=(30, 14), pady=(0, 10))
-
+    def _mirror_draw_run_detail(self, rc: RowCanvas, y: int, w: int, run: dict,
+                                tag: Optional[str]) -> int:
+        """Every broker and account a run touched, under its row."""
+        top = y
+        x = 30
+        right = w - 14
+        tags = (tag,) if tag else ()
         legs = run.get("legs") or []
         reported = {l.get("broker") for l in legs}
         for leg in sorted(legs, key=lambda l: l.get("broker", "")):
-            self._mirror_leg_block(detail, leg)
+            ok = int(leg.get("ok_accounts") or 0)
+            fail = int(leg.get("fail_accounts") or 0)
+            color = GREEN if ok and not fail else (YELLOW if ok else RED)
+            y += 8
+            lh = rc.line_height(self._MF_LEG)
+            cy = y + lh / 2
+            parts = [(str(leg.get("broker", "?")).capitalize(), self._MF_LEG, TEXT_PRIMARY),
+                     (f"   {ok} filled · {fail} rejected", self._MF_BODY, color)]
+            if leg.get("fill_price") is not None:
+                parts.append((f"   @ ${float(leg['fill_price']):.4f}".rstrip("0").rstrip("."),
+                              self._MF_MONO, TEXT_SECONDARY))
+            rc.text_run(x, cy, parts, tags=tags)
+            rc.text(right, cy, str(leg.get("state", "")), self._MF_SMALL, TEXT_MUTED,
+                    anchor="e", tags=tags)
+            y += lh + 2
+            accounts = leg.get("accounts") or []
+            blh = rc.line_height(self._MF_BODY)
+            if not accounts:
+                reason = (leg.get("errors") or ["no accounts reported"])[0]
+                for ln in wrap_lines(rc, f"    ✘  {reason[:150]}", self._MF_BODY, 760):
+                    rc.text(x, y + blh / 2, ln, self._MF_BODY, RED, tags=tags)
+                    y += blh
+                continue
+            for acct in accounts:
+                good = bool(acct.get("ok"))
+                cy = y + blh / 2
+                ax = rc.text_run(x + 16, cy, [("✔" if good else "✘", self._MF_BODY,
+                                               GREEN if good else RED)], tags=tags) + 8
+                rc.text_run(ax, cy, [
+                    (str(acct.get("account_id") or "—"), self._MF_MONO, TEXT_SECONDARY),
+                    (f"  {str(acct.get('message') or '')[:130]}", self._MF_BODY,
+                     TEXT_MUTED if good else RED)], tags=tags)
+                y += blh
         # A broker that was armed but never reported: the run died before it
         # got there. Silence would read as "it wasn't tried".
         for broker in run.get("brokers") or []:
             if broker not in reported:
-                tk.Label(detail, text=f"{broker.capitalize()} — no result recorded "
-                                      f"(run did not complete)",
-                         bg=BG_CARD, fg=YELLOW,
-                         font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(6, 0))
+                y += 6
+                lh = rc.line_height(self._MF_BODY)
+                rc.text(x, y + lh / 2, f"{broker.capitalize()} — no result recorded "
+                                       f"(run did not complete)",
+                        self._MF_BODY, YELLOW, tags=tags)
+                y += lh
         if run.get("note"):
-            tk.Label(detail, text=f"pick note: {run['note']}  ·  alerted "
-                                  f"{run.get('pick_date') or '—'}",
-                     bg=BG_CARD, fg=TEXT_MUTED,
-                     font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(8, 0))
+            y += 8
+            lh = rc.line_height(self._MF_SMALL)
+            rc.text(x, y + lh / 2, f"pick note: {run['note']}  ·  alerted "
+                                   f"{run.get('pick_date') or '—'}",
+                    self._MF_SMALL, TEXT_MUTED, tags=tags)
+            y += lh
+        y += 10
+        return y - top
 
-    def _mirror_leg_block(self, parent, leg: dict) -> None:
-        ok = int(leg.get("ok_accounts") or 0)
-        fail = int(leg.get("fail_accounts") or 0)
-        color = GREEN if ok and not fail else (YELLOW if ok else RED)
-
-        head = tk.Frame(parent, bg=BG_CARD)
-        head.pack(fill="x", pady=(8, 2))
-        tk.Label(head, text=str(leg.get("broker", "?")).capitalize(), bg=BG_CARD,
-                 fg=TEXT_PRIMARY, font=(FONT_FAMILY, 10, "bold")).pack(side="left")
-        tk.Label(head, text=f"   {ok} filled · {fail} rejected", bg=BG_CARD,
-                 fg=color, font=(FONT_FAMILY, 9)).pack(side="left")
-        if leg.get("fill_price") is not None:
-            tk.Label(head, text=f"   @ ${float(leg['fill_price']):.4f}".rstrip("0").rstrip("."),
-                     bg=BG_CARD, fg=TEXT_SECONDARY,
-                     font=(FONT_MONO, 9)).pack(side="left")
-        tk.Label(head, text=str(leg.get("state", "")), bg=BG_CARD, fg=TEXT_MUTED,
-                 font=(FONT_FAMILY, 8)).pack(side="right")
-
-        accounts = leg.get("accounts") or []
-        if not accounts:
-            reason = (leg.get("errors") or ["no accounts reported"])[0]
-            tk.Label(parent, text=f"    ✘  {reason[:150]}", bg=BG_CARD, fg=RED,
-                     font=(FONT_FAMILY, 9), wraplength=760,
-                     justify="left").pack(anchor="w")
-            return
-        for acct in accounts:
-            good = bool(acct.get("ok"))
-            line = tk.Frame(parent, bg=BG_CARD)
-            line.pack(fill="x")
-            tk.Label(line, text="✔" if good else "✘", bg=BG_CARD,
-                     fg=GREEN if good else RED,
-                     font=(FONT_FAMILY, 9)).pack(side="left", padx=(16, 8))
-            tk.Label(line, text=str(acct.get("account_id") or "—"), bg=BG_CARD,
-                     fg=TEXT_SECONDARY, font=(FONT_MONO, 9)).pack(side="left")
-            tk.Label(line, text=f"  {str(acct.get('message') or '')[:130]}",
-                     bg=BG_CARD, fg=TEXT_MUTED if good else RED,
-                     font=(FONT_FAMILY, 9)).pack(side="left")
-
-    def _mirror_render_scans(self, parent, scans: list) -> None:
+    def _mirror_scan_recipes(self, scans: list) -> list:
         """Every time the schedule woke up — including the quiet ones.
 
         A check that queued nothing is the entry that proves automation is alive,
         and its skip list is where "why didn't it buy that one" gets answered.
+        The skip list opens on click: it used to be a label per skipped pick,
+        always visible — the bulk of the page, for an answer you only want
+        about one check at a time.
         """
         if not scans:
-            return
-        self._exits_group_header(
-            parent, "FEED CHECKS", "Each time automation looked at the feed, and "
-            "what it passed over", len(scans))
-        for scan in scans:
-            row = tk.Frame(parent, bg=BG_PRIMARY)
-            row.pack(fill="x", pady=(0, 2))
-            tk.Label(row, text=(scan.get("at") or "").replace("T", " ")[:16],
-                     bg=BG_PRIMARY, fg=TEXT_MUTED,
-                     font=(FONT_MONO, 9)).pack(side="left", padx=(0, 12))
-            queued = int(scan.get("queued") or 0)
-            tk.Label(row, text=f"{scan.get('considered', 0)} pick(s) seen",
-                     bg=BG_PRIMARY, fg=TEXT_SECONDARY,
-                     font=(FONT_FAMILY, 9)).pack(side="left")
-            tk.Label(row, text=f"  ·  {queued} queued" if queued else "  ·  nothing new",
-                     bg=BG_PRIMARY, fg=ACCENT if queued else TEXT_MUTED,
-                     font=(FONT_FAMILY, 9)).pack(side="left")
-            tk.Label(row, text=scan.get("slot") or "", bg=BG_PRIMARY, fg=TEXT_MUTED,
-                     font=(FONT_FAMILY, 8)).pack(side="right")
-            for skip in (scan.get("skipped") or [])[:12]:
-                tk.Label(parent,
-                         text=f"      {skip.get('symbol', '?')} — {skip.get('reason', 'skipped')}",
-                         bg=BG_PRIMARY, fg=TEXT_MUTED,
-                         font=(FONT_FAMILY, 8)).pack(anchor="w")
+            return []
+        recipes = [self._group_header_recipe(
+            "FEED CHECKS", "Each time automation looked at the feed, and "
+            "what it passed over — click a check for its skip list", len(scans))]
+        shown = scans[:self._mirror_scans_limit]
+        recipes += [self._mirror_scan_recipe(sc) for sc in shown]
+        if len(scans) > len(shown):
+            recipes.append(self._mirror_more_recipe("scans", len(scans) - len(shown)))
+        return recipes
+
+    def _mirror_scan_recipe(self, scan: dict):
+        key = scan.get("at") or ""
+        skips = scan.get("skipped") or []
+        queued = int(scan.get("queued") or 0)
+        lines = [f"      {sk.get('symbol', '?')} — {sk.get('reason', 'skipped')}"
+                 for sk in skips[:12]]
+        if len(skips) > 12:
+            lines.append(f"      … and {len(skips) - 12} more")
+
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            opened = key in self._mirror_scans_open
+            lh = max(rc.line_height(self._MF_BODY), rc.line_height(self._MF_MONO))
+            cy = y + lh / 2
+            tag = rc.new_tag() if skips else None
+            tags = (tag,) if tag else ()
+            if tag:
+                # A transparent hit area, so the whole line is clickable.
+                rc.rect(0, y, w, y + lh, BG_PRIMARY, tags=tags)
+            x = 0
+            if skips:
+                x = rc.text_run(0, cy, [(icon("chevdown" if opened else "chevright"),
+                                         (ICON_FONT, 8), TEXT_MUTED)], tags=tags) + 6
+            x = rc.text_run(x, cy, [(key.replace("T", " ")[:16], self._MF_MONO,
+                                     TEXT_MUTED)], tags=tags) + 12
+            parts = [(f"{_plural(scan.get('considered', 0), 'pick')} seen", self._MF_BODY,
+                      TEXT_SECONDARY),
+                     (f"  ·  {queued} queued" if queued else "  ·  nothing new",
+                      self._MF_BODY, ACCENT if queued else TEXT_MUTED)]
+            if skips:
+                parts.append((f"  ·  {len(skips)} skipped", self._MF_BODY, TEXT_MUTED))
+            rc.text_run(x, cy, parts, tags=tags)
+            rc.text(w, cy, scan.get("slot") or "", self._MF_SMALL, TEXT_MUTED,
+                    anchor="e", tags=tags)
+            h = lh
+            if skips and opened:
+                slh = rc.line_height(self._MF_SMALL)
+                for i, ln in enumerate(lines):
+                    rc.text(0, y + h + slh * i + slh / 2, ln, self._MF_SMALL,
+                            TEXT_MUTED)
+                h += slh * len(lines)
+            if tag:
+                rc.on_click(tag, lambda k=key: self._mirror_toggle_scan(k))
+            return h + 2
+        return draw
+
+    def _mirror_toggle_scan(self, key: str) -> None:
+        if key in self._mirror_scans_open:
+            self._mirror_scans_open.discard(key)
+        else:
+            self._mirror_scans_open.add(key)
+        self._mirror_redraw_lists()
 
     # ---- Exits (the TRACK board) ------------------------------------------
     #
@@ -12453,19 +14090,19 @@ class App(ctk.CTk):
                                        font=(FONT_FAMILY, 9, "bold"))
         self._autosell_pill.pack(side="right")
 
-        tk.Label(body, bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
+        # Secondary, not muted, at 9pt: this is the one paragraph that says
+        # what arming the switch below will do with real money, and at 8pt
+        # muted grey on the card it was the hardest text on the page to read.
+        tk.Label(body, bg=BG_CARD, fg=TEXT_SECONDARY, font=(FONT_FAMILY, 9),
                  justify="left", anchor="w", wraplength=760,
-                 text=("Follows the Sell now board, nothing else: an exit names "
-                       "a brokerage, the journal still shows shares open there, "
-                       "so it reads your live holdings and sells them without "
-                       "asking. It does NOT guess from the split tracker — a "
-                       "play going fractional is not an instruction to sell, and "
-                       "an exit on a play the tracker still calls pending is. "
-                       "The ONE exception is the fractionals box below: a "
-                       "remnant decays whether or not anyone calls it, so "
-                       "nothing would ever come for those. "
-                       f"Market hours only; at most {AUTOSELL_MAX_PER_PULL} plays "
-                       "per batch; never the same play twice.")).pack(
+                 text=("Sells what the Sell now board lists — an exit named the "
+                       "brokerage and the journal still shows shares there — "
+                       "reading your live holdings first, without asking. The "
+                       "split tracker is never an instruction to sell; the one "
+                       "exception is the fractionals box below, because nobody "
+                       "calls an exit on a remnant.\n"
+                       f"Market hours only  ·  at most {AUTOSELL_MAX_PER_PULL} "
+                       "plays per batch  ·  never the same play twice.")).pack(
                            fill="x", pady=(6, 10))
 
         # Per-button armed state. It was a bare bool shared by two sweeps, which
@@ -12518,7 +14155,7 @@ class App(ctk.CTk):
         # board full of called exits.
         self._retry_btn = tk.Button(
             btn_row, text="Retry skipped", command=self._autosell_clear_skipped,
-            bg=BG_CARD, fg=TEXT_MUTED, activebackground=BG_CARD,
+            bg=BG_CARD, fg=TEXT_SECONDARY, activebackground=BG_CARD,
             activeforeground=TEXT_PRIMARY, font=(FONT_FAMILY, 9),
             relief="flat", bd=0, padx=12, pady=7, cursor="hand2",
         )
@@ -12540,8 +14177,9 @@ class App(ctk.CTk):
             return
         self._autosell_sold.clear()
         self._autosell_fails.clear()
+        (getattr(self, "_autosell_retry_after", None) or {}).clear()
         self._save_autosell_state()
-        self._log(f"Auto-sell: cleared {n} attempted play(s) — the sweep will "
+        self._log(f"Auto-sell: cleared {_plural(n, 'attempted play')} — the sweep will "
                   f"offer them again.")
         self._sweep_say(f"Cleared {n} — press the sweep", hold_ms=5000)
 
@@ -12603,13 +14241,28 @@ class App(ctk.CTk):
         """
         if not hasattr(self, "_exits_list"):
             return
-        for w in self._exits_list.winfo_children():
-            w.destroy()
+        # A board nobody is looking at is not redrawn — it is marked stale and
+        # drawn once, on the next visit (_show_frame calls _render_exits_now).
+        # Exits arriving, a sell landing and the hourly pull all ask for this.
+        if self._page_hidden("exits") and getattr(self, "_exits_drawn", False):
+            self._invalidate_page("exits")
+            return
+        self._render_exits_now()
 
+    def _render_exits_now(self) -> None:
+        if not hasattr(self, "_exits_list"):
+            return
+        self._exits_drawn = True
+        # Old rows are unmapped now and destroyed in idle slices (see _bury).
+        self._bury(*self._exits_list.winfo_children())
+
+        # Computed once per render and handed down — the cards used to ask for
+        # the board status map once per play.
         sells = _load_sells()
         plays = _sell_plays(sells) if sells else []
         ready = self._autosell_worklist()
         fracs = self._fractional_worklist(ready)
+        status_map = self._board_status_map()
         self._update_exits_summary(plays, ready, fracs)
 
         if not sells and not fracs:
@@ -12627,11 +14280,16 @@ class App(ctk.CTk):
         for play in plays:
             buckets[play.bucket].append(play)
 
+        # The whole board is ONE canvas: group headings, play cards and the
+        # fractional rows are all drawn. With up to 86 fractional rows (each a
+        # CTk button and a dozen labels before) this page was the heaviest in
+        # the app to open, redraw and leave.
+        recipes: list = []
         if buckets["now"]:
             sh = sum(l.left for p in buckets["now"] for l in p.of(SELL_NOW))
             cash = sum(p.ready_value for p in buckets["now"])
             sub = (f"An exit was called and you still hold it there — "
-                   f"{_qty_text(sh)} share(s), roughly ${cash:,.2f}. This is "
+                   f"{_plural(_qty_text(sh), 'share')}, roughly ${cash:,.2f}. This is "
                    f"exactly what auto-sell and the sweep act on.")
             unlinked = sorted({b for t in ready for b in t.skipped_brokers})
             if unlinked:
@@ -12640,34 +14298,33 @@ class App(ctk.CTk):
                 # "nothing was called there".
                 sub += (f"  Exits at {', '.join(unlinked)} are listed but not "
                         f"swept — no credentials for those here.")
-            self._exits_group_header(self._exits_list, "SELL NOW", sub,
-                                     len(buckets["now"]))
+            recipes.append(self._group_header_recipe("SELL NOW", sub,
+                                                     len(buckets["now"])))
             by_symbol = {t.symbol.upper(): t for t in ready}
             for play in buckets["now"]:
-                self._sell_play_card(self._exits_list, play,
-                                     by_symbol.get(play.symbol.upper()))
+                recipes.append(self._sell_play_recipe(
+                    play, status_map, task=by_symbol.get(play.symbol.upper())))
 
         if fracs:
-            self._exits_group_header(
-                self._exits_list, "FRACTIONAL — NO EXIT COMING",
+            recipes.append(self._group_header_recipe(
+                "FRACTIONAL — NO EXIT COMING",
                 "A fraction came back, which means the split did NOT round you "
                 "up. There is nothing to wait for and nobody calls an exit on a "
                 f"remnant, so these are yours to clear. Only "
                 f"{', '.join(rsa_feed.FRACTIONAL_BROKERS)} return one at all — "
                 "everyone else settled it to cash, so there is no share to sell "
-                "there.", len(fracs))
-            for t in fracs:
-                self._exits_task_row(t)
+                "there.", len(fracs)))
+            recipes += [self._exits_task_recipe(t) for t in fracs]
 
         if buckets["holding"]:
-            self._exits_group_header(
-                self._exits_list, "HOLDING",
+            recipes.append(self._group_header_recipe(
+                "HOLDING",
                 "You are still in these, and no exit has been called for the "
                 "brokerages you hold them at. Nothing to do yet — they move up "
                 "on their own the moment one lands.",
-                len(buckets["holding"]))
-            for play in buckets["holding"]:
-                self._sell_play_card(self._exits_list, play)
+                len(buckets["holding"])))
+            recipes += [self._sell_play_recipe(p, status_map)
+                        for p in buckets["holding"]]
 
         shown_closed, hidden_closed = self._visible_closed(buckets["closed"])
         if shown_closed or hidden_closed:
@@ -12676,48 +14333,48 @@ class App(ctk.CTk):
                    "and dropping it read as 'no exit was ever called'.")
             if hidden_closed and not self._show_confirmed:
                 sub += (f"  {len(hidden_closed)} confirmed and hidden.")
-            self._exits_group_header(self._exits_list, "CLOSED", sub,
-                                     len(shown_closed))
-            self._closed_actions(self._exits_list, shown_closed, hidden_closed)
-            for play in shown_closed:
-                self._sell_play_card(self._exits_list, play, closed=True)
+            recipes.append(self._group_header_recipe("CLOSED", sub,
+                                                     len(shown_closed)))
+            recipes.append(self._closed_actions_recipe(shown_closed, hidden_closed))
+            recipes += [self._sell_play_recipe(p, status_map, closed=True)
+                        for p in shown_closed]
 
-    def _closed_actions(self, parent, shown, hidden, bg: str = BG_PRIMARY) -> None:
+        rc = RowCanvas(self._exits_list, bg=BG_PRIMARY)
+        rc.pack(fill="x")
+        rc.set_rows(recipes)
+
+    def _closed_actions_recipe(self, shown, hidden, bg: str = BG_PRIMARY):
         """Confirm-all and the peek toggle, above the closed cards.
 
         Bulk first, because the whole complaint is volume: ticking off two
         months of finished plays one card at a time is the crowding, not the
         cure.
         """
-        if not shown and not hidden:
-            return
-        bar = tk.Frame(parent, bg=bg)
-        bar.pack(fill="x", pady=(0, 8))
-
         unconfirmed = [p for p in shown
                        if _sell_play_key(p) not in self._confirmed_sells]
-        if unconfirmed:
-            act = tk.Label(bar, text=f"Confirm all {len(unconfirmed)}",
-                           bg=_blend(GREEN, bg, 0.85), fg=GREEN,
-                           font=(FONT_FAMILY, 8, "bold"), padx=10, pady=3,
-                           cursor="hand2")
-            act.pack(side="left")
-            act.bind("<Button-1>",
-                     lambda e, pl=list(unconfirmed): self._confirm_all_closed(pl))
 
-        if hidden:
-            tog = tk.Label(
-                bar,
-                text=("Hide confirmed" if self._show_confirmed
-                      else f"Show {len(hidden)} confirmed"),
-                bg=bg, fg=TEXT_MUTED, font=(FONT_FAMILY, 8, "bold"),
-                padx=10, pady=3, cursor="hand2")
-            tog.pack(side="left", padx=(8, 0))
-            tog.bind("<Button-1>", lambda e: self._toggle_show_confirmed())
-            tog.bind("<Enter>", lambda e, w=tog: w.configure(fg=TEXT_PRIMARY))
-            tog.bind("<Leave>", lambda e, w=tog: w.configure(fg=TEXT_MUTED))
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            if not shown and not hidden:
+                return 0
+            lh = rc.line_height(self._SF_SMALLB) + 6
+            cy = y + lh / 2
+            x = 0
+            if unconfirmed:
+                _, x = rc.pill(0, cy, f"Confirm all {len(unconfirmed)}",
+                               self._SF_SMALLB, _blend(GREEN, bg, 0.85), GREEN,
+                               padx=10, pady=3,
+                               on_click=lambda pl=list(unconfirmed):
+                               self._confirm_all_closed(pl))
+            if hidden:
+                rc.link(x + 8 + 10, cy,
+                        "Hide confirmed" if self._show_confirmed
+                        else f"Show {len(hidden)} confirmed",
+                        self._SF_SMALLB, TEXT_MUTED, TEXT_PRIMARY,
+                        on_click=self._toggle_show_confirmed)
+            return lh + 8
+        return draw
 
-    def _exits_task_row(self, task) -> None:
+    def _exits_task_recipe(self, task):
         """One SellTask as a row: what it is, where, and the two actions.
 
         The play cards above render a SellPlay, which is built from called
@@ -12726,55 +14383,47 @@ class App(ctk.CTk):
         it gets its own, plainer row rather than being forced through a card
         whose whole shape is "which brokerage called this".
         """
-        row = tk.Frame(self._exits_list, bg=BG_INPUT)
-        row.pack(fill="x", pady=(0, 6))
-        tk.Frame(row, bg=ACCENT, width=3).pack(side="left", fill="y")
-        body = tk.Frame(row, bg=BG_INPUT)
-        body.pack(side="left", fill="x", expand=True, padx=14, pady=10)
+        fsym = (FONT_FAMILY, 14, "bold")
 
-        left = tk.Frame(body, bg=BG_INPUT)
-        left.pack(side="left")
-        sym_row = tk.Frame(left, bg=BG_INPUT)
-        sym_row.pack(anchor="w")
-        tk.Label(sym_row, text=task.symbol, bg=BG_INPUT, fg=TEXT_PRIMARY,
-                 font=(FONT_FAMILY, 14, "bold")).pack(side="left")
-        if task.renamed:
-            # The journal knows the old ticker; only the new one can be traded.
-            badge = tk.Frame(sym_row, bg=BG_ELEVATED)
-            badge.pack(side="left", padx=(8, 0))
-            tk.Label(badge, text=f" was {task.alert_symbol} ", bg=BG_ELEVATED,
-                     fg=YELLOW, font=(FONT_FAMILY, 8, "bold")).pack()
+        def draw(rc: RowCanvas, y: int, w: int) -> int:
+            left_h = rc.line_height(fsym) + 2 + rc.line_height(self._SF_SMALLB)
+            h = 10 + max(left_h, 30) + 10
+            cy = y + h / 2
+            rc.rect(0, y, w, y + h, BG_INPUT)
+            rc.rect(0, y, 3, y + h, ACCENT)
+            x0 = 3 + 14
+            top = cy - left_h / 2
+            sy = top + rc.line_height(fsym) / 2
+            x = rc.text_run(x0, sy, [(task.symbol, fsym, TEXT_PRIMARY)])
+            if task.renamed:
+                # The journal knows the old ticker; only the new one can be traded.
+                rc.pill(x + 8, sy, f" was {task.alert_symbol} ", self._SF_SMALLB,
+                        BG_ELEVATED, YELLOW, padx=0, pady=0)
+            my = top + rc.line_height(fsym) + 2 + rc.line_height(self._SF_SMALLB) / 2
+            parts = [(task.status.replace("_", " ").upper(), self._SF_SMALLB, ACCENT),
+                     (f"   ·   {task.alert_date}", self._SF_SMALL, TEXT_MUTED),
+                     (f"   ·   {_plural(task.accounts, 'account')} at {', '.join(task.brokers)}",
+                      self._SF_SMALL, TEXT_SECONDARY)]
+            if task.skipped_brokers:
+                # Shown, not hidden: "why isn't Fidelity in the list" is the
+                # first question this row has to answer.
+                parts.append((f"   ·   cash-in-lieu at {', '.join(task.skipped_brokers)}",
+                              self._SF_SMALL, TEXT_MUTED))
+            rc.text_run(x0, my, parts)
 
-        meta = tk.Frame(left, bg=BG_INPUT)
-        meta.pack(anchor="w", pady=(2, 0))
-        tk.Label(meta, text=task.status.replace("_", " ").upper(), bg=BG_INPUT,
-                 fg=ACCENT, font=(FONT_FAMILY, 8, "bold")).pack(side="left")
-        tk.Label(meta, text=f"   ·   {task.alert_date}", bg=BG_INPUT,
-                 fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).pack(side="left")
-        tk.Label(meta,
-                 text=f"   ·   {task.accounts} acct(s) at {', '.join(task.brokers)}",
-                 bg=BG_INPUT, fg=TEXT_SECONDARY,
-                 font=(FONT_FAMILY, 8)).pack(side="left")
-        if task.skipped_brokers:
-            # Shown, not hidden: "why isn't Fidelity in the list" is the first
-            # question this row has to answer.
-            tk.Label(meta,
-                     text=f"   ·   cash-in-lieu at {', '.join(task.skipped_brokers)}",
-                     bg=BG_INPUT, fg=TEXT_MUTED,
-                     font=(FONT_FAMILY, 8)).pack(side="left")
-
-        act = tk.Frame(body, bg=BG_INPUT)
-        act.pack(side="right")
-        q = tk.Label(act, text="Queue", bg=BG_INPUT, fg=ACCENT,
-                     font=(FONT_FAMILY, 9, "bold"), padx=10, pady=4,
-                     cursor="hand2")
-        q.pack(side="right", padx=(10, 0))
-        q.bind("<Button-1>",
-               lambda e, t=task: self._queue_sell(t, source="queued from the board"))
-        q.bind("<Enter>", lambda e, w=q: w.configure(fg=TEXT_PRIMARY))
-        q.bind("<Leave>", lambda e, w=q: w.configure(fg=ACCENT))
-        PillButton(act, text="Sell", command=lambda t=task: self._exit_sell(t),
-                   width=76, height=30, font_size=9).pack(side="right")
+            right = w - 14
+            qx, _ = rc.link(right - 10, cy, "Queue", self._SF_BTN, ACCENT, TEXT_PRIMARY,
+                            anchor="e",
+                            on_click=lambda t=task: self._queue_sell(
+                                t, source="queued from the board"))
+            # Was a CTkButton per row — the slowest widget in the app, and up to
+            # 86 of them. Same pill, drawn.
+            pad = max(10, (76 - rc.measure("Sell", self._SF_BTN)) // 2)
+            rc.pill(qx - 10 - 10, cy, "Sell", self._SF_BTN, ACCENT, TEXT_PRIMARY,
+                    padx=pad, pady=7, anchor="e", hover_bg=ACCENT_HOVER,
+                    on_click=lambda t=task: self._exit_sell(t))
+            return h + 6
+        return draw
 
     def _exit_trade(self, task) -> None:
         """Open the Trade Desk primed for this exit, without firing.
@@ -12861,10 +14510,34 @@ class App(ctk.CTk):
             t = threading.Thread(target=fetch, args=(key,), daemon=True)
             threads.append(t)
             t.start()
+        # Bounded. A get_holdings() that hangs (a wedged browser session, a 2FA
+        # push nobody answers) used to hold this join forever — and with it
+        # _queue_busy, which now holds the mirror buys as well as the sells.
+        # A broker still out at the deadline is left out of `outputs`, which
+        # resolve() files under `errors` ("could not read"), and auto-sell hands
+        # that back for a retry rather than calling it sold.
+        import time as _time
+        deadline = _time.monotonic() + EXIT_READ_TIMEOUT_S
         for t in threads:
-            t.join()
+            t.join(max(0.0, deadline - _time.monotonic()))
+        late = [t for t in threads if t.is_alive()]
+        if late:
+            self.after(0, lambda n=len(late): self._log(
+                f"Exits: {_plural(n, 'broker')} still reading {task.symbol} after "
+                f"{EXIT_READ_TIMEOUT_S // 60} min — treating as unread", "warn"))
+        with lock:
+            outputs = dict(outputs)
 
         resolved = lifecycle.resolve(task, outputs)
+        # Every Public account read, none holding it: a late round-up that
+        # _sell_plays reopened has had its look and found nothing. Recorded
+        # here rather than in the callbacks, because both of them (the dialog
+        # and auto-sell) stop at "nothing to sell" and never place a batch.
+        if any(lifecycle.app_key(b) == "public" for b in resolved.missing):
+            try:
+                _mark_public_late_checked((task.symbol, task.alert_symbol))
+            except Exception:
+                pass
         cb = then or self._exit_confirm
         self.after(0, lambda: cb(resolved))
 
@@ -12922,10 +14595,23 @@ class App(ctk.CTk):
             tk.Label(row, text=leg.broker, bg=BG_CARD_ALT, fg=TEXT_PRIMARY,
                      font=(FONT_FAMILY, 10, "bold"), width=14, anchor="w").pack(
                          side="left", padx=12, pady=9)
-            tk.Label(row, text=f"{leg.qty}  ×  {leg.accounts} acct(s)",
-                     bg=BG_CARD_ALT, fg=TEXT_PRIMARY,
-                     font=(FONT_MONO, 10)).pack(side="left")
-            if not leg.uniform:
+            if leg.key == "public":
+                # Public does NOT send leg.qty. Every account sells its own
+                # balance, capped at what we bought there (see _exit_fire), so
+                # "0.0333 × 21, 0.97 left behind" would describe an order that
+                # is never placed. Say what will be, from the same read.
+                plan = _public_sell_plan(
+                    leg.holdings,
+                    _public_sell_caps((task.symbol, task.alert_symbol)),
+                    remnant_only=task.status == REMNANT_STATUS)
+                tk.Label(row, text=_public_plan_text(plan), bg=BG_CARD_ALT,
+                         fg=TEXT_PRIMARY, font=(FONT_FAMILY, 9), justify="left",
+                         wraplength=330).pack(side="left", pady=6)
+            else:
+                tk.Label(row, text=f"{leg.qty}  ×  {_plural(leg.accounts, 'account')}",
+                         bg=BG_CARD_ALT, fg=TEXT_PRIMARY,
+                         font=(FONT_MONO, 10)).pack(side="left")
+            if not leg.uniform and leg.key != "public":
                 # Sending the max would reject the whole leg, so we send the
                 # smallest — but that leaves shares behind and you should know.
                 tk.Label(row, text=f"  accounts differ ({leg.low:g}–{leg.high:g}) — "
@@ -12936,8 +14622,8 @@ class App(ctk.CTk):
                 # The count above is a floor, not a total: these accounts did
                 # not read, so whether they hold it is unknown. Saying so is
                 # the difference between "you own none" and "we could not look".
-                tk.Label(row, text=f"  {leg.unread} more acct(s) wouldn't read — "
-                                   f"not included",
+                tk.Label(row, text=f"  {_plural(leg.unread, 'more account')} "
+                                   f"wouldn't read — not included",
                          bg=BG_CARD_ALT, fg=YELLOW,
                          font=(FONT_FAMILY, 8)).pack(side="left", padx=(10, 0))
 
@@ -12970,7 +14656,7 @@ class App(ctk.CTk):
 
         btns = tk.Frame(dlg, bg=BG_CARD)
         btns.pack(fill="x", padx=22, pady=(18, 20))
-        PillButton(btns, text=f"Sell at {len(resolved.legs)} broker(s)",
+        PillButton(btns, text=f"Sell at {_plural(len(resolved.legs), 'broker')}",
                    command=lambda: (dlg.destroy(),
                                     self._exit_fire(resolved, dry_run=dry.get())),
                    width=190, height=38, font_size=10).pack(side="right")
@@ -12986,7 +14672,7 @@ class App(ctk.CTk):
         dlg.geometry(f"+{self.winfo_rootx() + 220}+{self.winfo_rooty() + 170}")
         dlg.grab_set()
 
-    def _exit_fire(self, resolved, dry_run: bool = False) -> None:
+    def _exit_fire(self, resolved, dry_run: bool = False, autosell: bool = False) -> None:
         """Place the sells — one thread per broker, each with its own quantity.
 
         Reuses the Trade Desk batch machinery so an exit gets the same live
@@ -13019,6 +14705,33 @@ class App(ctk.CTk):
             "origin": "exit",
             "finished": False,
             "started": datetime.now(),
+            # Public sells per ACCOUNT from a live read taken the moment before
+            # each order, so 0.98 left after a fractional sale, 1/30 from a
+            # split and a full share each go out at exactly what is there. One
+            # figure for every account (leg.qty, the smallest balance seen)
+            # strands the difference in every account holding more.
+            #
+            # Capped per account at what THIS TOOL bought there
+            # (_public_sell_caps): the live balance includes any shares the
+            # customer held on his own, and an exit is about ours. An account
+            # we never bought in, or are already out of, is not in the map and
+            # is skipped.
+            "broker_kwargs": {
+                leg.key: {
+                    "size_from_holdings": True,
+                    "remnant_only": task.status == REMNANT_STATUS,
+                    "also_symbols": (task.alert_symbol,),
+                    "max_by_account": {
+                        acct: _cap_text(cap) for acct, cap in
+                        _public_sell_caps((task.symbol, task.alert_symbol)).items()},
+                }
+                for leg in resolved.legs if leg.key == "public"
+            },
+            # What was sold, on whose instruction. The batch outlives this
+            # call, and the finish handler needs the task to settle a Public
+            # late-round-up check and to hand an auto-sell back for a retry.
+            "exit_task": task,
+            "autosell": bool(autosell),
         }
         self._trade_in_flight = True
         self._trade_batch = batch
@@ -13080,12 +14793,48 @@ class App(ctk.CTk):
             "fractionals": bool(self._autosell_fracs.get()),
             # Bounded: this only has to outlive a re-pull of the same feed, and
             # an unbounded list would grow for the life of the install.
-            "sold": list(self._autosell_sold)[-500:],
+            #
+            # A play mid holdings-read is NOT written as sold. The claim is
+            # taken before the read so nothing sells twice, but no order exists
+            # yet — and if the process dies there, a claim on disk would read
+            # as "handled" forever. NRSN on 2026-09-29: claimed, the app died
+            # during the read, and every restart skipped it as sold.
+            "sold": list(self._autosell_sold - self._reading_keys())[-500:],
+            "reading": sorted(self._reading_keys()),
         }
         try:
             _write_json(AUTOSELL_STATE_FILE, state)
         except OSError as exc:
             self._log(f"Auto-sell: could not save state — {exc}", "warn")
+
+    def _reading_keys(self) -> set:
+        """Claimed plays with a holdings read out and no order placed yet."""
+        s = getattr(self, "_autosell_reading", None)
+        if s is None:
+            s = self._autosell_reading = set()
+        return s
+
+    def _autosell_read_done(self, task) -> None:
+        """The holdings read for `task` is over: its claim is now whatever the
+        caller makes of it (sold, or handed back), not "mid-read"."""
+        self._reading_keys().discard(self._autosell_key(task))
+
+    def _autosell_play_key(self, task) -> str:
+        """The PLAY, whatever brokerages are left on it: exit date + ticker.
+
+        Attempts and the retry back-off count against this, not against
+        _autosell_key. That key carries the broker set, and a partial sale
+        narrows the set — so keyed that way, every narrowing started a fresh
+        three attempts with no back-off at all.
+        """
+        tag = "remnant:" if getattr(task, "status", "") == REMNANT_STATUS else ""
+        return f"{tag}{task.alert_date}:{task.alert_symbol.upper()}"
+
+    def _autosell_cooling(self, task) -> bool:
+        """A handed-back play still inside its retry back-off."""
+        until = (getattr(self, "_autosell_retry_after", None) or {}).get(
+            self._autosell_play_key(task))
+        return until is not None and datetime.now() < until
 
     def _autosell_key(self, task) -> str:
         """One instruction's identity: this exit, this play, these brokerages.
@@ -13108,7 +14857,10 @@ class App(ctk.CTk):
         and the live holdings read still refuses an empty account.
         """
         where = "+".join(sorted(lifecycle.app_key(b) for b in task.brokers))
-        return f"{task.alert_date}:{task.alert_symbol.upper()}:{where}"
+        # A remnant clear is not the exit: a later exit called AT Public on the
+        # same play (whole shares there) must not be refused as already sold.
+        tag = "remnant:" if getattr(task, "status", "") == REMNANT_STATUS else ""
+        return f"{tag}{task.alert_date}:{task.alert_symbol.upper()}:{where}"
 
     def _symbol_renames(self) -> Dict[str, str]:
         """CURRENT ticker -> the one we bought it under.
@@ -13168,13 +14920,24 @@ class App(ctk.CTk):
         there, so it is that list's to place and the play must not be queued
         twice under two different keys.
         """
-        if not getattr(self, "_track_rows", None):
-            return []
         claimed = {t.symbol.upper() for t in
                    (exits if exits is not None else self._autosell_worklist())}
-        return [t for t in lifecycle.sell_worklist(self._track_rows)
-                if t.brokers and t.is_fractional
-                and t.symbol.upper() not in claimed]
+        out = []
+        if getattr(self, "_track_rows", None):
+            out = [t for t in lifecycle.sell_worklist(self._track_rows)
+                   if t.brokers and t.is_fractional
+                   and t.symbol.upper() not in claimed]
+        # Plus the Public remnants the TRACK board cannot see: an exit called
+        # elsewhere on a play that returned Public a fraction. See
+        # _public_remnant_tasks. Anything already queued above wins.
+        seen = claimed | {t.symbol.upper() for t in out}
+        try:
+            remnants = _public_remnant_tasks(_sell_plays(_load_sells()),
+                                             self._symbol_renames())
+        except Exception:
+            remnants = []
+        out.extend(t for t in remnants if t.symbol.upper() not in seen)
+        return out
 
     def _autosell_consider(self, reason: str = "new exits") -> None:
         """Queue the exits we have been told to take and still hold.
@@ -13200,6 +14963,15 @@ class App(ctk.CTk):
         if not getattr(self, "_autosell_enabled", None) or not self._autosell_enabled.get():
             return
 
+        released = getattr(self, "_autosell_released", None)
+        if released:
+            self._autosell_released = []
+            self._save_autosell_state()     # drop them from "reading" on disk
+            self._log(f"Auto-sell: the last session closed while reading "
+                      f"holdings for {', '.join(released)} — nothing was sold, "
+                      f"so {'they are' if len(released) > 1 else 'it is'} "
+                      f"back on the list.", "warn")
+
         exits = self._autosell_worklist()
         tasks = list(exits)
         # Fractionals ride along on the same tick rather than getting a timer
@@ -13209,6 +14981,16 @@ class App(ctk.CTk):
             tasks += self._fractional_worklist(exits)
         tasks = [t for t in tasks
                  if self._autosell_key(t) not in self._autosell_sold]
+        cooling = [t for t in tasks if self._autosell_cooling(t)]
+        if cooling:
+            # Come back when the first back-off ends, not on the hourly tick.
+            now = datetime.now()
+            wait = min(self._autosell_retry_after[self._autosell_play_key(t)] - now
+                       for t in cooling)
+            self._autosell_schedule_check(
+                "retry", max(1000, int(wait.total_seconds() * 1000) + 1000))
+            waiting = {id(t) for t in cooling}
+            tasks = [t for t in tasks if id(t) not in waiting]
         if not tasks:
             return
 
@@ -13228,10 +15010,10 @@ class App(ctk.CTk):
         if state != "open":
             # Queued, not dropped. The next check inside the session picks them
             # up because they are still unsold and still on the board.
-            self._log(f"Auto-sell: {len(tasks)} exit(s) ready but {label.lower()} — "
+            self._log(f"Auto-sell: {_plural(len(tasks), 'exit')} ready but {label.lower()} — "
                       f"holding until the open.", "meta")
             self._push_notification(
-                f"{len(tasks)} called exit(s) waiting for the open", "info")
+                f"{_plural(len(tasks), 'called exit')} waiting for the open", "info")
             return
 
         added = self._queue_extend(tasks)
@@ -13241,7 +15023,7 @@ class App(ctk.CTk):
             # line every hour and read like the exits were never picked up.
             self._autosell_pump()
             return
-        self._log(f"Auto-sell ({reason}): queued {len(added)} exit(s) — "
+        self._log(f"Auto-sell ({reason}): queued {_plural(len(added), 'exit')} — "
                   f"{', '.join(t.symbol for t in added)}"
                   + (" [DRY RUN]" if self._autosell_dry_run.get() else ""))
         self._autosell_pump()
@@ -13280,7 +15062,7 @@ class App(ctk.CTk):
             self._sweep_say(f"{label} — not selling")
             self._push_notification(
                 f"{label} — a market order now would pay the whole spread. "
-                f"{len(tasks)} exit(s) ready when it opens.", "warning")
+                f"{_plural(len(tasks), 'exit')} ready when it opens.", "warning")
             return
 
         if getattr(self, "_trade_in_flight", False):
@@ -13309,7 +15091,7 @@ class App(ctk.CTk):
         self._autosell_unclaim(tasks)
         added = self._queue_extend(tasks)
         dupes = len(tasks) - len(added)
-        self._log(f"Sweep: queued {len(added)} called exit(s) — "
+        self._log(f"Sweep: queued {_plural(len(added), 'called exit')} — "
                   f"{', '.join(t.symbol for t in added) or 'none new'}"
                   + (f" ({dupes} already waiting)" if dupes else "")
                   + (" [DRY RUN]" if self._autosell_dry_run.get() else ""))
@@ -13481,7 +15263,7 @@ class App(ctk.CTk):
         self._autosell_queue.append(task)
         dry = " [DRY RUN]" if self._autosell_dry_run.get() else ""
         self._log(f"Queue: {task.symbol} at {', '.join(task.brokers)} "
-                  f"({task.accounts} acct(s)) — {source}{dry}")
+                  f"({_plural(task.accounts, 'account')}) — {source}{dry}")
         # Said out loud, not just written to the Activity log. The queue strip
         # lives on the Exits page and these buttons are on the dashboard card
         # too, so from there a click would otherwise have no visible effect at
@@ -13521,10 +15303,10 @@ class App(ctk.CTk):
             return
         self._confirmed_sells |= keys
         _save_confirmed_sells(self._confirmed_sells)
-        self._log(f"Confirmed {len(new)} closed play(s) — hidden from the "
+        self._log(f"Confirmed {_plural(len(new), 'closed play')} — hidden from the "
                   f"board. 'Show confirmed' brings them back.")
         self._push_notification(
-            f"{len(new)} closed play(s) tidied away", "success")
+            f"{_plural(len(new), 'closed play')} tidied away", "success")
         self._refresh_sell_views()
 
     def _unconfirm_sell_play(self, play) -> None:
@@ -13581,7 +15363,7 @@ class App(ctk.CTk):
         left = ", ".join(t.symbol for t in self._autosell_queue)
         self._autosell_queue.clear()
         self._queue_stalled_said = False
-        self._log(f"Queue: cleared {n} waiting sell(s) — {left}. Anything "
+        self._log(f"Queue: cleared {_plural(n, 'waiting sell')} — {left}. Anything "
                   f"already placed is not affected.", "warn")
         self._render_sell_queue()
 
@@ -13645,6 +15427,50 @@ class App(ctk.CTk):
         self._pump_after_id = None
         self._autosell_pump()
 
+    def _mirror_busy(self) -> bool:
+        """A mirror (auto-buy) run still has picks queued or a LIVE batch out.
+
+        Live means not finished and younger than MIRROR_QUEUE_STALL_MS. The
+        entries themselves are only retired by _mirror_drain, which does not
+        run once the queue is empty (or mirror is switched off) — so counting
+        raw entries let one hung or orphaned batch hold every sell forever.
+        """
+        if getattr(self, "_mirror_queue", None):
+            return True
+        now = datetime.now()
+        for b in getattr(self, "_mirror_active", None) or ():
+            if b.get("finished"):
+                continue
+            started = b.get("started") or now
+            if (now - started).total_seconds() * 1000 < MIRROR_QUEUE_STALL_MS:
+                return True
+        return False
+
+    def _autosell_schedule_check(self, reason: str, ms: int) -> None:
+        """Look at the Sell-now board again in `ms` — ONE pending check.
+
+        The hourly TRACK tick is a backstop, and on its own it is far too slow:
+        a play past the per-batch cap, or handed back after a failed read,
+        waited up to an hour, and on 2026-09-29 the app was gone before that
+        hour was up. Buys finishing and the sell queue draining both land here,
+        so the day runs buys -> sells -> sells left over, back to back.
+        """
+        old = getattr(self, "_autosell_recheck_id", None)
+        if old is not None:
+            try:
+                self.after_cancel(old)
+            except Exception:
+                pass
+
+        def _run() -> None:
+            self._autosell_recheck_id = None
+            try:
+                self._autosell_consider(reason)
+            except Exception as exc:            # noqa: BLE001
+                self._log(f"Auto-sell: re-check skipped — {exc}", "warn")
+
+        self._autosell_recheck_id = self.after(int(ms), _run)
+
     def _gate_idle_secs(self) -> float:
         """Seconds since the thing holding the queue last showed any progress.
 
@@ -13681,6 +15507,16 @@ class App(ctk.CTk):
         self._render_sell_queue()
         if not self._autosell_queue:
             self._queue_stalled_said = False
+            # Drained. If this run sold (or tried) anything, look at the board
+            # again rather than waiting for the hourly tick: the per-batch cap
+            # left the rest there, a partial sell narrowed a play to the broker
+            # still owed, and a hand-back is due once its back-off ends. Only
+            # after real work, so a check that finds nothing cannot loop.
+            if (getattr(self, "_autosell_recheck", False)
+                    and not getattr(self, "_trade_in_flight", False)
+                    and not getattr(self, "_queue_busy", False)):
+                self._autosell_recheck = False
+                self._autosell_schedule_check("queue drained", AUTOSELL_RECHECK_MS)
             return
 
         # Out of hours the queue HOLDS rather than drains. Auto-sell and the
@@ -13697,7 +15533,7 @@ class App(ctk.CTk):
                 self._log(f"Queue: {label.lower()} — holding {left} until the "
                           f"open.", "meta")
                 self._push_notification(
-                    f"{len(self._autosell_queue)} sell(s) queued for the open",
+                    f"{_plural(len(self._autosell_queue), 'sell')} queued for the open",
                     "info")
             self._pump_later(60000)
             return
@@ -13742,6 +15578,20 @@ class App(ctk.CTk):
             return
         self._queue_stalled_said = False
 
+        # BUYS FIRST. A mirror run still queued or with a batch out holds the
+        # sell queue: both drive the same broker sessions, and on 2026-09-29 a
+        # FEED sell fired mid-SHFS-buy and lost its Wells Fargo leg to a
+        # contended login. The mirror queue has its own stall write-off, so this
+        # cannot hold the sells forever; when the run ends it re-checks for us.
+        if self._mirror_busy():
+            if not getattr(self, "_queue_mirror_said", False):
+                self._queue_mirror_said = True
+                self._log("Queue: auto-buys still running — sells go as soon as "
+                          "they finish.", "meta")
+            self._pump_later(5000)
+            return
+        self._queue_mirror_said = False
+
         task = self._autosell_queue.pop(0)
         key = self._autosell_key(task)
         if key in self._autosell_sold:              # a re-queue between ticks
@@ -13751,7 +15601,11 @@ class App(ctk.CTk):
         # Claimed BEFORE the holdings read, not after the order. Everything from
         # here on can fail in ways that leave an order placed, and selling twice
         # is far worse than not selling automatically once.
+        # Mid-read until _autosell_fire or a hand-back says otherwise; written to
+        # disk as "reading", not "sold", so a death here releases it on restart.
         self._autosell_sold.add(key)
+        self._reading_keys().add(key)
+        self._autosell_recheck = True
         self._save_autosell_state()
 
         self._log(f"Auto-sell: reading {task.symbol} holdings at "
@@ -13804,7 +15658,9 @@ class App(ctk.CTk):
         for t in tasks:
             key = self._autosell_key(t)
             self._autosell_sold.discard(key)
-            self._autosell_fails.pop(key, None)
+            self._autosell_fails.pop(self._autosell_play_key(t), None)
+            (getattr(self, "_autosell_retry_after", None) or {}).pop(
+                self._autosell_play_key(t), None)
         self._save_autosell_state()
 
     def _autosell_retry(self, task, why: str) -> None:
@@ -13829,10 +15685,13 @@ class App(ctk.CTk):
         for something no amount of retrying will fix.
         """
         key = self._autosell_key(task)
-        n = self._autosell_fails.get(key, 0) + 1
-        self._autosell_fails[key] = n
+        play = self._autosell_play_key(task)
+        n = self._autosell_fails.get(play, 0) + 1
+        self._autosell_fails[play] = n
+        self._autosell_read_done(task)
 
         if n >= AUTOSELL_MAX_ATTEMPTS:
+            self._save_autosell_state()         # claimed for good, not mid-read
             self._log(f"Auto-sell: giving up on {task.symbol} after {n} attempts "
                       f"({why}). Sell it by hand from the Exits tab — retrying "
                       f"is only re-triggering the broker login.", "warn")
@@ -13841,6 +15700,10 @@ class App(ctk.CTk):
             return                              # stays claimed: stop the loop
 
         self._autosell_sold.discard(key)
+        if getattr(self, "_autosell_retry_after", None) is None:
+            self._autosell_retry_after = {}
+        self._autosell_retry_after[play] = (
+            datetime.now() + timedelta(milliseconds=AUTOSELL_RETRY_BACKOFF_MS))
         self._save_autosell_state()
         self._log(f"Auto-sell: {task.symbol} put back — {why} "
                   f"(attempt {n} of {AUTOSELL_MAX_ATTEMPTS})", "meta")
@@ -13901,7 +15764,7 @@ class App(ctk.CTk):
                 except Exception:
                     pass
             if open_n > leg.accounts:
-                out.append(f"{leg.broker}: journal says {open_n} account(s) open, "
+                out.append(f"{leg.broker}: journal says {_plural(open_n, 'account')} open, "
                            f"the read found {leg.accounts}")
         return out
 
@@ -13911,12 +15774,20 @@ class App(ctk.CTk):
         # The holdings read is done. From here the gate is _trade_in_flight,
         # which _exit_fire owns.
         self._queue_busy = False
+        # And the claim is a real one now: every path below either places the
+        # order or hands the play back. Saved BEFORE any order goes out, so a
+        # death from here on leaves it sold — never sold twice.
+        self._autosell_read_done(task)
+        self._save_autosell_state()
 
         # Something else started while we were reading holdings. _exit_fire
         # would refuse, and the play was claimed before the read — so without
         # this it is marked sold and never sold.
         if getattr(self, "_trade_in_flight", False):
-            self._autosell_retry(task, "another trade started mid-read")
+            # Not a failure of this play, so not an attempt against it: three
+            # desk trades overlapping three reads would otherwise abandon it.
+            self._autosell_sold.discard(self._autosell_key(task))
+            self._save_autosell_state()
             self._autosell_queue.insert(0, task)
             self._pump_later(5000)
             return
@@ -13965,7 +15836,17 @@ class App(ctk.CTk):
             self._log(f"Auto-sell: {task.symbol} — {short}. Selling what the read "
                       f"found; check the rest at the broker.", "warn")
         try:
-            self._exit_fire(resolved, dry_run=dry)
+            self._exit_fire(resolved, dry_run=dry, autosell=True)
+            # A broker we could not READ is not in this batch at all — its
+            # shares are unknown, not sold. Tell the finish handler, so the
+            # play is handed back for it instead of being filed as done: FEED
+            # sold at Public and Robinhood on 2026-09-29 while Wells Fargo's
+            # login timed out, and the ten WF accounts were never looked at
+            # again.
+            batch = getattr(self, "_trade_batch", None)
+            if resolved.errors and isinstance(batch, dict) \
+                    and batch.get("exit_task") is task:
+                batch["unread_brokers"] = tuple(resolved.errors)
         except Exception as exc:                # noqa: BLE001
             # The order may or may not have gone out, so this does NOT unclaim
             # the play: a retry that re-sells something already filled is the
@@ -14134,7 +16015,7 @@ class App(ctk.CTk):
         n = (sent or {}).get("lifecycle", 0)
         if n:
             self.after(0, lambda: self._log(
-                f"TRACK: published {n} board change(s) to the feed", "ok"))
+                f"TRACK: published {_plural(n, 'board change')} to the feed", "ok"))
 
     def _track_available(self) -> bool:
         """Either source will do: the cloud feed, or a TRACK channel.
@@ -14207,7 +16088,7 @@ class App(ctk.CTk):
             self._push_notification(
                 f"+{len(newly) - 6} more plays became sellable", "info")
         if changes:
-            self._log(f"TRACK: {len(changes)} row(s) changed, "
+            self._log(f"TRACK: {_plural(len(changes), 'row')} changed, "
                       f"{len(newly)} newly sellable")
 
         # A backstop, not the trigger. Exits drive auto-sell now (see
@@ -14247,7 +16128,7 @@ class App(ctk.CTk):
         open_plays = sum(1 for p in plays if p.left > 1e-9)
         shares = sum(l.left for p in plays for l in p.of(SELL_NOW))
         self._exits_summary.configure(
-            text=f"{len(ready)} exit(s) ready ({_qty_text(shares)} share(s))"
+            text=f"{_plural(len(ready), 'exit')} ready ({_plural(_qty_text(shares), 'share')})"
                  f"   ·   {len(fracs)} fractional"
                  f"   ·   {open_plays} still open")
         self._exits_stamp.configure(
@@ -14263,8 +16144,7 @@ class App(ctk.CTk):
         canvas = tk.Canvas(frame, bg=BG_PRIMARY, bd=0, highlightthickness=0)
         scroll_frame = tk.Frame(canvas, bg=BG_PRIMARY)
 
-        scroll_frame.bind("<Configure>",
-                          lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        _bind_scrollregion(canvas, scroll_frame)
         canvas_window = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
         canvas.bind("<Configure>",
                     lambda e: canvas.itemconfigure(canvas_window, width=e.width))
@@ -14489,7 +16369,7 @@ class App(ctk.CTk):
         widgets["status"].configure(
             text="saved" if n <= 1 else f"saved · {n} logins", fg=GREEN)
         named = ", ".join(l.display for l in broker_logins.logins(broker))
-        self._log(f"Accounts: saved {n} login(s) for {broker}"
+        self._log(f"Accounts: saved {_plural(n, 'login')} for {broker}"
                   + (f" — {named}" if named else ""))
         # The desk, the mirror card and both "N brokers linked" readouts are all
         # built from .env at startup, so without this a broker linked now stayed
@@ -14563,13 +16443,13 @@ class App(ctk.CTk):
                     if broker in self._broker_status_labels:
                         self._broker_status_labels[broker]["dot"].set_color(GREEN)
                         self._broker_status_labels[broker]["status"].configure(
-                            text=f"{n_accounts} account(s)", fg=GREEN)
+                            text=f"{_plural(n_accounts, 'account')}", fg=GREEN)
                     if broker == "public":
                         self._apply_public_status(output)
                     # Update total accounts card (replace, not add)
                     self._update_total_accounts(broker, n_accounts)
                     self._push_notification(
-                        f"{broker.capitalize()} connected — {n_accounts} account(s)",
+                        f"{broker.capitalize()} connected — {_plural(n_accounts, 'account')}",
                         "success")
                 else:
                     widgets["dot"].set_color(RED)
@@ -14719,6 +16599,9 @@ class App(ctk.CTk):
         self._log_text.tag_configure(
             "done_err", foreground=RED, font=(FONT_FAMILY, 12, "bold"),
             spacing1=8, spacing3=6)
+        self._log_text.tag_configure(
+            "done_none", foreground=TEXT_SECONDARY, font=(FONT_FAMILY, 12, "bold"),
+            spacing1=8, spacing3=6)
 
         # Category badges — a small colored pill at the head of each feed line.
         _badge_cols = {
@@ -14747,7 +16630,9 @@ class App(ctk.CTk):
     # ---- Live activity strip + completion receipt -------------------------
 
     def _live_show(self) -> None:
-        if hasattr(self, "_live_card") and not self._live_card.winfo_ismapped():
+        # winfo_manager, not winfo_ismapped: the question is "is it packed",
+        # and mapped-ness also depends on whether the Activity page is up.
+        if hasattr(self, "_live_card") and not self._live_card.winfo_manager():
             self._live_card.pack(fill="x", pady=(0, 12), before=self._log_feed_card)
 
     def _live_hide(self) -> None:
@@ -14757,7 +16642,7 @@ class App(ctk.CTk):
             self._live_card.pack_forget()
 
     def _done_show(self) -> None:
-        if hasattr(self, "_done_card") and not self._done_card.winfo_ismapped():
+        if hasattr(self, "_done_card") and not self._done_card.winfo_manager():
             self._done_card.pack(fill="x", pady=(0, 12), before=self._log_feed_card)
 
     def _done_hide(self) -> None:
@@ -14846,11 +16731,17 @@ class App(ctk.CTk):
                              batch=None) -> None:
         if not hasattr(self, "_done_card"):
             return
-        color = {"ok": GREEN, "warn": YELLOW, "fail": RED}[kind]
+        color = {"ok": GREEN, "warn": YELLOW, "fail": RED,
+                 "none": TEXT_SECONDARY}[kind]
         glyph = {"ok": icon("check"), "warn": icon("warning"),
-                 "fail": icon("error")}[kind]
+                 "fail": icon("error"), "none": icon("info")}[kind]
         self._done_icon.configure(text=glyph, fg=color)
-        if kind == "fail":
+        if kind == "none":
+            # Nothing of ours was there to sell. Neutral, not red: every
+            # account was read and each skip has a reason, listed below.
+            self._done_headline.configure(text=f"{symbol}: nothing to sell",
+                                          fg=TEXT_PRIMARY)
+        elif kind == "fail":
             self._done_headline.configure(text=f"Nothing {verb.lower()}", fg=color)
         else:
             self._done_headline.configure(text=f"{verb} {shares} {symbol}",
@@ -14861,6 +16752,12 @@ class App(ctk.CTk):
             sub = (f"{total_ok} account{'s' if total_ok != 1 else ''} across "
                    f"{n_br} broker{'s' if n_br != 1 else ''} · "
                    f"{elapsed:.1f}s{dry_tag}")
+        elif kind == "none":
+            skipped: Dict[str, int] = {}
+            for r in results:
+                for k, v in (r.get("skipped") or {}).items():
+                    skipped[k] = skipped.get(k, 0) + int(v or 0)
+            sub = f"{_skip_note(skipped)} · {elapsed:.1f}s{dry_tag}"
         else:
             sub = (f"{total_ok} filled · {total_fail} failed · "
                    f"{elapsed:.1f}s{dry_tag}")
@@ -14874,6 +16771,9 @@ class App(ctk.CTk):
             elif r["ok_accounts"] > 0:
                 tot = r["ok_accounts"] + r["fail_accounts"]
                 self._receipt_chip(self._done_chips, f"{name}  {r['ok_accounts']}/{tot}", YELLOW)
+            elif _nothing_to_sell(r):
+                self._receipt_chip(self._done_chips, f"{name}  nothing to sell",
+                                   TEXT_SECONDARY)
             else:
                 self._receipt_chip(self._done_chips, f"{name}  failed", RED)
         self._render_retry_row(results=results, dry=dry, batch=batch)
@@ -14939,7 +16839,7 @@ class App(ctk.CTk):
         if not messagebox.askyesno(
             "Retry failed accounts",
             f"Retry {order['side'].upper()} {order['qty']} {order['symbol']} on "
-            f"the {n} account(s) that did not fill?\n\n"
+            f"the {_plural(n, 'account')} that did not fill?\n\n"
             + "\n".join(f"  {b}: {', '.join(v)}" for b, v in sorted(plan.items())),
                 parent=self):
             return
@@ -14960,7 +16860,7 @@ class App(ctk.CTk):
         self._live_start(batch)
         for broker in brokers:
             accts = plan[broker]
-            self._log(f"  {broker}: retrying {len(accts)} failed account(s)...")
+            self._log(f"  {broker}: retrying {_plural(len(accts), 'failed account')}...")
             self._run_in_thread(self._trade_worker, broker, order["side"],
                                 order["symbol"], order["qty"], False, batch,
                                 accts)

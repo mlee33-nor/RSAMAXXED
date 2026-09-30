@@ -22,6 +22,7 @@ tkinter, no broker session and no order ever exists.
 from __future__ import annotations
 
 import importlib.util
+import os
 import json
 import pathlib
 import sys
@@ -39,11 +40,27 @@ import lifecycle  # noqa: E402
 # first wins `sys.modules["app"]` for the whole session, so `import app` here
 # passes alone and fails in the full run. Loading it by path under a name
 # nothing else claims makes this test independent of suite order.
+#
+# RSA_NO_CRASH_LOG first: the desktop app opens logs/crash.log at import time,
+# and a test run has no business writing into the user's real crash log.
+os.environ["RSA_NO_CRASH_LOG"] = "1"
 _spec = importlib.util.spec_from_file_location(
     "rsamaxxed_desktop_app", REPO_ROOT / "app.py")
 desktop_app = importlib.util.module_from_spec(_spec)
 sys.modules["rsamaxxed_desktop_app"] = desktop_app
 _spec.loader.exec_module(desktop_app)
+
+
+@pytest.fixture(autouse=True)
+def _keep_out_of_the_real_repo(tmp_path, monkeypatch):
+    """Logs and state files the desktop sell paths can write: the test's own."""
+    monkeypatch.setattr(desktop_app, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(desktop_app, "TRADE_RESULTS_LOG",
+                        tmp_path / "logs" / "trade_results.log", raising=False)
+    monkeypatch.setattr(desktop_app, "PUBLIC_LATE_CHECKED_FILE",
+                        tmp_path / "public_late_checked.json")
+    monkeypatch.setattr(desktop_app, "ROUNDUP_RADAR_FILE",
+                        tmp_path / "roundup_radar.json")
 
 
 class _Var:
@@ -157,7 +174,9 @@ class _App:
 
         cls = desktop_app.App
         for name in ("_autosell_consider", "_autosell_key", "_save_autosell_state",
-                     "_queue_extend", "_pump_later", "_pump_tick"):
+                     "_queue_extend", "_pump_later", "_pump_tick",
+                     "_reading_keys", "_autosell_cooling", "_autosell_play_key",
+                     "_autosell_schedule_check"):
             setattr(self, name, types.MethodType(getattr(cls, name), self))
 
     # the bits _autosell_consider leans on
@@ -486,7 +505,8 @@ def _resolver(tmp_path, monkeypatch, **kw):
                  # The two that decide whether an empty read is believed:
                  # a broker reporting no position where the journal says we
                  # hold is a disagreement, not an answer. See app._journal_disputes.
-                 "_journal_disputes", "_journal_shortfalls"):
+                 "_journal_disputes", "_journal_shortfalls",
+                 "_reading_keys", "_autosell_read_done", "_autosell_play_key"):
         setattr(app, name, types.MethodType(getattr(desktop_app.App, name), app))
     return app
 
@@ -609,6 +629,8 @@ def test_a_play_is_handed_back_when_it_could_not_be_read(make_app):
     nothing about whether the shares are there."""
     app = make_app()
     app._autosell_retry = types.MethodType(desktop_app.App._autosell_retry, app)
+    for name in ("_reading_keys", "_autosell_read_done", "_autosell_play_key"):
+        setattr(app, name, types.MethodType(getattr(desktop_app.App, name), app))
     task = lifecycle.SellTask(
         symbol="GRNQ", alert_symbol="GRNQ", alert_date="2026-08-06",
         status="fractional", brokers=("Public",), accounts=3, skipped_brokers=(),
@@ -629,3 +651,197 @@ def test_a_renamed_play_is_keyed_by_what_we_bought(make_app):
     # Keyed by the ALERT symbol (AGAE), not the sell symbol (AIFA), plus the
     # brokerages the exit named.
     assert app._autosell_key(task) == "2026-07-02:AGAE:public"
+
+
+# ---- 2026-09-29: the session that died mid-read ---------------------------
+#
+# The app vanished between claiming NRSN and placing its order. The claim was
+# on disk as "sold", so every restart skipped it. And FEED sold at Public and
+# Robinhood while Wells Fargo's login timed out — the whole play was filed as
+# done and the WF shares were never looked at again.
+
+
+def test_a_claim_mid_read_is_saved_as_reading_not_sold(tmp_path, monkeypatch):
+    app = _resolver(tmp_path, monkeypatch)
+    key = _key(_task())
+    app._autosell_sold.add(key)
+    app._reading_keys().add(key)
+    app._save_autosell_state()
+
+    saved = json.loads((tmp_path / "autosell_state.json").read_text())
+    assert key not in saved["sold"]
+    assert saved["reading"] == [key]
+
+
+def test_a_restart_releases_what_a_dead_session_was_reading():
+    sold, released = desktop_app._autosell_restore(
+        {"sold": ["a", "b"], "reading": ["b"]})
+    assert sold == {"a"}
+    assert released == ["b"]
+    # Files written before "reading" existed load exactly as before.
+    assert desktop_app._autosell_restore({"sold": ["a"]}) == ({"a"}, [])
+
+
+def test_the_claim_becomes_sold_before_the_order_goes_out(tmp_path, monkeypatch):
+    app = _resolver(tmp_path, monkeypatch)
+    key = _key(_task())
+    app._autosell_sold.add(key)
+    app._reading_keys().add(key)
+    on_disk_at_order = {}
+
+    def fire(resolved, dry_run=False, autosell=False):
+        on_disk_at_order.update(
+            json.loads((tmp_path / "autosell_state.json").read_text()))
+    app._exit_fire = fire
+    resolved = types.SimpleNamespace(
+        task=_task(), ok=True, missing=(), errors=(),
+        describe=lambda: "Public x3", legs=[])
+
+    app._autosell_fire(resolved)
+    assert key in on_disk_at_order["sold"]          # never sold twice
+    assert key not in app._reading_keys()
+
+
+def _settler(tmp_path, monkeypatch):
+    app = _resolver(tmp_path, monkeypatch)
+    app._exit_batch_settle = types.MethodType(
+        desktop_app.App._exit_batch_settle, app)
+    monkeypatch.setattr(desktop_app, "_mark_public_late_checked", lambda syms: None)
+    app._autosell_sold.add(_key(_task()))
+    return app
+
+
+def _leg(broker, ok, fail, errors=()):
+    return {"broker": broker, "ok_accounts": ok, "fail_accounts": fail,
+            "errors": list(errors), "accounts": []}
+
+
+def test_a_broker_that_could_not_be_read_is_handed_back_after_the_others_sell(
+        tmp_path, monkeypatch):
+    app = _settler(tmp_path, monkeypatch)
+    batch = {"exit_task": _task(), "autosell": True,
+             "unread_brokers": ("Wells Fargo",)}
+    app._exit_batch_settle(batch, [_leg("public", 21, 0)])
+    assert _key(_task()) not in app._autosell_sold
+    assert any("Wells Fargo" in m for m in app.logs)
+
+
+def test_a_leg_that_failed_outright_is_handed_back(tmp_path, monkeypatch):
+    app = _settler(tmp_path, monkeypatch)
+    batch = {"exit_task": _task(), "autosell": True}
+    app._exit_batch_settle(batch, [_leg("public", 21, 0),
+                                   _leg("robinhood", 0, 3)])
+    assert _key(_task()) not in app._autosell_sold
+    assert any("robinhood" in m for m in app.logs)
+
+
+def test_a_clean_batch_stays_sold(tmp_path, monkeypatch):
+    app = _settler(tmp_path, monkeypatch)
+    batch = {"exit_task": _task(), "autosell": True}
+    app._exit_batch_settle(batch, [_leg("public", 21, 0), _leg("robinhood", 3, 0)])
+    assert _key(_task()) in app._autosell_sold
+
+
+def test_a_handed_back_play_waits_out_its_back_off(make_app):
+    from datetime import datetime, timedelta
+    app = make_app()
+    calls = []
+    app.after = lambda ms, fn=None: calls.append(ms) or "id"
+    app._exits = [_ready()]
+    app._autosell_retry_after = {
+        app._autosell_play_key(_ready()): datetime.now() + timedelta(minutes=5)}
+    app._autosell_consider("test")
+    assert app._autosell_queue == []
+    # ...and comes back when it ends, not on the hourly tick.
+    assert calls and 4 * 60_000 < calls[-1] <= 6 * 60_000
+
+
+def _pump_app(tmp_path, monkeypatch):
+    app = _resolver(tmp_path, monkeypatch)
+    for name in ("_autosell_pump", "_mirror_busy", "_autosell_schedule_check"):
+        setattr(app, name, types.MethodType(getattr(desktop_app.App, name), app))
+    app._render_sell_queue = lambda: None
+    app._run_in_thread = lambda *a, **k: app.started.append(a)
+    app.started = []
+    return app
+
+
+def test_sells_wait_for_the_buys_to_finish(tmp_path, monkeypatch):
+    app = _pump_app(tmp_path, monkeypatch)
+    app._autosell_queue = [_task()]
+    app._mirror_queue = [{"symbol": "KUST"}]
+    app._autosell_pump()
+    assert app._autosell_queue and not app.started
+    assert _key(_task()) not in app._autosell_sold  # not claimed while waiting
+
+    app._mirror_queue = []
+    app._mirror_active = []
+    app._autosell_pump()
+    assert app.started and _key(_task()) in app._reading_keys()
+
+
+def test_a_drained_queue_looks_at_the_board_again(tmp_path, monkeypatch):
+    app = _pump_app(tmp_path, monkeypatch)
+    app._autosell_recheck = True
+    app._autosell_pump()
+    assert app.scheduled, "no re-check after the queue drained"
+    app.scheduled.clear()
+    app._autosell_pump()                        # nothing done since: no loop
+    assert not app.scheduled
+
+
+# ---- QA pass on the above (2026-09-29) ------------------------------------
+
+
+def test_a_hung_or_finished_buy_does_not_hold_the_sells(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+    app = _pump_app(tmp_path, monkeypatch)
+    app._mirror_queue = []
+    stale = datetime.now() - timedelta(
+        milliseconds=desktop_app.MIRROR_QUEUE_STALL_MS + 60_000)
+    app._mirror_active = [{"started": stale}, {"finished": True,
+                                               "started": datetime.now()}]
+    assert not app._mirror_busy()
+    app._mirror_active.append({"started": datetime.now()})
+    assert app._mirror_busy()
+
+
+def test_a_dry_run_is_never_handed_back(tmp_path, monkeypatch):
+    app = _settler(tmp_path, monkeypatch)
+    batch = {"exit_task": _task(), "autosell": True, "dry_run": True,
+             "unread_brokers": ("Wells Fargo",)}
+    app._exit_batch_settle(batch, [_leg("robinhood", 0, 3)])
+    assert _key(_task()) in app._autosell_sold
+
+
+def test_a_failed_leg_whose_order_may_exist_stays_claimed(tmp_path, monkeypatch):
+    app = _settler(tmp_path, monkeypatch)
+    leg = _leg("robinhood", 0, 3)
+    leg["accounts"] = [{"ok": False, "message": "order submitted, status unknown"}]
+    app._exit_batch_settle({"exit_task": _task(), "autosell": True}, [leg])
+    assert _key(_task()) in app._autosell_sold
+
+
+def test_attempts_count_per_play_not_per_broker_set(tmp_path, monkeypatch):
+    """A partial sale narrows the broker set and so the claim key; it must not
+    hand the play a fresh three attempts."""
+    app = _resolver(tmp_path, monkeypatch)
+    wide = _ready(brokers=("Public", "Wells Fargo"))
+    narrow = _ready(brokers=("Wells Fargo",))
+    app._autosell_retry(wide, "x")
+    app._autosell_retry(narrow, "x")
+    app._autosell_sold.add(_key(narrow))
+    app._autosell_retry(narrow, "x")
+    assert _key(narrow) in app._autosell_sold      # third strike, per play
+    assert any("giving up" in m for m in app.logs)
+
+
+def test_a_desk_trade_mid_read_does_not_cost_an_attempt(tmp_path, monkeypatch):
+    app = _resolver(tmp_path, monkeypatch)
+    app._trade_in_flight = True
+    app._autosell_sold.add(_key(_task()))
+    resolved = types.SimpleNamespace(task=_task(), ok=True, missing=(), errors=(),
+                                     describe=lambda: "", legs=[])
+    app._autosell_fire(resolved)
+    assert _key(_task()) not in app._autosell_sold
+    assert app._autosell_queue and not app._autosell_fails

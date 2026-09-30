@@ -79,3 +79,7 @@ sells_confirmed.json
 # over it. A crash between the two leaves one behind; it is never content
 # anyone should commit.
 *.tmp
+
+# runtime state (per-machine)
+public_late_checked.json
+roundup_radar.json

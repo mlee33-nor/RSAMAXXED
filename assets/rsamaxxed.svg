@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>RSAMAXXED</title>
+  <defs>
+    <linearGradient id="tile" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#8e8aff"/>
+      <stop offset="1" stop-color="#4d49d6"/>
+    </linearGradient>
+    <radialGradient id="light" cx="0.2" cy="0" r="0.8">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="glyph" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+      <polygon points="230.4,133.1 414.7,133.1 414.7,576.6 230.4,620.8" fill="#fff"/>
+      <polygon points="230.4,133.1 547.8,133.1 547.8,133.1 573.2,134.8 598.2,139.7 622.3,147.9 645.1,159.2 666.3,173.3 685.4,190.1 702.2,209.2 716.3,230.4 727.6,253.2 735.8,277.3 740.7,302.3 742.4,327.7 740.7,353.1 735.8,378 727.6,402.1 716.3,425 702.2,446.1 685.4,465.3 666.3,482 645.1,496.2 622.3,507.4 598.2,515.6 573.2,520.6 547.8,522.2 547.8,522.2 230.4,522.2" fill="#fff"/>
+      <polygon points="414.7,276.5 465.9,276.5 465.9,276.5 472.6,276.9 479.2,278.2 485.5,280.4 491.5,283.3 497.1,287.1 502.1,291.5 506.5,296.5 510.3,302.1 513.2,308.1 515.4,314.4 516.7,321 517.1,327.7 516.7,334.4 515.4,340.9 513.2,347.3 510.3,353.3 506.5,358.8 502.1,363.9 497.1,368.3 491.5,372 485.5,375 479.2,377.1 472.6,378.4 465.9,378.9 414.7,378.9" fill="#000"/>
+      <polygon points="389.1,660 389.1,860.2 204.8,860.2 204.8,704.2" fill="#fff"/>
+      <polygon points="656.5,595.8 819.2,860.2 624.6,860.2 487,636.5" fill="#fff"/>
+    </mask>
+    <filter id="lift" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14.3" stdDeviation="28.7" flood-color="#160e5a" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" rx="230.4" fill="url(#tile)"/>
+  <rect width="1024" height="1024" rx="230.4" fill="url(#light)"/>
+  <g filter="url(#lift)">
+    <rect width="1024" height="1024" fill="#ffffff" mask="url(#glyph)"/>
+  </g>
+  <rect x="4.1" y="4.1" width="1015.8" height="1015.8" rx="226.3" fill="none" stroke="#fff" stroke-opacity="0.23" stroke-width="8.2"/>
+</svg>
