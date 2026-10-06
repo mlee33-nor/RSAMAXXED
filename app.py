@@ -132,7 +132,7 @@ AUTOSELL_RETRY_BACKOFF_MS = 10 * 60 * 1000
 EXIT_READ_TIMEOUT_S = 480
 
 
-load_dotenv(ENV_FILE)
+load_dotenv(ENV_FILE, interpolate=False)
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +233,36 @@ def _order_may_exist(result: Dict[str, Any]) -> bool:
     return any(w in t.lower() for t in texts for w in _ORDER_MAY_EXIST)
 
 
+def _account_order_may_exist(acct: Dict[str, Any]) -> bool:
+    """One failed account whose message says its order may have gone out.
+
+    A broker that submitted the order but never saw the confirmation reports
+    the account ok=False with "submitted ... verify" in the message. Retrying
+    it is the double-buy (or double-sell) the message is warning about.
+
+    Narrower than _ORDER_MAY_EXIST on purpose: a plain rejection ("order
+    cannot be placed ... pending a corporate action") or a "Skipped:" row for
+    an account never attempted holds no order and belongs in Retry. Every
+    broker's may-exist wording says "verify" next to "submitted"/"placed";
+    "verify" alone also matches SoFi's "Verify you are human" login text.
+    """
+    if not isinstance(acct, dict) or acct.get("ok"):
+        return False
+    msg = str(acct.get("message") or "").lower()
+    return "verify" in msg and ("submitted" in msg or "placed" in msg)
+
+
+def _verify_manually_accounts(results: List[dict]) -> Dict[str, List[str]]:
+    """broker -> failed accounts that may hold a live order: check by hand."""
+    out: Dict[str, List[str]] = {}
+    for r in results or []:
+        ids = [str(a.get("account_id") or "account")
+               for a in (r.get("accounts") or []) if _account_order_may_exist(a)]
+        if ids:
+            out[str(r.get("broker") or "")] = ids
+    return out
+
+
 def _autosell_restore(state: Dict[str, Any]) -> Tuple[set, List[str]]:
     """(sold-once set, claims released) from a saved autosell_state.json.
 
@@ -241,6 +271,37 @@ def _autosell_restore(state: Dict[str, Any]) -> Tuple[set, List[str]]:
     """
     released = [k for k in (state.get("reading") or []) if isinstance(k, str)]
     return set(state.get("sold") or []) - set(released), released
+
+
+def _autosell_dry_claims(app) -> set:
+    """Sold-once keys a DRY RUN claimed: nothing was sold under them.
+
+    Created on first use, so the stand-ins the tests bind methods to need not
+    know about it.
+    """
+    s = getattr(app, "_autosell_dry_keys", None)
+    if s is None:
+        s = set()
+        try:
+            app._autosell_dry_keys = s
+        except Exception:
+            pass
+    return s
+
+
+def _release_dry_claims(sold: set, dry_keys: set) -> List[str]:
+    """Hand back every play a dry run claimed, in place. Returns what it freed.
+
+    A dry run settles a play exactly like a live one — that is what makes it a
+    rehearsal — so once it has looked at a play the sold-once record says
+    "handled". Switching to live then sold nothing: every play the rehearsal had
+    walked through was already claimed. Only keys a dry run claimed are freed,
+    never one a live order went out under.
+    """
+    freed = sorted(k for k in dry_keys if k in sold)
+    sold.difference_update(freed)
+    dry_keys.clear()
+    return freed
 
 
 def _activity_note(line: str) -> None:
@@ -881,6 +942,32 @@ def _public_token_indices() -> List[int]:
     return [login.idx for login in broker_logins.logins("public")]
 
 
+def _broker_status_plan(linked: List[str], public_indices, evidence) -> List[tuple]:
+    """(kind, key, label, status) for each Broker Status row, in display order.
+
+    `public_indices` and `evidence` are called, not passed in evaluated, so a
+    card with no Public login never asks for Public's token list.
+
+    Public runs one independent login per API secret token — each configured
+    token is its own P1/P2/P3 row so you can see which connects. Elsewhere only
+    a count we have evidence for is shown; a broker nothing has reported on yet
+    says so rather than showing a number.
+    """
+    rows: List[tuple] = []
+    counts = None
+    for broker in linked:
+        if broker == "public":
+            for idx in public_indices():
+                rows.append(("public", idx, f"Public P{idx}", "credentials set"))
+            continue
+        if counts is None:
+            counts = evidence() or {}
+        n = counts.get(broker)
+        rows.append(("broker", broker, broker.capitalize(),
+                     _plural(n, "account") if n else "credentials set"))
+    return rows
+
+
 def _write_json(path: Path, data: Any, *, indent: int = 2) -> None:
     """Write one of the app's state files so a crash cannot leave it half-done.
 
@@ -899,7 +986,42 @@ def _write_json(path: Path, data: Any, *, indent: int = 2) -> None:
     atomic.replace(tmp, path)
 
 
+def _env_quote(val: str) -> str:
+    """One .env value, written so python-dotenv reads back exactly `val`.
+
+    Unquoted was how a password got mangled: `abc #def` loads as `abc`, a
+    leading space is stripped, and a value that starts with a quote is parsed
+    as a quoted string. Single quotes with `\\` and `\\'` escaped survive all of
+    that. (`${...}` inside one is still interpolated by python-dotenv, which is
+    why every load in this app passes interpolate=False.)
+
+    The one thing single quotes cannot hold is a TRAILING backslash: the
+    parser reads `\\'` at the end as an escaped quote and runs on into the next
+    line. Such a value is written bare when bare is safe, and refused when it
+    is not, rather than corrupting every key after it.
+    """
+    val = str(val)
+    if "\n" in val or "\r" in val:
+        raise ValueError("a .env value cannot span lines")
+    if not val.endswith("\\"):
+        return "'" + val.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    bare_ok = (val == val.strip() and val[:1] not in ("'", '"')
+               and not re.search(r"\s#", val))
+    if bare_ok:
+        return val
+    raise ValueError("this value can't be stored in .env (it ends with a "
+                     "backslash and has spaces or a ' #')")
+
+
 def _save_env_file(updates: Dict[str, str]) -> None:
+    """Write `updates` into .env, keeping every other line as it was.
+
+    Comments, order and unrelated keys are untouched; a key that already
+    exists is rewritten in place (every occurrence, so no stale duplicate
+    later in the file wins the load). Written temp-then-rename like every
+    other state file: this one holds the broker logins.
+    """
+    encoded = {key: _env_quote(val) for key, val in updates.items()}
     lines: List[str] = []
     if ENV_FILE.exists():
         lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
@@ -907,19 +1029,21 @@ def _save_env_file(updates: Dict[str, str]) -> None:
     existing_keys: set = set()
     new_lines: List[str] = []
     for line in lines:
-        m = re.match(r"^([A-Z_][A-Z0-9_]*)=", line)
-        if m and m.group(1) in updates:
+        m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        if m and m.group(1) in encoded:
             key = m.group(1)
-            new_lines.append(f"{key}={updates[key]}")
+            new_lines.append(f"{key}={encoded[key]}")
             existing_keys.add(key)
         else:
             new_lines.append(line)
 
-    for key, val in updates.items():
+    for key, val in encoded.items():
         if key not in existing_keys:
             new_lines.append(f"{key}={val}")
 
-    ENV_FILE.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    tmp = ENV_FILE.with_name(ENV_FILE.name + ".tmp")
+    tmp.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    atomic.replace(tmp, ENV_FILE)
     for key, val in updates.items():
         os.environ[key] = val
 
@@ -1128,6 +1252,7 @@ class StatusDot(tk.Canvas):
         self.set_color(color)
 
     def set_color(self, color: str) -> None:
+        self.color = color          # read back when a card is rebuilt
         self.delete("all")
         s, p = self._size, self._pad
         # glow
@@ -1399,6 +1524,11 @@ def _public_raw_positions(symbols, rows=None) -> Dict[str, List[float]]:
     Summed across the alert and current ticker, because the buy is journaled
     under the name we bought it as and a later sell may be under the new one.
     """
+    return _raw_positions("public", symbols, rows)
+
+
+def _raw_positions(broker: str, symbols, rows=None) -> Dict[str, List[float]]:
+    """_public_raw_positions for any brokerage: account -> [bought, sold], raw."""
     syms = {str(s or "").upper() for s in symbols if s}
     out: Dict[str, List[float]] = {}
     if rows is None:
@@ -1407,7 +1537,7 @@ def _public_raw_positions(symbols, rows=None) -> Dict[str, List[float]]:
         except Exception:
             return out
     for t in rows:
-        if (str(t.get("broker") or "") != "public"
+        if (str(t.get("broker") or "") != broker
                 or str(t.get("symbol") or "").upper() not in syms):
             continue
         try:
@@ -1441,6 +1571,49 @@ def _public_sell_caps(symbols, rows=None) -> Dict[str, float]:
     return {acct: bought
             for acct, (bought, sold) in _public_raw_positions(symbols, rows).items()
             if acct and bought > 1e-9 and bought - sold > 1e-9}
+
+
+def _broker_sell_cap(broker: str, symbols, rows=None) -> Tuple[Optional[float], int]:
+    """(most one order may sell per account, accounts the journal holds) at a
+    brokerage whose module sends ONE quantity to every account.
+
+    Public sizes each account itself (_public_sell_caps). Everywhere else the
+    exit leg is lifecycle.resolve's smallest live balance, sent to every
+    account, and a live balance includes any shares the customer held on his
+    own: a broker with one account holding 100 of his and 1 of ours read as
+    "sell 101".
+
+    The same rule as Public, applied per brokerage: never sell more shares in
+    an account than this tool put in. The figure is the GROSS raw buy, in the
+    units we bought in, for the same reason given there — a reverse split only
+    ever shrinks a share count (a round-up brings 1 back to at most 1), so the
+    pre-split buy is always at least what is ours afterwards, and no
+    split-adjusted figure has to be trusted to line up. One quantity reaches
+    every account, so the cap is the SMALLEST such buy among the accounts we
+    are still in.
+
+    (None, 0) when the journal shows no open account here: nothing to cap
+    against, and the caller leaves the size alone and says so.
+    """
+    caps = [bought for acct, (bought, sold) in _raw_positions(broker, symbols, rows).items()
+            if bought > 1e-9 and bought - sold > 1e-9]
+    if not caps:
+        return None, 0
+    return min(caps), len(caps)
+
+
+def _capped_leg_qty(leg, cap: Optional[float]) -> Tuple[str, bool]:
+    """(quantity to send, whether the cap cut it) for one non-Public exit leg."""
+    if cap is None:
+        return leg.qty, False
+    try:
+        live = Decimal(str(leg.qty))
+        lim = Decimal(_cap_text(cap))
+    except (InvalidOperation, ValueError, TypeError):
+        return leg.qty, False
+    if lim <= 0 or live <= lim:
+        return leg.qty, False
+    return lifecycle.qty_text(lim), True
 
 
 def _cap_text(qty: float) -> str:
@@ -2528,6 +2701,11 @@ def _local_picks() -> List[Dict[str, str]]:
 # successful read. Module-level because _cloud_picks() is a plain function that
 # the App instance calls, not a method.
 _PICKS_AUTH_ERROR: Optional[str] = None
+# Whether the LAST _cloud_picks() call actually got an answer. A network error
+# returns None without touching _PICKS_AUTH_ERROR, so that alone read an
+# offline pull as a good one: the status bar said "just now" and the 5-30 min
+# retry never scheduled.
+_PICKS_LAST_FETCH_OK: bool = False
 
 
 def _cloud_picks() -> Optional[List[Dict[str, str]]]:
@@ -2541,7 +2719,8 @@ def _cloud_picks() -> Optional[List[Dict[str, str]]]:
     have", [] is "the feed says nothing is open". Collapsing them would blank a
     customer's Quick Picks every time their wifi dropped.
     """
-    global _PICKS_AUTH_ERROR
+    global _PICKS_AUTH_ERROR, _PICKS_LAST_FETCH_OK
+    _PICKS_LAST_FETCH_OK = False
     if not CLOUD_AVAILABLE:
         return None
     try:
@@ -2554,7 +2733,10 @@ def _cloud_picks() -> Optional[List[Dict[str, str]]]:
     except Exception:
         return None          # CloudError, or anything the transport threw
     _PICKS_AUTH_ERROR = None
-    return picks if isinstance(picks, list) else None
+    if not isinstance(picks, list):
+        return None
+    _PICKS_LAST_FETCH_OK = True
+    return picks
 
 
 def _push_picks_remote(picks: List[Dict[str, str]]) -> bool:
@@ -2798,6 +2980,12 @@ class App(ctk.CTk):
         # the claim and the order, so nothing was sold and it is released.
         self._autosell_reading: set = set()
         self._autosell_sold, self._autosell_released = _autosell_restore(_as)
+        # Of those, the ones a DRY RUN claimed. Released when dry run is
+        # switched off, so the first live run sells them — see
+        # _release_dry_claims.
+        self._autosell_dry_keys: set = {
+            k for k in (_as.get("dry_sold") or [])
+            if isinstance(k, str) and k in self._autosell_sold}
         # key -> earliest time a handed-back play may be queued again. The
         # re-checks after buys and after the queue drains are minutes apart,
         # not an hour, so without this a broker that cannot log in would be
@@ -4240,7 +4428,36 @@ class App(ctk.CTk):
         # keep counting up on its own, or a feed that died an hour ago would
         # still read "just now" until the next successful pull.
         self._update_feed_status()
+        self._surface_journal_error()
         self.after(1000, self._tick_clock)
+
+    def _surface_journal_error(self) -> None:
+        """Say so, once, when trades.json had to be recovered or can't be read.
+
+        trade_journal restores a corrupt file from its .bak, or refuses to read
+        it at all (JournalUnreadable), and only records why in last_error() and
+        the crash log. Without this the GUI just shows the recovered (or last
+        cached) rows as if nothing happened. Rides the Tk clock tick, so it is
+        always on the Tk thread, and dedupes on the text so a message that
+        stays true is not repeated every second.
+        """
+        try:
+            err = trade_journal.last_error()
+        except Exception:
+            return
+        if not err or err == getattr(self, "_journal_error_shown", None):
+            return
+        self._journal_error_shown = err
+        recovered = "recovered" in err.lower()
+        try:
+            self._log(f"Trade journal: {err}", "warn" if recovered else "error")
+            self._push_notification(
+                "Trade journal was restored from its backup — check recent trades"
+                if recovered else
+                "Trade journal can't be read — new trades are NOT being saved",
+                "warning" if recovered else "error")
+        except Exception:
+            pass
 
     def _start_quote_loop(self) -> None:
         # Re-entrant: also the "Refresh Quotes" button and Ctrl+R (_global_refresh).
@@ -5436,36 +5653,9 @@ class App(ctk.CTk):
         self._broker_status_labels: Dict[str, Dict[str, Any]] = {}
         self._public_status_labels: Dict[int, Dict[str, Any]] = {}
 
-        list_frame = tk.Frame(status_card.inner, bg=BG_CARD)
-        list_frame.pack(fill="x", padx=20, pady=(0, 16))
-
-        def _status_row(name: str, status_text: str) -> Dict[str, Any]:
-            row = tk.Frame(list_frame, bg=BG_CARD)
-            row.pack(fill="x", pady=2)
-            dot = StatusDot(row, color=GREEN, size=8)
-            dot.pack(side="left", padx=(0, 10))
-            tk.Label(row, text=name, bg=BG_CARD, fg=TEXT_PRIMARY,
-                     font=(FONT_FAMILY, 10), width=12, anchor="w").pack(side="left")
-            status_lbl = tk.Label(row, text=status_text, bg=BG_CARD, fg=GREEN,
-                                   font=(FONT_FAMILY, 9))
-            status_lbl.pack(side="left", padx=(8, 0))
-            return {"dot": dot, "status": status_lbl}
-
-        for broker in sorted(BROKER_MODULES):
-            if not _broker_has_creds(broker):
-                continue
-            # Public runs one independent login per API secret token — render each
-            # configured token as its own P1/P2/P3 row so you can see which connects.
-            if broker == "public":
-                for idx in _public_token_indices():
-                    self._public_status_labels[idx] = _status_row(f"Public P{idx}", "credentials set")
-                continue
-
-            # Only a count we have evidence for; a broker nothing has reported
-            # on yet says so rather than showing a number.
-            n = _account_count_evidence().get(broker)
-            status_text = f"{_plural(n, 'account')}" if n else "credentials set"
-            self._broker_status_labels[broker] = _status_row(broker.capitalize(), status_text)
+        self._broker_status_list = tk.Frame(status_card.inner, bg=BG_CARD)
+        self._broker_status_list.pack(fill="x", padx=20, pady=(0, 16))
+        self._render_broker_status()
 
         # ---- Custom Accounts card ----
         custom_card = RoundedFrame(frame, bg_color=BG_CARD, border_color=BORDER, radius=14)
@@ -6084,18 +6274,42 @@ class App(ctk.CTk):
                     err.configure(text="Price must be above zero.")
                     return
 
-            for acct, n in _spread_over_accounts(accounts, qty):
-                if sold:
-                    trade_journal.record_trade(
-                        broker=leg.broker, account_id=acct, side="sell",
-                        symbol=play.symbol, qty=n, fill_price=price,
-                        price_source=trade_journal.PRICE_MANUAL, when=when)
-                else:
-                    trade_journal.record_close(
-                        broker=leg.broker, account_id=acct, symbol=play.symbol,
-                        qty=n, reason=trade_journal.CLOSE_MANUAL,
-                        note="marked resolved by hand on the sells board",
-                        when=when)
+            spread = list(_spread_over_accounts(accounts, qty))
+            saved = 0
+            try:
+                for acct, n in spread:
+                    if sold:
+                        trade_journal.record_trade(
+                            broker=leg.broker, account_id=acct, side="sell",
+                            symbol=play.symbol, qty=n, fill_price=price,
+                            price_source=trade_journal.PRICE_MANUAL, when=when)
+                    else:
+                        trade_journal.record_close(
+                            broker=leg.broker, account_id=acct, symbol=play.symbol,
+                            qty=n, reason=trade_journal.CLOSE_MANUAL,
+                            note="marked resolved by hand on the sells board",
+                            when=when)
+                    saved += 1
+            except Exception as exc:            # noqa: BLE001
+                # JournalUnreadable, a locked file, a full disk. Nothing saved:
+                # the dialog stays open so nothing typed is lost. Some saved:
+                # close it — its open-share count is now stale, and Record
+                # again would write the saved accounts twice.
+                part = (f" {saved} of {len(spread)} accounts were recorded "
+                        f"before it failed." if saved else "")
+                self._log(f"{play.symbol} at {leg.label}: mark-resolved NOT saved "
+                          f"to the journal ({exc}).{part}", "error")
+                if not saved:
+                    err.configure(text=f"Not saved - the trade journal couldn't "
+                                       f"be written ({exc}).")
+                    return
+                dlg.destroy()
+                self._push_notification(
+                    f"{play.symbol}: only partly saved -{part} Check the "
+                    f"Activity log.", "warning")
+                self._render_sell_alerts()
+                self._apply_dashboard_summary()
+                return
             dlg.destroy()
 
             what = (f"sold at ${price:,.4f}".rstrip("0").rstrip(".") if sold
@@ -7308,7 +7522,7 @@ class App(ctk.CTk):
         self._run_in_thread(self._startup_refresh_worker)
 
     def _startup_refresh_worker(self) -> None:
-        load_dotenv(ENV_FILE, override=True)
+        load_dotenv(ENV_FILE, override=True, interpolate=False)
         results: Dict[str, BrokerOutput] = {}
         lock = threading.Lock()
 
@@ -7360,6 +7574,63 @@ class App(ctk.CTk):
             self._log("Dashboard: startup refresh complete")
 
         self.after(0, update_final)
+
+    def _render_broker_status(self) -> None:
+        """(Re)build the Command Center's Broker Status rows from .env.
+
+        Built once at startup, it never learned about a broker linked later —
+        the card kept saying whatever .env held at launch until a restart.
+        _refresh_linked_brokers calls this after every credentials save. A row
+        that already existed keeps what a refresh last said about it ("3
+        accounts connected"), so a save elsewhere does not wipe it back to
+        "credentials set".
+        """
+        frame = getattr(self, "_broker_status_list", None)
+        if frame is None:
+            return
+        carried: Dict[tuple, tuple] = {}
+        for kind, labels in (("broker", self._broker_status_labels),
+                             ("public", self._public_status_labels)):
+            for key, row in labels.items():
+                try:
+                    carried[(kind, key)] = (row["status"].cget("text"),
+                                            row["status"].cget("fg"),
+                                            getattr(row["dot"], "color", GREEN))
+                except Exception:
+                    pass
+        for w in frame.winfo_children():
+            w.destroy()
+        self._broker_status_labels.clear()
+        self._public_status_labels.clear()
+
+        def _status_row(name: str, status_text: str) -> Dict[str, Any]:
+            row = tk.Frame(frame, bg=BG_CARD)
+            row.pack(fill="x", pady=2)
+            dot = StatusDot(row, color=GREEN, size=8)
+            dot.pack(side="left", padx=(0, 10))
+            tk.Label(row, text=name, bg=BG_CARD, fg=TEXT_PRIMARY,
+                     font=(FONT_FAMILY, 10), width=12, anchor="w").pack(side="left")
+            status_lbl = tk.Label(row, text=status_text, bg=BG_CARD, fg=GREEN,
+                                   font=(FONT_FAMILY, 9))
+            status_lbl.pack(side="left", padx=(8, 0))
+            return {"dot": dot, "status": status_lbl}
+
+        plan = _broker_status_plan(
+            [b for b in sorted(BROKER_MODULES) if _broker_has_creds(b)],
+            _public_token_indices, _account_count_evidence)
+        if not plan:
+            tk.Label(frame, text="No brokers linked yet — add one in Brokers",
+                     bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9),
+                     anchor="w").pack(fill="x", pady=2)
+            return
+        for kind, key, name, status_text in plan:
+            row = _status_row(name, status_text)
+            prev = carried.get((kind, key))
+            if prev:
+                row["status"].configure(text=prev[0], fg=prev[1])
+                row["dot"].set_color(prev[2])
+            (self._public_status_labels if kind == "public"
+             else self._broker_status_labels)[key] = row
 
     def _apply_public_status(self, out: Optional[Any]) -> None:
         """Update the per-login Public rows (P1/P2/P3) on the Command Center.
@@ -7486,7 +7757,7 @@ class App(ctk.CTk):
         self._run_in_thread(self._dashboard_refresh_worker)
 
     def _dashboard_refresh_worker(self) -> None:
-        load_dotenv(ENV_FILE, override=True)
+        load_dotenv(ENV_FILE, override=True, interpolate=False)
         threads: List[threading.Thread] = []
         results: Dict[str, BrokerOutput] = {}
         lock = threading.Lock()
@@ -7831,7 +8102,7 @@ class App(ctk.CTk):
                     if not slot.acquire(timeout=_BROWSER_LOCK_TIMEOUT):
                         raise RuntimeError(_BROWSER_BUSY_MSG)
                     held = slot
-                load_dotenv(ENV_FILE, override=True)
+                load_dotenv(ENV_FILE, override=True, interpolate=False)
                 out = _load_broker(broker).get_holdings()
                 # Saved here rather than at the end, so a broker that answers
                 # in two seconds shows up in two seconds.
@@ -9120,7 +9391,7 @@ class App(ctk.CTk):
                     raise RuntimeError(_BROWSER_BUSY_MSG)
                 held_slot = slot
 
-            load_dotenv(ENV_FILE, override=True)
+            load_dotenv(ENV_FILE, override=True, interpolate=False)
             mod = _load_broker(broker)
 
             # Live progress: tail the broker's nav log for real-time updates
@@ -12557,6 +12828,18 @@ class App(ctk.CTk):
             toast = f"Mirror: {symbol} filled on no broker — needs manual action"
             kind = "error"
 
+        # A broker that sent the order but never saw it confirmed reports the
+        # account as failed. "Trade manually" on such a row is a second buy, so
+        # the row says to check the broker first.
+        verify = _verify_manually_accounts(batch.get("results") or [])
+        if verify:
+            where = ", ".join(_names(verify))
+            note = f"order may have been placed at {where} — verify manually before trading"
+            detail = (f"{symbol}: {where} did not confirm the order but may have "
+                      f"placed it — check the broker before buying again")
+            toast = f"Mirror: {symbol} — verify at {where} before buying again"
+            kind = "warning"
+
         self._mirror_failed.add(key)
         self._mirror_failed_notes[key] = note
         self._save_mirror_state()
@@ -13191,7 +13474,11 @@ class App(ctk.CTk):
                 updates[id_key] = raw
             elif raw.lower() != (_env(name_key) or "").lower():
                 updates[id_key] = ""
-        _save_env_file(updates)
+        try:
+            _save_env_file(updates)
+        except (ValueError, OSError) as exc:
+            self._alerts_log_msg(f"Not saved — {exc}")
+            return
         self._alerts_log_msg("Saved.")
 
     def _ensure_alerts_channel_id(self, role: str = "buy", required: bool = True):
@@ -14423,6 +14710,14 @@ class App(ctk.CTk):
         if hasattr(self, "_autosell_pill"):
             self._autosell_pill.configure(text=text, fg=colour)
         if save:
+            if not dry:
+                # Going live: what the rehearsal walked through was never sold.
+                freed = _release_dry_claims(self._autosell_sold,
+                                            _autosell_dry_claims(self))
+                if freed:
+                    self._log(f"Auto-sell: dry run off — "
+                              f"{_plural(len(freed), 'play')} the dry run looked at "
+                              f"will be sold live on the next check.", "meta")
             self._save_autosell_state()
             if armed and not dry:
                 # Said once, plainly, at the moment it becomes true — and it
@@ -14918,6 +15213,30 @@ class App(ctk.CTk):
 
         task = resolved.task
         keys = [leg.key for leg in resolved.legs]
+        leg_qty = {leg.key: leg.qty for leg in resolved.legs}
+        cap_notes: List[str] = []
+        for leg in resolved.legs:
+            if leg.key == "public":
+                continue                # sized per account at order time
+            cap, n_ours = _broker_sell_cap(leg.key, (task.symbol, task.alert_symbol))
+            qty, cut = _capped_leg_qty(leg, cap)
+            if cut and autosell:
+                # Nobody is watching an auto-sell to notice "sell 101". By hand
+                # the confirm dialog showed the live size, and that is the
+                # user's call to make.
+                leg_qty[leg.key] = qty
+                cap_notes.append(f"{leg.broker}: live balance {leg.qty} is more than "
+                                 f"this tool bought there — selling {qty}")
+            elif cut:
+                cap_notes.append(f"{leg.broker}: selling {leg.qty}, more than the "
+                                 f"{qty} this tool bought there — the rest may be "
+                                 f"your own shares")
+            if n_ours and leg.accounts > n_ours:
+                # The module cannot be pointed at a subset of accounts, so an
+                # account holding only the customer's own shares is sold too.
+                cap_notes.append(f"{leg.broker}: {leg.accounts} accounts hold "
+                                 f"{task.symbol} but this tool bought in {n_ours} — "
+                                 f"check the others at the broker")
         batch = {
             "pending": set(keys),
             "all_brokers": sorted(keys),
@@ -14927,8 +15246,8 @@ class App(ctk.CTk):
             # Informational only: the completion receipt sums the shares each
             # broker actually reported. Each leg carries its own size below,
             # and they legitimately differ, so there is no single batch qty.
-            "qty": (resolved.legs[0].qty
-                    if len({l.qty for l in resolved.legs}) == 1 else "mixed"),
+            "qty": (next(iter(leg_qty.values()))
+                    if len(set(leg_qty.values())) == 1 else "mixed"),
             "dry_run": dry_run,
             "origin": "exit",
             "finished": False,
@@ -14965,10 +15284,14 @@ class App(ctk.CTk):
         self._trade_batch = batch
         self._log(f"Exit: SELL {task.symbol} — {resolved.describe()}"
                   + (" [DRY RUN]" if dry_run else ""))
+        for note in cap_notes:
+            self._log(f"Exit: {task.symbol} — {note}", "warn")
+        if cap_notes:
+            self._push_notification(f"{task.symbol}: {cap_notes[0]}", "warning")
         self._live_start(batch)
         for leg in resolved.legs:
             self._run_in_thread(self._trade_worker, leg.key, "sell",
-                                task.symbol, leg.qty, dry_run, batch)
+                                task.symbol, leg_qty[leg.key], dry_run, batch)
 
     # ---- Auto-sell fractionals ---------------------------------------------
     #
@@ -15029,6 +15352,8 @@ class App(ctk.CTk):
             # during the read, and every restart skipped it as sold.
             "sold": list(self._autosell_sold - self._reading_keys())[-500:],
             "reading": sorted(self._reading_keys()),
+            # Claimed by a dry run, so released when it is switched off.
+            "dry_sold": sorted(_autosell_dry_claims(self) & self._autosell_sold),
         }
         try:
             _write_json(AUTOSELL_STATE_FILE, state)
@@ -15833,6 +16158,9 @@ class App(ctk.CTk):
         # disk as "reading", not "sold", so a death here releases it on restart.
         self._autosell_sold.add(key)
         self._reading_keys().add(key)
+        # A fresh claim is not a dry one until _autosell_fire says so; a stale
+        # dry mark left on it would let switching dry run off free a LIVE sell.
+        _autosell_dry_claims(self).discard(key)
         self._autosell_recheck = True
         self._save_autosell_state()
 
@@ -15961,7 +16289,10 @@ class App(ctk.CTk):
             n = 0
             for sym in {task.symbol, task.alert_symbol}:
                 try:
-                    n = max(n, len(_leg_open_accounts(broker, sym)))
+                    # `missing` holds display names ("Fidelity"); the journal
+                    # keys rows by app key ("fidelity"). Compare like with like
+                    # or this never finds anything and the net never fires.
+                    n = max(n, len(_leg_open_accounts(lifecycle.app_key(broker), sym)))
                 except Exception:
                     pass
             if n:
@@ -15988,7 +16319,9 @@ class App(ctk.CTk):
             open_n = 0
             for sym in {resolved.task.symbol, resolved.task.alert_symbol}:
                 try:
-                    open_n = max(open_n, len(_leg_open_accounts(leg.broker, sym)))
+                    # leg.broker is the display name; the journal is keyed by
+                    # leg.key ("wellsfargo"), the same key the order goes to.
+                    open_n = max(open_n, len(_leg_open_accounts(leg.key, sym)))
                 except Exception:
                     pass
             if open_n > leg.accounts:
@@ -16006,6 +16339,12 @@ class App(ctk.CTk):
         # order or hands the play back. Saved BEFORE any order goes out, so a
         # death from here on leaves it sold — never sold twice.
         self._autosell_read_done(task)
+        # Recorded with the claim, in the same save: a dry run's claim is freed
+        # when dry run is switched off (_release_dry_claims), a live one never.
+        if bool(self._autosell_dry_run.get()):
+            _autosell_dry_claims(self).add(self._autosell_key(task))
+        else:
+            _autosell_dry_claims(self).discard(self._autosell_key(task))
         self._save_autosell_state()
 
         # Something else started while we were reading holdings. _exit_fire
@@ -16124,7 +16463,10 @@ class App(ctk.CTk):
             # "nothing is live today, last checked 14:02", which is a confident
             # lie. We were never allowed to look. Treat that as a failed pull so
             # the empty state can ask for the password instead.
-            ok = _PICKS_AUTH_ERROR is None
+            #
+            # Nor is "no auth error" enough: an offline pull also hands back
+            # the cache with no error recorded. Only an answer counts.
+            ok = _PICKS_AUTH_ERROR is None and _PICKS_LAST_FETCH_OK
             # Render even when empty: that is exactly when the message matters,
             # and _load_picks() already refuses to let an empty feed erase a
             # populated cache, so this cannot blank anyone's plays.
@@ -16132,11 +16474,15 @@ class App(ctk.CTk):
         except Exception:
             pass
 
+        # The exits stream counts too, but it cannot vouch for the picks: a
+        # pull is good only when every stream it asked for answered. A sells
+        # call that raised (offline, refused) is a failed pull, so the retry
+        # schedules instead of the status bar claiming "just now".
         try:
             incoming = client.fetch_sells()
-            ok = ok or _PICKS_AUTH_ERROR is None
         except Exception:
             incoming = None
+            ok = False
         if incoming:
             merged = _merge_sells(_load_sells(), incoming)
             _save_sells(merged)
@@ -16554,9 +16900,16 @@ class App(ctk.CTk):
         stayed empty and both counters sat at "0 brokers linked" for the rest of
         the session.
         """
-        for render in (self._render_trade_broker_chips,
-                       self._render_mirror_broker_chips,
-                       self._render_linked_count):
+        # The Command Center's Broker Status card too: it listed only what
+        # .env held at launch. getattr, like the recount below — the page that
+        # owns it may not be built.
+        renders = [self._render_trade_broker_chips,
+                   self._render_mirror_broker_chips,
+                   self._render_linked_count]
+        status = getattr(self, "_render_broker_status", None)
+        if status is not None:
+            renders.append(status)
+        for render in renders:
             try:
                 render()
             except Exception as exc:      # one broken piece must not eat the save
@@ -16593,7 +16946,13 @@ class App(ctk.CTk):
         widgets = self._account_widgets[broker]
         self._collect_login_rows(broker)
         updates = broker_logins.env_updates(broker, self._login_model(broker))
-        _save_env_file(updates)
+        try:
+            _save_env_file(updates)
+        except (ValueError, OSError) as exc:
+            widgets["status"].configure(text="not saved", fg=RED)
+            self._log(f"Accounts: could not save {broker} — {exc}", "warn")
+            self._push_notification(f"{broker}: login not saved — {exc}", "error")
+            return
 
         # Re-read from disk so the editor shows what was actually stored —
         # including the index a brand-new login just landed on.
@@ -16647,7 +17006,7 @@ class App(ctk.CTk):
                 held_slot = slot
                 self.after(0, lambda: widgets["status"].configure(text="bootstrapping...", fg=YELLOW))
             try:
-                load_dotenv(ENV_FILE, override=True)
+                load_dotenv(ENV_FILE, override=True, interpolate=False)
                 mod = _load_broker(broker)
                 # Robinhood's login can stall on a device approval waiting on the
                 # user's phone. Nothing on screen said so, and the poll has no
@@ -17026,10 +17385,26 @@ class App(ctk.CTk):
         if not hasattr(self, "_done_retry_row"):
             return
         self._retry_plan = {} if (dry or not batch) else self._failed_account_plan(results)
+        verify = {} if dry else _verify_manually_accounts(results)
+        verify_txt = ""
+        if verify:
+            nv = sum(len(v) for v in verify.values())
+            verify_txt = (f"{_plural(nv, 'account')} may have an order in — verify "
+                          f"manually: " + "; ".join(
+                              f"{b.capitalize()} {', '.join(v)}"
+                              for b, v in sorted(verify.items())))
         if not self._retry_plan:
             self._retry_order = None
-            self._done_retry_row.pack_forget()
+            if verify_txt:
+                # Nothing to retry, but something to check: the label alone,
+                # without a button that would place the order a second time.
+                self._done_retry_btn.pack_forget()
+                self._done_retry_lbl.configure(text=verify_txt, fg=YELLOW)
+                self._done_retry_row.pack(fill="x", padx=22, pady=(4, 16))
+            else:
+                self._done_retry_row.pack_forget()
             return
+        self._done_retry_btn.pack(side="right")
         n = sum(len(v) for v in self._retry_plan.values())
         where = ", ".join(f"{b.capitalize()} ({len(v)})"
                           for b, v in sorted(self._retry_plan.items()))
@@ -17040,7 +17415,9 @@ class App(ctk.CTk):
                              "symbol": batch.get("symbol", ""),
                              "qty": str(batch.get("qty", "1"))}
         self._done_retry_lbl.configure(
-            text=f"{n} account{'s' if n != 1 else ''} still unfilled — {where}")
+            text=f"{n} account{'s' if n != 1 else ''} still unfilled — {where}"
+                 + (f"\n{verify_txt}" if verify_txt else ""),
+            fg=YELLOW if verify_txt else TEXT_SECONDARY)
         self._done_retry_row.pack(fill="x", padx=22, pady=(4, 16))
 
     @staticmethod
@@ -17050,6 +17427,11 @@ class App(ctk.CTk):
         Brokers whose module can't narrow to a subset of accounts are left out:
         offering a retry that silently re-runs all of them is worse than not
         offering one.
+
+        An account whose message says the order may already be in ("submitted
+        ... verify") is never in the plan: the broker took something it could
+        not confirm, and a retry would place it twice. Those are listed as
+        "verify manually" instead (_verify_manually_accounts).
         """
         plan: Dict[str, List[str]] = {}
         for r in results or []:
@@ -17057,7 +17439,8 @@ class App(ctk.CTk):
             if broker not in RETRYABLE_ACCOUNT_BROKERS:
                 continue
             failed = [a.get("account_id") for a in (r.get("accounts") or [])
-                      if not a.get("ok") and a.get("account_id")]
+                      if not a.get("ok") and a.get("account_id")
+                      and not _account_order_may_exist(a)]
             if failed:
                 plan[broker] = failed
         return plan

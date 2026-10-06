@@ -1131,6 +1131,21 @@ def get_accounts(*args, **kwargs) -> BrokerOutput:
     return get_holdings(*args, **kwargs)
 
 
+def _schwab_friendly_error(messages: Any, error_messages: Dict[str, str]) -> str:
+    """A pre-placement rejection, in words the user can act on.
+
+    Known Schwab refusals map to their short form; anything else is Schwab's
+    own text. This is only used where no order can exist, so it must never
+    borrow the "may have been submitted / verify" wording.
+    """
+    msgs = [str(m) for m in (messages or [])]
+    for err, friendly in error_messages.items():
+        if any(err in m for m in msgs):
+            return friendly
+    text = "; ".join(m for m in msgs if m.strip()) or "no detail"
+    return f"Schwab rejected the order before it was sent: {text}"
+
+
 def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **kwargs) -> BrokerOutput:
     """
     Critical: trades MUST NOT be blocked by holdings being empty.
@@ -1203,6 +1218,76 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
 
                 acct_label = f"{sess['label']} ({_mask_last4(acc_id)})"
 
+                if not dry_run:
+                    # Verification-only pass first (trade_v2 dry_run=True stops
+                    # after the verification POST and places nothing). Most
+                    # failures — expired token, insufficient funds, restricted
+                    # security, a dropped connection — happen right there, and
+                    # they hold no order, so they must read as plain, retryable
+                    # failures. Only the live call below can leave an order
+                    # behind, and only it gets the "verify" wording.
+                    try:
+                        pre_msgs, pre_ok = client.trade_v2(
+                            ticker=sym,
+                            side=side_cap,
+                            qty=q,
+                            account_id=acc_id,
+                            dry_run=True,
+                        )
+                    except Exception as e:
+                        if BLOG is not None:
+                            try:
+                                BLOG.log_exception(ctx, broker=BROKER, action="trade", label=lbl, exc=e, secrets=None)
+                            except Exception:
+                                pass
+                        outs.append(AccountOutput(
+                            account_id=acct_label, ok=False,
+                            message=f"Schwab order check failed, nothing was sent: {e}"))
+                        any_fail = True
+                        continue
+                    if not pre_ok:
+                        known = any(err in str(m) for m in (pre_msgs or [])
+                                    for err in error_messages)
+                        if known:
+                            outs.append(AccountOutput(
+                                account_id=acct_label, ok=False,
+                                message=_schwab_friendly_error(pre_msgs, error_messages)))
+                            any_fail = True
+                            continue
+                        # v2's verification refused for a reason Schwab didn't
+                        # name (it is the flakier endpoint, with stricter auth).
+                        # Nothing was placed, so the legacy cookie-based call is
+                        # safe here and places at most one order — the fallback
+                        # this module always had, just moved ahead of the live
+                        # v2 call where it can no longer double up.
+                        try:
+                            messages2, success2 = client.trade(
+                                ticker=sym,
+                                side=side_cap,
+                                qty=q,
+                                account_id=acc_id,
+                                dry_run=False,
+                            )
+                        except Exception as e:
+                            if BLOG is not None:
+                                try:
+                                    BLOG.log_exception(ctx, broker=BROKER, action="trade", label=lbl, exc=e, secrets=None)
+                                except Exception:
+                                    pass
+                            outs.append(AccountOutput(
+                                account_id=acct_label, ok=False,
+                                message=f"Schwab order failed: {e}"))
+                            any_fail = True
+                            continue
+                        if success2:
+                            outs.append(AccountOutput(account_id=acct_label, ok=True, message="ok (retry)"))
+                            any_ok = True
+                        else:
+                            text = "\n".join(str(m) for m in (messages2 or [])) if messages2 else "Order failed"
+                            outs.append(AccountOutput(account_id=acct_label, ok=False, message=text))
+                            any_fail = True
+                        continue
+
                 try:
                     messages, success = client.trade_v2(
                         ticker=sym,
@@ -1223,6 +1308,24 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         if handled:
                             continue
 
+                        if not dry_run:
+                            # No legacy retry on a live order. trade_v2 also
+                            # returns False AFTER its placement POST (a 504 once
+                            # Schwab has accepted it, an orderReturnCode outside
+                            # the valid set), so client.trade() here could place
+                            # a second order. Report it as possibly submitted —
+                            # the app never auto-retries that wording.
+                            text = "; ".join(str(m) for m in (messages or [])) or "no detail"
+                            outs.append(AccountOutput(
+                                account_id=acct_label, ok=False,
+                                message=("Schwab returned an error after the order may have been "
+                                         f"submitted — verify in Schwab before retrying: {text}"),
+                            ))
+                            any_fail = True
+                            continue
+
+                        # Dry run only: the legacy call stops at verification
+                        # when dry_run=True, so the retry can't place anything.
                         messages2, success2 = client.trade(
                             ticker=sym,
                             side=side_cap,
@@ -1247,7 +1350,16 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                             BLOG.log_exception(ctx, broker=BROKER, action="trade", label=lbl, exc=e, secrets=None)
                         except Exception:
                             pass
-                    outs.append(AccountOutput(account_id=acct_label, ok=False, message=str(e)))
+                    # trade_v2 raises from either POST alike (timeouts, a
+                    # non-JSON body, a missing key in the placement response),
+                    # so a live order can't be told apart from one never sent.
+                    # Dry runs never reach the placement POST.
+                    if dry_run:
+                        text = str(e)
+                    else:
+                        text = ("Schwab raised an error while the order may have been "
+                                f"submitted — verify in Schwab before retrying: {e}")
+                    outs.append(AccountOutput(account_id=acct_label, ok=False, message=text))
                     any_fail = True
 
         state = "success" if any_ok and not any_fail else ("partial" if any_ok and any_fail else "failed")

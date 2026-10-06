@@ -45,7 +45,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-load_dotenv(".env")
+load_dotenv(".env", interpolate=False)
 
 import trade_journal  # noqa: E402
 

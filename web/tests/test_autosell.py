@@ -498,6 +498,9 @@ def _resolver(tmp_path, monkeypatch, **kw):
     monkeypatch.setattr(desktop_app, "AUTOSELL_STATE_FILE",
                         tmp_path / "autosell_state.json")
     monkeypatch.setattr(desktop_app, "_market_status", lambda: ("open", "Open", None))
+    # An empty journal unless a test says otherwise: the real lookup reads the
+    # machine's trades.json, so a test's outcome would depend on what it holds.
+    monkeypatch.setattr(desktop_app, "_leg_open_accounts", lambda broker, sym: [])
     app = _Pumped(tmp_path, **kw)
     app.scheduled = []
     for name in ("_autosell_resolve", "_autosell_abandon", "_autosell_retry",

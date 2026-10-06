@@ -536,7 +536,7 @@ class CloudSync:
         if not _TRADES_FILE.exists():
             return []
         try:
-            return json.loads(_TRADES_FILE.read_text("utf-8"))
+            return json.loads(_TRADES_FILE.read_text("utf-8-sig"))
         except (json.JSONDecodeError, OSError):
             return []
 

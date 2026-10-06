@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import argparse
 import collections
-import json
 import shutil
 import sys
 import uuid
@@ -57,10 +56,24 @@ import trade_journal
 FILE = trade_journal._FILE
 
 
+#: trade_journal.version() of the file as _load read it. _write refuses to
+#: save over a journal that changed since -- this is a separate process from
+#: the GUI, so the GUI's in-process lock alone cannot stop it overwriting a
+#: trade the app recorded while this was running.
+_loaded_version: tuple = (0, 0)
+
+
 def _load() -> list[dict]:
+    """The journal, read the way the app reads it (BOM-tolerant, .bak
+    recovery). Exits rather than carrying on with an empty list."""
+    global _loaded_version
     if not FILE.exists():
         sys.exit(f"no journal at {FILE}")
-    return json.loads(FILE.read_text(encoding="utf-8"))
+    _loaded_version = trade_journal.version()
+    try:
+        return trade_journal._load()
+    except trade_journal.JournalUnreadable as e:
+        sys.exit(f"journal unreadable, nothing done: {e}")
 
 
 def audit(trades: list[dict]) -> None:
@@ -208,18 +221,25 @@ def _write(trades: list[dict]) -> None:
     captured the file AFTER the first had already changed it. The true original
     was gone, which is the one thing a backup exists to prevent.
     """
-    stamp = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
-    backup = FILE.with_suffix(f".{stamp}.bak.json")
-    n = 1
-    while backup.exists():
-        backup = FILE.with_suffix(f".{stamp}-{n}.bak.json")
-        n += 1
-    shutil.copy2(FILE, backup)
-    # Sorted by time: the split lens in trade_journal walks rows in file order,
-    # and a created buy appended after its own sell would never be seen opening
-    # the position it pays for.
-    trades.sort(key=lambda t: str(t.get("timestamp") or ""))
-    FILE.write_text(json.dumps(trades, indent=2), encoding="utf-8")
+    with trade_journal._lock:
+        if trade_journal.version() != _loaded_version:
+            sys.exit("trades.json changed while this was running (a trade was "
+                     "recorded?). Nothing written -- run it again.")
+        stamp = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
+        backup = FILE.with_suffix(f".{stamp}.bak.json")
+        n = 1
+        while backup.exists():
+            backup = FILE.with_suffix(f".{stamp}-{n}.bak.json")
+            n += 1
+        shutil.copy2(FILE, backup)
+        # Sorted by time: the split lens in trade_journal walks rows in file
+        # order, and a created buy appended after its own sell would never be
+        # seen opening the position it pays for.
+        trades.sort(key=lambda t: str(t.get("timestamp") or ""))
+        # The journal's own atomic save (temp + fsync + retried rename), never
+        # write_text: truncate-then-write is a torn file for any reader that
+        # lands in between, and a crash mid-write costs the whole history.
+        trade_journal._save(trades)
     print(f"\nwritten. backup: {backup.name}")
 
 

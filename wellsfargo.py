@@ -249,7 +249,15 @@ def _trace(msg: str, notify: Optional[NotifyFn] = None) -> None:
             pass
 
 
+def _is_abandoned_ctx(ctx: Dict[str, Any]) -> bool:
+    """Has _dispatch given up waiting on this run (its timeout fired)?"""
+    abandoned = ctx.get("_abandoned")
+    return abandoned is not None and abandoned.is_set()
+
+
 def _is_cancelled_ctx(ctx: Dict[str, Any]) -> bool:
+    if _is_abandoned_ctx(ctx):
+        return True  # _dispatch gave up on this run; stop at the next account
     token = ctx.get("cancel_event")
     if token is None:
         token = ctx.get("cancel_token")
@@ -519,6 +527,11 @@ async def _start_browser(*, headless: Optional[bool] = None):
         if not use_headless and _offscreen():
             quiet.tame_windows(browser)
         setattr(browser, "_wf_lock_path", str(lock))
+        # Pin the profile this browser runs on, like the lock above. The active
+        # login (broker_logins) is process-global and moves on after a timeout,
+        # so an abandoned attempt that re-resolved _profile_dir() at cleanup
+        # would kill the NEXT login's Chrome instead of its own.
+        setattr(browser, "_wf_profile_dir", str(profile))
         page = browser.tabs[0] if getattr(browser, "tabs", None) else await browser()
         return browser, page
     except Exception:
@@ -542,7 +555,8 @@ async def _close_browser(browser) -> None:
         # Force-kill any lingering Chrome processes for this profile
         await asyncio.sleep(1)
         try:
-            cleanup_orphaned_chrome(_profile_dir())
+            pinned = getattr(browser, "_wf_profile_dir", None)
+            cleanup_orphaned_chrome(Path(pinned) if pinned else _profile_dir())
         except Exception:
             pass
     finally:
@@ -1424,6 +1438,12 @@ async def _commit_symbol(page, symbol: str) -> bool:
     except Exception:
         pass
     await sym_in.send_keys(symbol)
+    # SpecialKeys used to be a free name here — it only existed as a local
+    # inside _cmd_trade, so this fallback died with NameError every time it ran.
+    try:
+        from zendriver import SpecialKeys  # type: ignore
+    except Exception:  # pragma: no cover
+        SpecialKeys = None  # type: ignore
     if SpecialKeys is not None:
         await sym_in.send_keys(SpecialKeys.TAB)
     else:
@@ -1484,6 +1504,19 @@ async def _wait_for_quote(page, symbol: str, acct_label: str,
                f"state={await _capture_page_state(page, symbol)}", notify=notify)
         raise
     _trace(f"TRADE | Wells Fargo | {acct_label}: quote arrived on retry", notify=notify)
+
+
+def _submitted_unverified_msg(e: BaseException) -> str:
+    """The account result for an error AFTER the confirm click.
+
+    "submitted" + "verify" is what the app keys on to treat the order as
+    possibly live and keep Retry from placing it twice. The raw error stays on
+    the end for the logs (asyncio.TimeoutError has an empty str(), hence the
+    type name).
+    """
+    detail = f"{type(e).__name__}: {e}".strip().rstrip(":")
+    return ("Order submitted but the confirmation page didn't load — verify in "
+            f"Wells Fargo before retrying ({detail})")
 
 
 def _is_hard_error(msg: str) -> bool:
@@ -1647,6 +1680,7 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                    f"({_acct_i + 1}/{len(accts)}) {action} {qty_int} {symbol}",
                    notify=notify)
 
+            _submitted = False
             try:
                 # Deep-link the symbol. WF's own ticket URL carries a `symbol`
                 # parameter and we were sending it empty, then typing the symbol
@@ -1818,6 +1852,23 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                     log_lines.append("")
                     continue
 
+                # From here on the order may be live at Wells Fargo. Flag it
+                # BEFORE the click: a click that raises may still have landed,
+                # and "verify before retrying" is the safe side of that doubt.
+                #
+                # Run-level flag for _dispatch's timeout handler, and the order
+                # matters: raise the flag FIRST, then look at the abandon event.
+                # _dispatch sets the event first and reads the flag second, so
+                # either it sees the flag (and says "verify") or we see the
+                # event (and never click). A run _dispatch already gave up on
+                # must not place an order nobody is waiting to hear about.
+                ctx["_clicked"] = True
+                if _is_abandoned_ctx(ctx):
+                    outputs.append(AccountOutput(
+                        account_id=acct_label, ok=False,
+                        message="Stopped before clicking Place Order: the run timed out"))
+                    break
+                _submitted = True
                 await confirm_btn.mouse_click()
                 await page.wait_for_ready_state("complete", timeout=20)
                 await page.wait()
@@ -1831,6 +1882,16 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                 _consec_hard_errors = 0
 
             except Exception as e:
+                if _submitted:
+                    # The confirm click went out; a slow confirmation page
+                    # (wait_for_ready_state timing out) is not a failed order.
+                    # Say so, or a Retry would place it a second time.
+                    smsg = _submitted_unverified_msg(e)
+                    outputs.append(AccountOutput(account_id=acct_label, ok=False, message=smsg))
+                    _trace(f"TRADE | Wells Fargo | {acct_label} | {smsg} "
+                           f"state={await _capture_page_state(page, symbol)}", notify=notify)
+                    _consec_hard_errors = 0
+                    continue
                 outputs.append(AccountOutput(account_id=acct_label, ok=False, message=str(e)))
                 _trace(f"TRADE | Wells Fargo | {acct_label} | FAILED: {e} "
                        f"state={await _capture_page_state(page, symbol)}", notify=notify)
@@ -1896,7 +1957,37 @@ def _dispatch(command: str, *, timeout_s: int = 1200, **kwargs) -> BrokerOutput:
             return await _cmd_trade(ctx)
         raise RuntimeError(f"Unknown Wells Fargo command: {command}")
 
-    return _run_coro(lambda: _run(), timeout_s=timeout_s)
+    if command != "trade":
+        return _run_coro(lambda: _run(), timeout_s=timeout_s)
+
+    ctx["_abandoned"] = threading.Event()
+    ctx["_clicked"] = False
+    try:
+        return _run_coro(lambda: _run(), timeout_s=timeout_s)
+    except TimeoutError as e:
+        # The abandoned run stops at its next account boundary, but orders may
+        # already be live on the accounts it got through and their results died
+        # with it. Never let that read as a clean, retryable failure.
+        #
+        # Set the event FIRST, then read the flag (the worker does the mirror
+        # image: flag first, then event). That ordering means a run that never
+        # reached a Place Order click — hung at login, say — can be reported
+        # plainly, and a run that did can't click again after we answer.
+        ctx["_abandoned"].set()
+        clicked = bool(ctx.get("_clicked")) and not bool(ctx.get("dry_run"))
+        if clicked:
+            why = (f"Wells Fargo trade did not finish within {timeout_s // 60} min — some "
+                   f"orders may have been submitted; verify in Wells Fargo before retrying ({e})")
+        else:
+            why = (f"Wells Fargo timed out after {timeout_s}s before reaching "
+                   f"the Place Order click; no order was sent")
+        _trace(f"TRADE | Wells Fargo | {why}")
+        return BrokerOutput(
+            broker=BROKER,
+            state="failed",
+            accounts=[AccountOutput(account_id="Wells Fargo", ok=False, message=why)],
+            message=why,
+        )
 
 
 # =============================================================================

@@ -6,6 +6,7 @@ import json
 import os
 import random
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, time as dtime
@@ -51,6 +52,56 @@ OtpProvider = Callable[[str, int], Optional[str]]
 # human" check. Generous on purpose: it is a one-off per fresh login, and the
 # saved profile session is reused for a long time afterwards.
 _HUMAN_HANDOFF_S = int(os.getenv("SOFI_HUMAN_WAIT_S", "300"))
+
+# zendriver's page.get() can simply never return (a stalled navigation). Same
+# bound as Chase's LOGIN_NAV_TIMEOUT_S.
+LOGIN_NAV_TIMEOUT_S = 60
+# Hard ceilings on a session rehydrate. The headless attempt can't involve a
+# human (a bot check makes it bail at once), so its own waits — nav 60s, OTP
+# detect 90s, backend auth 120s — fit well inside 6 min. The headless attempt
+# and the headed retry share one 13-min deadline: room for the 300s human
+# check (or 240s CAPTCHA) plus backend auth in the retry, while still releasing
+# the SoFi slot inside the app's 15-min mirror stall window.
+LOGIN_HEADLESS_TIMEOUT_S = 360
+LOGIN_TOTAL_TIMEOUT_S = 780
+# Below this the headed retry can't fit a human check — don't start one.
+LOGIN_RETRY_MIN_S = 240
+
+
+def _run_login_attempt(coro_factory: Callable[[], Any], *, budget_s: float,
+                       label: str) -> Dict[str, str]:
+    """Run one login attempt on its own thread + event loop, bounded by join().
+
+    A hang that cancellation can't unwind (zendriver stuck in a CDP call) still
+    hands control back and frees the SoFi slot instead of wedging until the app
+    restarts. The abandoned daemon thread's Chrome is reaped by the next
+    attempt's cleanup_orphaned_chrome() on the same (pinned) profile.
+    """
+    box: Dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            box["ok"] = asyncio.run(coro_factory())
+        except BaseException as e:
+            box["err"] = e
+
+    budget_s = max(0.1, float(budget_s))
+    t = threading.Thread(target=_worker, name=f"sofi-login-{label}", daemon=True)
+    t.start()
+    t.join(budget_s)
+    if t.is_alive():
+        try:
+            BLOG.write_log(
+                _log_ctx(), broker=BROKER, action="session",
+                label="login_attempt_timeout", filename_prefix="session_stage",
+                text=f"SoFi login attempt ({label}) did not finish within {budget_s:.0f}s.\n")
+        except Exception:
+            pass
+        raise TimeoutError(
+            f"SoFi login did not finish within {max(1, round(budget_s / 60))} min")
+    if "err" in box:
+        raise box["err"]
+    return box["ok"]
 
 
 # =============================================================================
@@ -940,7 +991,12 @@ async def _force_login_flow(
     except Exception:
         pass
 
-    await page.get("https://www.sofi.com/login/")
+    try:
+        await asyncio.wait_for(page.get("https://www.sofi.com/login/"),
+                               timeout=LOGIN_NAV_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"SoFi login page did not load within {LOGIN_NAV_TIMEOUT_S}s") from None
     await page.sleep(2)
 
     user_selectors = [
@@ -1193,7 +1249,10 @@ async def _wait_until_backend_auth(browser, page, *, timeout_s: int = 180) -> Di
 
     while time.time() < deadline:
         try:
-            await page.get("https://www.sofi.com/wealth/app/overview")
+            # Bounded: one never-returning page.get() would otherwise outlive
+            # this loop's own deadline. A timeout is just another poll miss.
+            await asyncio.wait_for(page.get("https://www.sofi.com/wealth/app/overview"),
+                                   timeout=LOGIN_NAV_TIMEOUT_S)
         except Exception:
             pass
 
@@ -1231,7 +1290,12 @@ async def _async_login(
     totp_secret: str,
     otp_provider: Optional[OtpProvider],
     headless_override: Optional[bool] = None,
+    profile_dir: Optional[Path] = None,
 ) -> Dict[str, str]:
+    # Resolve the profile ONCE. broker_logins' active login is process-global
+    # and moves on after a timeout, so this attempt must never re-resolve it
+    # later and touch (or kill the Chrome of) a different login's profile.
+    profile = Path(profile_dir) if profile_dir is not None else _profile_dir()
     try:
         import zendriver as uc  # type: ignore
     except Exception as e:
@@ -1250,7 +1314,7 @@ async def _async_login(
             text=(
                 "SoFi async login start\n"
                 f"headless={headless}\n"
-                f"profile_dir={_profile_dir()}\n"
+                f"profile_dir={profile}\n"
             ),
             secrets=[username, password, totp_secret],
         )
@@ -1278,8 +1342,8 @@ async def _async_login(
     # off-screen so it never lands on top of what the user is doing.
     browser_args = quiet.browser_args(browser_args, headless=headless)
 
-    cleanup_orphaned_chrome(_profile_dir())
-    browser = await uc.start(browser_args=browser_args, user_data_dir=str(_profile_dir()), browser_executable_path=find_browser_executable())
+    cleanup_orphaned_chrome(profile)
+    browser = await uc.start(browser_args=browser_args, user_data_dir=str(profile), browser_executable_path=find_browser_executable())
     if not headless:
         quiet.tame_windows(browser)
     try:
@@ -1419,23 +1483,27 @@ def _rehydrate_session(*args, **kwargs) -> BrokerOutput:
         except Exception:
             pass
 
-        local_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(local_loop)
+        # Both attempts share ONE deadline (see LOGIN_TOTAL_TIMEOUT_S). The
+        # profile is pinned now, in the caller's thread, while the active login
+        # is still the one this call is for.
+        deadline = time.monotonic() + LOGIN_TOTAL_TIMEOUT_S
+        profile = _profile_dir()
 
         default_headless = _headless_default()
         initial_headless = (False if debug_mode else default_headless)
         try:
-            cookies = local_loop.run_until_complete(
-                _async_login(
-                    user,
-                    pw,
-                    totp,
-                    otp_provider,
-                    headless_override=initial_headless,
-                )
+            budget = (min(LOGIN_HEADLESS_TIMEOUT_S, LOGIN_TOTAL_TIMEOUT_S)
+                      if initial_headless else LOGIN_TOTAL_TIMEOUT_S)
+            cookies = _run_login_attempt(
+                lambda: _async_login(user, pw, totp, otp_provider,
+                                     headless_override=initial_headless,
+                                     profile_dir=profile),
+                budget_s=budget,
+                label=f"headless={initial_headless}",
             )
         except Exception:
-            if initial_headless:
+            remaining = deadline - time.monotonic()
+            if initial_headless and remaining >= LOGIN_RETRY_MIN_S:
                 try:
                     BLOG.write_log(
                         _log_ctx(),
@@ -1443,18 +1511,20 @@ def _rehydrate_session(*args, **kwargs) -> BrokerOutput:
                         action="session",
                         label="headless_retry_headed",
                         filename_prefix="session_stage",
-                        text="SoFi headless login failed; retrying in headed mode.",
+                        text=("SoFi headless login failed; retrying in headed mode.\n"
+                              f"budget_s={remaining:.0f}\n"),
                         secrets=[user, pw, totp],
                     )
                 except Exception:
                     pass
-                cookies = local_loop.run_until_complete(
-                    _async_login(user, pw, totp, otp_provider, headless_override=False)
+                cookies = _run_login_attempt(
+                    lambda: _async_login(user, pw, totp, otp_provider,
+                                         headless_override=False, profile_dir=profile),
+                    budget_s=remaining,
+                    label="headless=False",
                 )
             else:
                 raise
-
-        local_loop.close()
 
         csrf = _csrf_from_cookies(cookies)
         if not csrf:

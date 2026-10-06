@@ -27,7 +27,7 @@ import trade_journal
 # file next to this script rather than the current working directory, so the
 # commands work from anywhere.
 ENV_FILE = Path(__file__).resolve().parent / ".env"
-load_dotenv(ENV_FILE, override=True)
+load_dotenv(ENV_FILE, override=True, interpolate=False)
 
 
 BROKER_MODULES = {

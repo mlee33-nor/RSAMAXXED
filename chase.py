@@ -5,6 +5,7 @@ import json
 import os
 import random
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -23,6 +24,19 @@ BROKER = "chase"
 
 # --- URL Constants ---
 LOGIN_URL = "https://secure05c.chase.com/web/auth/#/logon/logon/chaseOnline"
+LOGIN_NAV_TIMEOUT_S = 60
+# Hard ceiling on one login attempt (cold login incl. push approval is ~140s;
+# the challenge loop is 180s + 45s). Backstop for hangs wait_for can't cancel.
+LOGIN_ATTEMPT_TIMEOUT_S = 480
+# ...and on the whole ensure_session (headless attempt + headed retry share it),
+# so the slot is released inside the app's 15-min mirror stall window.
+LOGIN_TOTAL_TIMEOUT_S = 540
+# A headed retry needs time for a push approval (~140s cold login) to matter.
+LOGIN_RETRY_MIN_S = 180
+
+
+class _LoginAttemptTimeout(TimeoutError):
+    """A login attempt hit the join() backstop — it hung, it didn't fail."""
 LANDING_PAGE = "https://secure.chase.com/web/auth/dashboard#/dashboard/overview"
 TRADE_ENTRY_URL = "https://secure.chase.com/web/auth/dashboard#/dashboard/oi-trade/equity/entry"
 
@@ -670,7 +684,12 @@ async def _async_login(
     headless_override: Optional[bool] = None,
     notify_push: bool = True,
     notify_push_fn=None,
+    profile_dir: Optional[Path] = None,
 ) -> Dict[str, str]:
+    # Resolve the profile ONCE. broker_logins' active login is process-global
+    # and moves on after a timeout, so this attempt must never re-resolve it
+    # later and touch (or kill the Chrome of) a different login's profile.
+    profile = Path(profile_dir) if profile_dir is not None else _profile_dir()
     try:
         import zendriver as uc  # type: ignore
     except Exception as e:
@@ -700,14 +719,14 @@ async def _async_login(
     # desktop -- parked off-screen here, taskbar button dropped below.
     browser_args = quiet.browser_args(browser_args, headless=headless)
 
-    cleanup_orphaned_chrome(_profile_dir())
-    browser = await uc.start(browser_args=browser_args, user_data_dir=str(_profile_dir()), browser_executable_path=find_browser_executable())
+    cleanup_orphaned_chrome(profile)
+    browser = await uc.start(browser_args=browser_args, user_data_dir=str(profile), browser_executable_path=find_browser_executable())
     if not headless:
         quiet.tame_windows(browser)
     code_handed_over = False
     try:
         page = browser.tabs[0] if browser.tabs else await browser()
-        _stage("browser_ready", f"headless={headless} profile={_profile_dir()}")
+        _stage("browser_ready", f"headless={headless} profile={profile}")
 
         # Quick path: already logged in
         try:
@@ -728,7 +747,15 @@ async def _async_login(
             pass
 
         _stage("login_required", "Chase profile not authenticated; starting login flow.")
-        await page.get(LOGIN_URL)
+        # zendriver's page.get() can simply never return (headless Chrome
+        # stalling on the logon page). Unbounded, that held the Chase slot for
+        # 100+ minutes on 2026-10-02 with the trade "still purchasing" forever.
+        try:
+            await asyncio.wait_for(page.get(LOGIN_URL), timeout=LOGIN_NAV_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            _stage("login_nav_timeout", f"headless={headless} after {LOGIN_NAV_TIMEOUT_S}s")
+            raise RuntimeError(
+                f"Chase login page did not load within {LOGIN_NAV_TIMEOUT_S}s")
         await page.sleep(2)
 
         user_box = await _safe_find(page, "#userId-input-field-input", timeout_s=8)
@@ -924,7 +951,46 @@ def ensure_session(*, prime_trade: bool = False, **kwargs: Any) -> BrokerOutput:
         interactive = False
     otp_provider = _otp_provider_terminal() if interactive else None
 
-    def _run(loop, headless: bool) -> Dict[str, str]:
+    # Both attempts share ONE deadline. Two independent 8-min attempts could
+    # hold the Chase slot ~16 min — longer than the app's 15-min mirror stall
+    # window. Pinned now, in the caller's thread, while the active login is
+    # still the one this call is for.
+    deadline = time.monotonic() + LOGIN_TOTAL_TIMEOUT_S
+    profile = _profile_dir()
+
+    def _run(headless: bool, budget_s: float) -> Dict[str, str]:
+        # Each attempt gets its own thread + event loop, bounded by join(): a
+        # hang that cancellation can't unwind still hands control back (and
+        # frees the Chase slot) instead of wedging until the app restarts. The
+        # next attempt's cleanup_orphaned_chrome() reaps anything left behind.
+        box: Dict[str, Any] = {}
+
+        def _worker() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                box["ok"] = _attempt(loop, headless)
+            except BaseException as e:
+                box["err"] = e
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_worker, name=f"chase-login-{'hl' if headless else 'hd'}",
+                             daemon=True)
+        t.start()
+        t.join(budget_s)
+        if t.is_alive():
+            _stage("login_attempt_timeout", f"headless={headless} after {budget_s:.0f}s")
+            raise _LoginAttemptTimeout(
+                f"Chase login did not finish within {max(1, round(budget_s / 60))} min")
+        if "err" in box:
+            raise box["err"]
+        return box["ok"]
+
+    def _attempt(loop, headless: bool) -> Dict[str, str]:
         return loop.run_until_complete(
             _async_login(
                 user,
@@ -932,6 +998,7 @@ def ensure_session(*, prime_trade: bool = False, **kwargs: Any) -> BrokerOutput:
                 otp_provider,
                 prime_trade=prime_trade,
                 headless_override=headless,
+                profile_dir=profile,
                 notify_push=True,
                 # notify_user, not print(): print() goes nowhere under pythonw.
                 notify_push_fn=lambda: notify_user(
@@ -940,21 +1007,29 @@ def ensure_session(*, prime_trade: bool = False, **kwargs: Any) -> BrokerOutput:
             )
         )
 
-    local_loop = asyncio.new_event_loop()
     try:
-        asyncio.set_event_loop(local_loop)
-
         # Warm sessions verify headless (no window). If that attempt fails —
         # typically because a fresh login hit interactive 2FA that can't be
         # completed headless — retry with a visible browser so the user can
         # finish the challenge. force_headed (debug) skips straight to headed.
         initial_headless = False if force_headed else _default_headless()
         try:
-            cookies = _run(local_loop, initial_headless)
-        except Exception:
+            cookies = _run(initial_headless,
+                           min(LOGIN_ATTEMPT_TIMEOUT_S, deadline - time.monotonic()))
+        except Exception as first:
             if not initial_headless:
                 raise  # already headed — nothing more to try
-            cookies = _run(local_loop, False)
+            # A backstop timeout means the attempt HUNG, not that it hit 2FA —
+            # a headed retry would usually hang the same way, and the shared
+            # deadline has (almost) nothing left for it anyway. Likewise skip a
+            # retry with too little time to complete a push approval.
+            remaining = deadline - time.monotonic()
+            if isinstance(first, _LoginAttemptTimeout) or remaining < LOGIN_RETRY_MIN_S:
+                _stage("headed_retry_skipped",
+                       f"{type(first).__name__}: {first} | remaining={remaining:.0f}s")
+                raise
+            _stage("headed_retry", f"after {type(first).__name__}: {first} | budget={remaining:.0f}s")
+            cookies = _run(False, remaining)
 
         _set_cookies(cookies)
         return BrokerOutput(
@@ -971,11 +1046,6 @@ def ensure_session(*, prime_trade: bool = False, **kwargs: Any) -> BrokerOutput:
             accounts=[AccountOutput(account_id="Chase", ok=False, message=str(e))],
             message=str(e),
         )
-    finally:
-        try:
-            local_loop.close()
-        except Exception:
-            pass
 
 
 # =============================================================================

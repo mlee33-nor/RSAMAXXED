@@ -16,7 +16,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from queue import Queue
-from threading import Thread
+from threading import Event, Thread
 from urllib.parse import urlsplit
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
@@ -48,6 +48,11 @@ POSITIONS_URL = "https://digital.fidelity.com/ftgw/digital/portfolio/positions"
 
 # Legacy trade entry uses /orderEntry
 TRADE_URL = "https://digital.fidelity.com/ftgw/digital/trade-equity/index/orderEntry"
+
+# zendriver's page.get() can simply never return (a stalled navigation), which
+# held the whole Fidelity slot until the app was restarted. Same bound as
+# Chase's LOGIN_NAV_TIMEOUT_S; a healthy Fidelity page commits in seconds.
+NAV_TIMEOUT_S = 60
 
 
 # =============================================================================
@@ -323,37 +328,28 @@ def _is_cancelled(kwargs: Dict[str, Any]) -> bool:
 # =============================================================================
 
 def _run_coro(coro_factory: Callable[[], Coroutine[Any, Any, Any]], *, timeout_s: int = 900):
-    try:
-        asyncio.get_running_loop()
-        in_running = True
-    except RuntimeError:
-        in_running = False
-
-    if not in_running:
-        return asyncio.run(coro_factory())
-
+    # ALWAYS run in a dedicated worker thread and enforce timeout_s via join()
+    # (the Wells Fargo fix, ported). The old "no running loop -> asyncio.run()
+    # right here" shortcut was the path every GUI worker thread took, and it
+    # ignored timeout_s entirely: one navigation that never returned held the
+    # Fidelity slot until the app was restarted. The abandoned daemon thread
+    # (and any Chrome it left) is reaped by the next start's
+    # cleanup_orphaned_chrome() / stale-lock handling. asyncio.run() inside the
+    # thread keeps the old shutdown semantics (pending tasks cancelled).
     q: "Queue[Tuple[bool, Any]]" = Queue()
 
     def runner() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
-            res = loop.run_until_complete(coro_factory())
-            q.put((True, res))
-        except Exception as e:
+            q.put((True, asyncio.run(coro_factory())))
+        except BaseException as e:
             q.put((False, e))
-        finally:
-            try:
-                loop.close()
-            except Exception:
-                pass
 
-    t = Thread(target=runner, daemon=True)
+    t = Thread(target=runner, name="fidelity-run", daemon=True)
     t.start()
     t.join(timeout_s)
 
     if q.empty():
-        raise TimeoutError("Fidelity operation timed out")
+        raise TimeoutError(f"Fidelity operation timed out after {timeout_s}s")
 
     ok, payload = q.get()
     if ok:
@@ -529,10 +525,28 @@ async def _current_url(page) -> str:
     except Exception:
         return ""
 
+class NavTimeout(RuntimeError):
+    """A bounded page.get() that ran out of time."""
+
+
+async def _nav(page, url: str, label: str, notify: Optional[NotifyFn] = None) -> None:
+    """page.get(url), bounded. A navigation that never returns becomes a clear
+    RuntimeError instead of a slot held forever. Only used before an order is
+    placed — nothing here can abandon a half-submitted order."""
+    try:
+        await asyncio.wait_for(page.get(url), timeout=NAV_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        _trace(f"{label} | goto TIMEOUT after {NAV_TIMEOUT_S}s url={url}", notify=notify)
+        raise NavTimeout(
+            f"Fidelity page did not load within {NAV_TIMEOUT_S}s ({label})") from None
+
+
 async def _goto(page, url: str, label: str, notify: Optional[NotifyFn] = None, settle_s: float = 0.6):
     _trace(f"{label} | goto={url}", notify=notify)
     try:
-        await page.get(url)
+        await _nav(page, url, label, notify=notify)
+    except NavTimeout:
+        raise  # give up rather than settle on a page that never loaded
     except Exception as e:
         _trace(f"{label} | goto ERROR: {type(e).__name__}: {e}", notify=notify)
     await _settle(page, sleep_s=settle_s)
@@ -851,6 +865,9 @@ async def _start_browser_for_login(idx_1based: int, *, notify: Optional[NotifyFn
             quiet.tame_windows(browser)
         setattr(browser, "_fidelity_lock_path", str(lock))
         setattr(browser, "_fidelity_idx", idx_1based)
+        # Cleanup kills Chrome by THIS profile path, captured now — never one
+        # re-resolved later by a run that may have been abandoned meanwhile.
+        setattr(browser, "_fidelity_profile_dir", str(profile))
 
         if getattr(browser, "tabs", None):
             page = await browser.tabs[0].get("about:blank")
@@ -878,8 +895,11 @@ async def _close_browser(browser, notify: Optional[NotifyFn] = None) -> None:
         # Force-kill any lingering Chrome processes for this profile
         await asyncio.sleep(1)
         try:
+            pinned = getattr(browser, "_fidelity_profile_dir", None)
             idx = getattr(browser, "_fidelity_idx", None)
-            if idx:
+            if pinned:
+                cleanup_orphaned_chrome(Path(pinned))
+            elif idx:
                 cleanup_orphaned_chrome(_zen_profile_dir(idx))
         except Exception:
             pass
@@ -3176,6 +3196,18 @@ async def _open_trade_drawer_from_current_page(page) -> None:
     await page.select("#eq-ticket-dest-symbol", timeout=12)
 
 
+def _submitted_unverified_msg(e: BaseException) -> str:
+    """The account result for an error AFTER Place Order was clicked.
+
+    "submitted" + "verify" is what the app keys on to treat the order as
+    possibly live and keep Retry from placing it twice. The raw error stays on
+    the end for the logs.
+    """
+    detail = f"{type(e).__name__}: {e}".strip().rstrip(":")
+    return ("Order submitted but the confirmation page didn't load — verify in "
+            f"Fidelity before retrying ({detail})")
+
+
 def _is_hard_error(msg: str) -> bool:
     """Should this failure stop the rest of this login's accounts, or just this one?
 
@@ -3338,7 +3370,7 @@ def bootstrap(*args, **kwargs) -> BrokerOutput:
                 sub: List[Dict[str, str]] = []
                 if ok:
                     try:
-                        await page.get(TRADE_URL)
+                        await _nav(page, TRADE_URL, f"BOOTSTRAP[{c.label}]", notify=notify)
                         await _wait_for_trade_ticket(page, label=c.label, notify=notify)
                         sub = await _open_account_dropdown_and_scrape(page)
                         _trace(f"BOOTSTRAP | {c.label} | {len(sub)} destination account(s)",
@@ -3383,7 +3415,8 @@ def bootstrap(*args, **kwargs) -> BrokerOutput:
         state = "success" if any_ok and not any_fail else ("partial" if any_ok and any_fail else "failed")
         return BrokerOutput(broker=BROKER, state=state, accounts=outs, message="")
 
-    return _run_coro(lambda: _run_all(), timeout_s=900)
+    # Per-login budget (2FA can wait on a human); bounded either way.
+    return _run_coro(lambda: _run_all(), timeout_s=900 + 600 * max(0, len(creds) - 1))
 
 
 def get_holdings(*args, **kwargs) -> BrokerOutput:
@@ -3475,7 +3508,7 @@ def get_holdings(*args, **kwargs) -> BrokerOutput:
 
         return BrokerOutput(broker=BROKER, state=state, accounts=outs, message="", extra=broker_extra)
 
-    return _run_coro(lambda: _run_all(), timeout_s=1200)
+    return _run_coro(lambda: _run_all(), timeout_s=1200 + 600 * max(0, len(creds) - 1))
 
 
 def get_accounts(*args, **kwargs) -> BrokerOutput:
@@ -3554,6 +3587,14 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
         except Exception:
             return BrokerOutput(broker=BROKER, state="failed", accounts=[], message=f"Invalid qty: {qty!r}")
 
+    # Set when _run_coro gives up on this trade: the abandoned run stops at the
+    # next account boundary instead of placing orders nobody is waiting for.
+    _abandoned = Event()
+    # "clicked" goes True the moment any account is about to click Place Order
+    # (set before the abandon check — see the submit block). The timeout
+    # handler uses it to tell "hung before any order" from "may have placed".
+    _run_flags: Dict[str, bool] = {"clicked": False}
+
     async def _run_all() -> BrokerOutput:
         outs: List[AccountOutput] = []
         log_lines: List[str] = []
@@ -3576,7 +3617,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
         any_fail = False
 
         for c in creds:
-            if _is_cancelled(kwargs):
+            if _is_cancelled(kwargs) or _abandoned.is_set():
                 break
             if hard_stop:
                 break
@@ -3623,7 +3664,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                     await _open_trade_drawer_from_current_page(page)
                 else:
                     _trace(f"TRADE | {c.label} | navigating to trade page", notify=notify)
-                    await page.get(TRADE_URL)
+                    await _nav(page, TRADE_URL, f"TRADE[{c.label}]", notify=notify)
                     _trace(f"TRADE | {c.label} | waiting for trade form", notify=notify)
                     await _wait_for_trade_ticket(page, label=c.label, notify=notify)
                     await _ensure_expanded_ticket_mode(page, notify=notify)
@@ -3669,7 +3710,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                 for _acct_i, acct in enumerate(acct_list):
                     if _acct_i > 0:
                         await asyncio.sleep(random.uniform(1.0, 3.0))
-                    if _is_cancelled(kwargs):
+                    if _is_cancelled(kwargs) or _abandoned.is_set():
                         break
                     if hard_stop:
                         break
@@ -3685,6 +3726,9 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                     acct_label = f"{c.label} · {acct_name} ({acct_num})"
                     _trace(f"TRADE | {acct_label} | starting ({_acct_i+1}/{len(acct_list)})", notify=notify)
 
+                    # Reset per account: a stale True from the previous account
+                    # would turn this account's pre-click failure into "verify".
+                    _placed = False
                     try:
                         if dry_run:
                             log_lines.append(f"[{acct_label}] step=open_trade")
@@ -3693,7 +3737,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                             await _click_enter_new_order_if_present(page)
                             await _open_trade_drawer_from_current_page(page)
                         else:
-                            await page.get(TRADE_URL)
+                            await _nav(page, TRADE_URL, f"TRADE[{acct_label}]", notify=notify)
                             await _wait_for_trade_ticket(page, label=acct_label,
                                                          notify=notify)
                             await _ensure_expanded_ticket_mode(page, notify=notify)
@@ -4103,16 +4147,32 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         _trace(f"TRADE | {acct_label} | submitting order", notify=notify)
                         if dry_run:
                             log_lines.append(f"[{acct_label}] step=submit")
-                        _placed = False
+                        # Run-level flag for the timeout handler below. Order
+                        # matters: raise the flag FIRST, then look at the
+                        # abandon event right before each click. The handler
+                        # sets the event first and reads the flag second, so
+                        # either it sees the flag (and says "verify") or we see
+                        # the event (and never click on a run nobody is waiting
+                        # on any more).
+                        _run_flags["clicked"] = True
+                        _stop_click = False
                         for _place_try in range(3):
+                            if _abandoned.is_set():
+                                _stop_click = True
+                                break
                             try:
                                 place_btn = await page.select("#placeOrderBtn", timeout=10)
                                 await place_btn.mouse_move()
+                                if _abandoned.is_set():
+                                    _stop_click = True
+                                    break
                                 await place_btn.mouse_click()
                                 _placed = True
                                 break
                             except Exception:
                                 await _settle(page, sleep_s=0.5)
+                        if not _placed and (_stop_click or _abandoned.is_set()):
+                            raise RuntimeError("Stopped before clicking Place Order: the run timed out")
                         if not _placed:
                             # Every handle attempt raised before dispatching (order not
                             # sent) — click once via JS as a last resort.
@@ -4122,21 +4182,36 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                                     "if(!b)return false;b.click();return true;})();"
                                 ))
                             except Exception:
-                                _placed = False
+                                # evaluate() raising is ambiguous: b.click() may
+                                # have run and the navigation it caused destroyed
+                                # the context before the result came back. Treat
+                                # it as possibly sent — the except below reports
+                                # "verify" instead of a retryable failure.
+                                _placed = True
+                                raise
                         if not _placed:
                             raise RuntimeError("Could not click Place Order (button kept going stale)")
 
+                        # The order is out. The page navigates to confirmation
+                        # under us, so a destroyed execution context here is
+                        # expected, not a failure — keep polling.
                         confirmed = False
+                        _poll_err: Optional[Exception] = None
                         for _ in range(50):
                             await page.sleep(0.5)
-                            ok_txt = await page.evaluate(
-                                """
-                                (function() {
-                                    const t = (document.body && document.body.innerText) ? document.body.innerText : '';
-                                    return (t.includes('Order Received') || t.includes('Confirmation'));
-                                })();
-                                """
-                            )
+                            try:
+                                ok_txt = await page.evaluate(
+                                    """
+                                    (function() {
+                                        const t = (document.body && document.body.innerText) ? document.body.innerText : '';
+                                        return (t.includes('Order Received') || t.includes('Confirmation'));
+                                    })();
+                                    """
+                                )
+                                _poll_err = None
+                            except Exception as _pe:
+                                _poll_err = _pe
+                                ok_txt = False
                             if ok_txt:
                                 confirmed = True
                                 break
@@ -4144,6 +4219,10 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                             if "confirmation" in u:
                                 confirmed = True
                                 break
+                        if not confirmed and _poll_err is not None:
+                            # The page never came back readable: we can't say
+                            # the order went through, only that it was sent.
+                            raise _poll_err
 
                         msg = "order placed" if confirmed else "order submitted (verify manually)"
                         _trace(f"TRADE | {acct_label} | {msg}", notify=notify)
@@ -4153,6 +4232,21 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         processed_targets.add(target_id)
 
                     except Exception as e:
+                        if _placed:
+                            # Place Order went out; whatever broke afterwards
+                            # (page.sleep / evaluate on a navigating page) says
+                            # nothing about the order. A plain failure here is
+                            # what a Retry would place a second time.
+                            smsg = _submitted_unverified_msg(e)
+                            _trace(f"TRADE | {acct_label} | {smsg}", notify=notify)
+                            outs.append(AccountOutput(account_id=acct_label, ok=False, message=smsg, order_id=None))
+                            any_fail = True
+                            if dry_run:
+                                log_lines.append(f"[{acct_label}] ERROR: {smsg}")
+                                log_lines.append("")
+                            processed_targets.add(target_id)
+                            _consec_errors = 0
+                            continue
                         _trace(f"TRADE | {acct_label} | ERROR: {e}", notify=notify)
                         outs.append(AccountOutput(account_id=acct_label, ok=False, message=str(e), order_id=None))
                         any_fail = True
@@ -4212,7 +4306,33 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
 
         return BrokerOutput(broker=BROKER, state=state, accounts=outs, message=msg)
 
-    return _run_coro(lambda: _run_all(), timeout_s=1800)
+    # 30 min for the first login, +15 per extra login (~10 accounts each at
+    # well under a minute apiece). Now that _run_coro really enforces this, it
+    # must not cut off a healthy multi-login run.
+    timeout_s = 1800 + 900 * max(0, len(creds) - 1)
+    try:
+        return _run_coro(lambda: _run_all(), timeout_s=timeout_s)
+    except TimeoutError as e:
+        # Event FIRST, flag second — the mirror image of the worker, so a run
+        # that never reached Place Order (hung at login, say) is reported
+        # plainly and one that did can't click again after we answer.
+        _abandoned.set()
+        if _run_flags["clicked"] and not dry_run:
+            # Orders may already be live on the accounts it got through, and
+            # the per-account results died with the run. Never let this read
+            # as a clean, retryable failure.
+            why = (f"Fidelity trade did not finish within {timeout_s // 60} min — some "
+                   f"orders may have been submitted; verify in Fidelity before retrying ({e})")
+        else:
+            why = (f"Fidelity timed out after {timeout_s}s before reaching the "
+                   f"Place Order click; no order was sent")
+        _trace(f"TRADE | {why}")
+        return BrokerOutput(
+            broker=BROKER,
+            state="failed",
+            accounts=[AccountOutput(account_id="Fidelity", ok=False, message=why)],
+            message=why,
+        )
 
 
 def healthcheck(*args, **kwargs) -> BrokerOutput:

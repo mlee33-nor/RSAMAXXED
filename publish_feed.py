@@ -43,7 +43,7 @@ ROOT = Path(__file__).resolve().parent
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(ROOT / ".env")
+    load_dotenv(ROOT / ".env", interpolate=False)
 except Exception:      # dotenv is optional — a scheduler usually injects real env vars
     pass
 

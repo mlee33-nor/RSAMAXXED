@@ -1286,7 +1286,14 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
                     )
                 resp = frac_fn(sym, q, account_number=acct_num, timeInForce="gfd")
             else:
-                if callable(order_fn):
+                # Only a missing order() or a signature mismatch may fall back
+                # to the market helper — in both cases nothing was sent. A None
+                # from a real call is NOT "nothing was sent": request_post
+                # swallows timeouts, 5xx and non-JSON bodies and returns None
+                # even when Robinhood took the order, so retrying through the
+                # market helper there could place it twice.
+                use_market = not callable(order_fn)
+                if not use_market:
                     # Legacy order call shape
                     try:
                         resp = order_fn(
@@ -1298,14 +1305,25 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
                         )
                     except TypeError:
                         # Some versions differ; fall through to market helpers
-                        resp = None
+                        use_market = True
 
-                if resp is None:
+                if use_market:
                     # Fallback: market helpers
                     fn = _rh_fn(f"order_{side_norm}_market")
                     if fn is None:
                         raise RuntimeError("Robinhood market order function not available")
                     resp = fn(sym, q, account_number=acct_num)
+
+            if resp is None:
+                # Every order path above has actually been called by now, so
+                # silence is ambiguous, not a rejection. Say so in words the
+                # app reads as "order may exist" and never auto-retries.
+                outs.append(AccountOutput(
+                    account_id=display_label, ok=False,
+                    message=("Robinhood gave no response — the order may have been "
+                             "submitted; verify in Robinhood before retrying"),
+                ))
+                continue
 
             # Check what came back. robin_stocks returns a rejection instead of
             # raising one, so "no exception" is not evidence an order exists.

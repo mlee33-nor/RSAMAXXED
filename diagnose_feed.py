@@ -42,7 +42,7 @@ def main() -> int:
         print("       Run:  py -3.13 -m pip install -r requirements.txt")
         print("       (a bare 'pip' installs into the wrong Python)")
         return 1
-    load_dotenv(env_file)
+    load_dotenv(env_file, interpolate=False)
 
     # 4. Is the key present?
     key = (os.environ.get("RSAMAXXED_PLAYS_KEY") or "").strip()

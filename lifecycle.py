@@ -674,7 +674,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     try:
         from dotenv import load_dotenv
-        load_dotenv(ROOT / ".env")
+        load_dotenv(ROOT / ".env", interpolate=False)
     except Exception:
         pass
 

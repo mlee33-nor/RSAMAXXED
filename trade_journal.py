@@ -8,9 +8,11 @@ EXE packaging: pip install pyinstaller && pyinstaller --onefile --windowed app.p
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,14 +24,114 @@ _FILE = Path(__file__).resolve().parent / "trades.json"
 _lock = threading.Lock()
 
 
-def _load() -> List[Dict[str, Any]]:
-    """Parse trades.json. Raw read — no cache, for read-modify-write callers."""
-    if not _FILE.exists():
-        return []
+_log = logging.getLogger(__name__)
+
+
+class JournalUnreadable(RuntimeError):
+    """trades.json exists but could not be read, and neither could its .bak.
+
+    Raised instead of returning [] so a read-modify-write caller can never save
+    `[] + new row` over the whole history. The trade worker in app.py already
+    turns a raised error here into a loud "NOT saved to the journal" line.
+    """
+
+
+# A read can lose a brief race with Google Drive / antivirus holding the file,
+# or with a non-atomic external writer (a torn read). A few short retries ride
+# that out; a genuinely corrupt file costs well under a second before we give up.
+_READ_ATTEMPTS = 4
+_READ_DELAY = 0.05
+
+#: Why the last read failed, or None. For a UI that wants to say so.
+_last_error: Optional[str] = None
+
+
+def last_error() -> Optional[str]:
+    """The reason the journal could not be read on the last attempt, or None."""
+    return _last_error
+
+
+def _read_file(path: Path) -> List[Dict[str, Any]]:
+    """Parse one journal file, retrying briefly. Raises OSError / ValueError.
+
+    utf-8-sig, not utf-8: a file re-saved by an editor with a BOM is still the
+    same journal. FileNotFoundError is raised at once — it is not transient.
+    """
+    err: Exception = OSError(f"could not read {path.name}")
+    for attempt in range(_READ_ATTEMPTS):
+        if attempt:
+            time.sleep(_READ_DELAY * (2 ** (attempt - 1)))
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            raise
+        except (OSError, ValueError) as e:     # ValueError covers JSON + Unicode
+            err = e
+            continue
+        if not isinstance(data, list):
+            raise ValueError(f"{path.name} is not a list of trades")
+        return data
+    raise err
+
+
+def _quarantine(path: Path) -> Optional[Path]:
+    """Keep a copy of an unreadable journal before anything can overwrite it."""
+    stamp = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
+    dest = path.with_name(f"{path.stem}.unreadable-{stamp}{path.suffix}")
+    n = 1
+    while dest.exists():
+        dest = path.with_name(f"{path.stem}.unreadable-{stamp}-{n}{path.suffix}")
+        n += 1
     try:
-        return json.loads(_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        shutil.copy2(path, dest)
+        return dest
+    except OSError:
+        return None
+
+
+def _load() -> List[Dict[str, Any]]:
+    """Parse trades.json. Raw read — no cache, for read-modify-write callers.
+
+    Returns [] ONLY when the journal does not exist. Every other failure either
+    recovers from the .bak (loudly) or raises JournalUnreadable — it never
+    pretends the history is empty, because the caller is about to save.
+
+    The .bak is used only when trades.json was read but did not PARSE. A file
+    that cannot even be opened (a lock that outlasted the retries) is most
+    likely fine underneath, and the .bak is one save behind it, so writing
+    `.bak + new row` back would drop a real trade; that case raises.
+    """
+    global _last_error
+    try:
+        rows = _read_file(_FILE)
+        _last_error = None
+        return rows
+    except FileNotFoundError:
+        _last_error = None
         return []
+    except ValueError as e:
+        primary: Exception = e
+    except OSError as e:
+        _last_error = f"trades.json could not be opened: {e}"
+        _log.error("JOURNAL UNREADABLE: %s", _last_error)
+        raise JournalUnreadable(_last_error) from e
+
+    bak = _FILE.with_suffix(".bak")
+    try:
+        rows = _read_file(bak)
+    except (OSError, ValueError) as e:
+        _last_error = (f"trades.json is corrupt ({primary}) and its backup "
+                       f"{bak.name} could not be used ({e}). Nothing will be "
+                       f"written until it is repaired.")
+        _log.error("JOURNAL UNREADABLE: %s", _last_error)
+        raise JournalUnreadable(_last_error) from primary
+
+    kept = _quarantine(_FILE)
+    _last_error = (f"trades.json is corrupt ({primary}); recovered {len(rows)} "
+                   f"trades from {bak.name}. The damaged file was kept as "
+                   f"{kept.name if kept else '(copy failed)'}.")
+    _log.warning("JOURNAL RECOVERED FROM BACKUP: %s", _last_error)
+    return rows
 
 
 #: Parsed journal, keyed by the file fingerprint it was parsed from.
@@ -54,13 +156,50 @@ def _load_shared() -> List[Dict[str, Any]]:
     out a copy; the read-modify-write paths deliberately use `_load` instead.
     """
     key = version()
-    if _cache["key"] != key:
-        _cache["rows"] = _load()
+    if _cache.get("key") != key:
+        try:
+            rows = _load()
+        except JournalUnreadable:
+            # Read-only callers (every page of the GUI) must not crash on this.
+            # Serve the last rows we did read, or nothing, and leave the key
+            # alone so the next call tries the file again. _load logged it.
+            return _cache.get("rows") or []
+        _cache["rows"] = rows
         _cache["key"] = key
     return _cache["rows"]
 
 
-def _save(trades: List[Dict[str, Any]]) -> None:
+def _refresh_backup(shrink_ok: bool = False) -> None:
+    """Copy the on-disk journal to .bak — but only if it is worth keeping.
+
+    Two rules, both so one bad state on disk can never reach the backup too:
+
+    * it must PARSE. When trades.json is corrupt and _load recovered from the
+      .bak, copying the corrupt file over it would destroy the one good copy.
+    * it must not have FEWER rows than the .bak already holds, unless the
+      shrink is an intentional delete (`shrink_ok`). Something that truncated
+      trades.json to `[]` would otherwise take the backup with it on the very
+      next save. The cost of the rule: after a delete_trade, the .bak keeps the
+      deleted row until the journal grows back past it — harmless in a backup.
+    """
+    if not _FILE.exists():
+        return
+    current = _read_file(_FILE)          # raises -> no backup this time
+    bak = _FILE.with_suffix(".bak")
+    if not shrink_ok and bak.exists():
+        try:
+            backed_up = len(_read_file(bak))
+        except (OSError, ValueError):
+            backed_up = -1               # an unusable .bak is always replaced
+        if len(current) < backed_up:
+            _log.warning("trades.json has %d rows but %s has %d; keeping the "
+                         "backup rather than shrinking it", len(current),
+                         bak.name, backed_up)
+            return
+    shutil.copy2(_FILE, bak)
+
+
+def _save(trades: List[Dict[str, Any]], shrink_ok: bool = False) -> None:
     """Write the journal so that a crash cannot cost it.
 
     THIS FILE IS THE PRODUCT. Every share this tool ever bought or sold, the
@@ -87,13 +226,12 @@ def _save(trades: List[Dict[str, Any]]) -> None:
         fh.write(payload)
         fh.flush()
         os.fsync(fh.fileno())
-    if _FILE.exists():
-        try:
-            shutil.copy2(_FILE, _FILE.with_suffix(".bak"))
-        except OSError:
-            # A missing backup is worth a save; a failed save is not worth a
-            # backup. Never let this stop the write below.
-            pass
+    try:
+        _refresh_backup(shrink_ok)
+    except Exception:
+        # A missing backup is worth a save; a failed save is not worth a
+        # backup. Never let this stop the write below.
+        pass
     # atomic.replace, not os.replace: Google Drive syncs this folder and holds
     # the journal open mid-upload, which a bare rename reports as WinError 5.
     atomic.replace(tmp, _FILE)
@@ -427,6 +565,6 @@ def delete_trade(trade_id: str) -> bool:
         before = len(trades)
         trades = [t for t in trades if t["id"] != trade_id]
         if len(trades) < before:
-            _save(trades)
+            _save(trades, shrink_ok=True)
             return True
     return False
