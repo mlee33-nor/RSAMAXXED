@@ -124,6 +124,18 @@ SCHEMAS: Dict[str, Schema] = {
                 _f("password", "FIDELITY_PASSWORD", "Password"),
                 _f("totp", "FIDELITY_TOTP_SECRET", "TOTP secret (optional)",
                    required=False))),
+    "ibkr": Schema(
+        # No password, ever: the user logs in to IB Gateway themselves and
+        # this only says where Gateway listens. A port is what makes a login
+        # real; host and client id have working defaults (see ibkr.py). One
+        # login is one Gateway, so a second IBKR username is IBKR_PORT_2.
+        broker="ibkr", display="IBKR", style="keyed",
+        fields=(_f("port", "IBKR_PORT", "Gateway port (4001 live, 4002 paper)",
+                   secret=False),
+                _f("host", "IBKR_HOST", "Gateway host (blank = 127.0.0.1)",
+                   secret=False, required=False),
+                _f("client_id", "IBKR_CLIENT_ID", "API client ID (optional)",
+                   secret=False, required=False))),
     "public": Schema(
         # Public has always numbered from 1, so there is no bare key to
         # preserve — PUBLIC_SECRET_TOKEN_1 IS login 1's historical key.

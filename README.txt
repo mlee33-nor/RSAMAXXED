@@ -8,7 +8,7 @@
 ================================================================================
 
   RSAMAXXED is a Windows desktop app that runs Reverse-Split Arbitrage (RSA)
-  across up to 10 brokerages at the same time. Plays arrive on their own from
+  across up to 11 brokerages at the same time. Plays arrive on their own from
   the RSAMAXXED feed. One click (or the automation, if you turn it on) buys
   one share in every linked account, in parallel. When the reverse split
   lands and a broker rounds your fraction up to a whole share, the Exits page
@@ -127,6 +127,7 @@ CONTENTS
 │    DSPAC           Broker's own web API
 │    Fennel          Broker's own web API
 │    Fidelity        Automated Chrome browser
+│    IBKR            IBKR's official API, through IB Gateway on this PC
 │    Public          Public's official API (secret token)
 │    Robinhood       Broker's own web API
 │    Schwab          Automated Firefox browser (installed by INSTALL.bat)
@@ -262,6 +263,30 @@ CONTENTS
 │     brings the SoFi browser window to the front and puts up a notice:
 │     tick the box in that window (re-enter your password and press
 │     Log in if the form was cleared). You have a few minutes.
+│
+│  IBKR (INTERACTIVE BROKERS)
+│     No password goes into RSAMAXXED. You run IB Gateway, IBKR's own
+│     small login app, and the app trades through it.
+│        1. Install IB Gateway (the "stable" version) from
+│           https://www.interactivebrokers.com/en/trading/ibgateway-stable.php
+│        2. Open it, choose IB API, and log in with your IBKR username
+│           (approve the 2FA on your phone as usual). Choose Live or
+│           Paper Trading.
+│        3. In Gateway: Configure -> Settings -> API -> Settings:
+│             Enable ActiveX and Socket Clients ........ ON
+│             Read-Only API ............................ OFF
+│             Allow connections from localhost only .... ON
+│             Socket port ...... 4001 for live, 4002 for paper
+│           Click OK.
+│        4. On the Brokers page enter that port in the IBKR card and
+│           Save. Leave host and client ID blank. Click Bootstrap.
+│     Gateway must be open and logged in whenever the app trades at
+│     IBKR, and IBKR logs it out once a day: log back in when it asks.
+│     OTC / pink-sheet names need IBKR's penny-stock trading permission
+│     (Client Portal -> Settings -> Trading Permissions -> Stocks); without
+│     it IBKR refuses those orders and the app shows IBKR's reason.
+│     Whole shares only. A second IBKR username needs a second Gateway on
+│     its own port ("+ Add login").
 │
 │  WELLS FARGO
 │     Username and password. At sign-in Wells Fargo usually sends an

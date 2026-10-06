@@ -87,6 +87,7 @@ BROKER_CAPABILITY: Dict[str, Capability] = {
     "fidelity":   Capability.WHOLE_ONLY,    # fidelity.py:3387 int(float(qty))
     "chase":      Capability.WHOLE_ONLY,    # chase.py:1387
     "wellsfargo": Capability.WHOLE_ONLY,    # wellsfargo.py:1538
+    "ibkr":       Capability.WHOLE_ONLY,    # ibkr.py execute_trade refuses fractions
     "schwab":     Capability.UNVERIFIED,
     "fennel":     Capability.UNVERIFIED,
     "bbae":       Capability.UNVERIFIED,

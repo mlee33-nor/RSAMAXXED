@@ -345,6 +345,7 @@ BROKER_MODULES = {
     "dspac": "dspac",
     "fennel": "fennel",
     "fidelity": "fidelity",
+    "ibkr": "ibkr",
     "public": "public",
     "robinhood": "robinhood",
     "schwab": "schwab",
@@ -385,7 +386,8 @@ BROKER_ENV_KEYS: Dict[str, List[str]] = {
     "dspac":      ["DSPAC_USER", "DSPAC_PASSWORD"],
     "fennel":     ["FENNEL_EMAIL"],
     "fidelity":   ["FIDELITY_USERNAME", "FIDELITY_PASSWORD", "FIDELITY_TOTP_SECRET"],
-    "public":     ["PUBLIC_SECRET_TOKEN_1", "PUBLIC_SECRET_TOKEN_2", "PUBLIC_SECRET_TOKEN_3"],
+    "ibkr":       ["IBKR_PORT"],
+    "public":    ["PUBLIC_SECRET_TOKEN_1", "PUBLIC_SECRET_TOKEN_2", "PUBLIC_SECRET_TOKEN_3"],
     "robinhood":  ["ROBINHOOD_USERNAME", "ROBINHOOD_PASSWORD"],
     "schwab":     ["SCHWAB_USERNAME", "SCHWAB_PASSWORD", "SCHWAB_TOTP_SECRET"],
     "sofi":       ["SOFI_USERNAME", "SOFI_PASSWORD", "SOFI_TOTP_SECRET"],
@@ -780,7 +782,7 @@ MIRROR_NOTES = ("reg alert", "alert", "early access")
 # those. Anything not listed here re-runs its whole account list, so the
 # "retry the accounts that failed" action deliberately won't offer it — a retry
 # that quietly re-buys the accounts that already filled is worse than no retry.
-RETRYABLE_ACCOUNT_BROKERS = ("wellsfargo", "fidelity")
+RETRYABLE_ACCOUNT_BROKERS = ("wellsfargo", "fidelity", "ibkr")
 
 
 def _mirror_due_slot(now: datetime) -> Optional[str]:

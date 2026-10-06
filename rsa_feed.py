@@ -50,10 +50,10 @@ __all__ = [
 
 # --------------------------------------------------------------------- brokers
 
-# The ten the terminal can actually execute in. Anything else still parses —
+# The brokers the terminal can actually execute in. Anything else still parses —
 # it is real information about the play — it just can't be automated here.
 SUPPORTED_BROKERS = (
-    "BBAE", "Chase", "DSPAC", "Fennel", "Fidelity",
+    "BBAE", "Chase", "DSPAC", "Fennel", "Fidelity", "IBKR",
     "Public", "Robinhood", "Schwab", "SoFi", "Wells Fargo",
 )
 
@@ -65,6 +65,8 @@ _BROKER_ALIASES = {
     "dspac": "DSPAC",
     "fennel": "Fennel",
     "fidelity": "Fidelity", "fid": "Fidelity",
+    "ibkr": "IBKR", "ib": "IBKR", "interactive brokers": "IBKR",
+    "interactivebrokers": "IBKR",
     "public": "Public",
     "robinhood": "Robinhood", "rh": "Robinhood", "hood": "Robinhood",
     "schwab": "Schwab", "charles schwab": "Schwab",
@@ -707,7 +709,7 @@ FRACTIONAL_STATUSES = frozenset({"fractional"})
 # broker can sell one.
 FRACTIONAL_BROKERS = ("Public", "Robinhood", "SoFi")
 
-# The other seven. Named rather than derived so the reason is written down:
+# Everyone else, IBKR included. Derived, with the reason written down here:
 # these settle to cash automatically, so a 🧩 play needs no action on them.
 CASH_IN_LIEU_BROKERS = tuple(
     b for b in SUPPORTED_BROKERS if b not in FRACTIONAL_BROKERS

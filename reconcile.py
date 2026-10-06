@@ -49,7 +49,7 @@ load_dotenv(".env", interpolate=False)
 
 import trade_journal  # noqa: E402
 
-BROKERS = ("bbae", "chase", "dspac", "fennel", "fidelity",
+BROKERS = ("bbae", "chase", "dspac", "fennel", "fidelity", "ibkr",
            "public", "robinhood", "schwab", "sofi", "wellsfargo")
 
 

@@ -33,6 +33,10 @@ dspac-invest-api==0.1.4
 # in the UI as "Auth failed". Moving to 2.x is a rewrite of fennel.py.
 fennel-invest-api==1.2.0
 schwab-api==0.4.3
+# Interactive Brokers' official API, spoken to a local IB Gateway (ibkr.py).
+# Pinned like the rest: it is asyncio underneath, and ibkr.py relies on it NOT
+# patching the event loop at import (2.1.0 does not; only util.startLoop does).
+ib_async==2.1.0
 
 # --- Browser automation ----------------------------------------------------
 # >=0.15.5 is required, not cosmetic. Chrome 150 dropped the `sameParty` cookie

@@ -36,6 +36,7 @@ BROKER_MODULES = {
     "dspac": "dspac",
     "fennel": "fennel",
     "fidelity": "fidelity",
+    "ibkr": "ibkr",
     "public": "public",
     "robinhood": "robinhood",
     "schwab": "schwab",

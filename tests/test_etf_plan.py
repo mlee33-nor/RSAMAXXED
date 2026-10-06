@@ -36,7 +36,7 @@ def test_capability_table_matches_the_broker_modules():
     assert capability_for("public") is Capability.FULL
     assert capability_for("robinhood") is Capability.FULL
     assert capability_for("sofi") is Capability.SUB_ONE_ONLY
-    for b in ("fidelity", "chase", "wellsfargo"):
+    for b in ("fidelity", "chase", "wellsfargo", "ibkr"):
         assert capability_for(b) is Capability.WHOLE_ONLY
     for b in ("schwab", "fennel", "bbae", "dspac"):
         assert capability_for(b) is Capability.UNVERIFIED

@@ -25,8 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import broker_logins as BL
 
 #: Every broker the app can load.
-ALL = ["bbae", "chase", "dspac", "fennel", "fidelity", "public", "robinhood",
-       "schwab", "sofi", "wellsfargo"]
+ALL = ["bbae", "chase", "dspac", "fennel", "fidelity", "ibkr", "public",
+       "robinhood", "schwab", "sofi", "wellsfargo"]
 
 #: The five that could hold exactly one login and now run through fan_out.
 CONVERTED = ["bbae", "chase", "dspac", "sofi", "wellsfargo"]
@@ -35,6 +35,10 @@ CONVERTED = ["bbae", "chase", "dspac", "sofi", "wellsfargo"]
 #: deliberately NOT touched — rewriting a working multi-login flow to prove a
 #: point is how you break Fidelity's ten accounts.
 ALREADY = ["fennel", "fidelity", "robinhood", "schwab"]
+
+#: Public and IBKR were written multi-login from the start: each reads
+#: broker_logins.logins() itself (one token, or one IB Gateway, per login).
+#: IBKR's per-login wiring is pinned in test_ibkr.py.
 
 
 def load(broker: str):
