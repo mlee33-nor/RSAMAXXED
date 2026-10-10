@@ -213,8 +213,8 @@ def test_dashboard_matches_app_py(paired, real_trades):
 
 
 def test_zero_basis_symbol_is_disclosed(paired, real_trades):
-    """A buy with fill_price=None costs $0, so its whole proceeds book as
-    profit. Say so; don't quietly book it.
+    """A symbol whose every buy has fill_price=None has no basis, so its sales
+    are left out of realized. Say so; don't quietly drop it.
 
     Named MASK until 2026-08-07, when MASK was given a real basis by
     backfill_basis.py and the test started failing for the best possible
@@ -239,7 +239,7 @@ def test_zero_basis_symbol_is_disclosed(paired, real_trades):
         pytest.skip("no sold symbol has a zero cost basis — nothing to disclose")
 
     page = browser.get("/app").text
-    assert "overstated" in page
+    assert "left out of the profit" in page
     for sym in zero_basis:
         assert sym in page, f"{sym} has no cost basis and the page does not say so"
 

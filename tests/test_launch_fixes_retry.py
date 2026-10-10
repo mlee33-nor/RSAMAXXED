@@ -87,6 +87,7 @@ def test_autosell_still_hands_back_a_plain_rejection(monkeypatch):
 
 class _Mirror:
     _mirror_record_outcome = A.App._mirror_record_outcome
+    _mirror_owe_failed_legs = A.App._mirror_owe_failed_legs
 
     def __init__(self):
         self._mirror_failed = set()
@@ -120,6 +121,11 @@ def test_mirror_says_verify_before_offering_a_second_buy():
 def test_mirror_plain_failure_wording_is_unchanged():
     m = _Mirror()
     key = ("2026-10-05", "SFWL")
+    # A plain rejection sent nothing, so earlier launches are handed back for
+    # another try (test_mirror_fixes_2026_10); this is the last one, which is
+    # what lands in NEEDS ATTENTION.
+    m._mirror_executed = {key}
+    m._mirror_attempts = {key: A.MIRROR_MAX_ATTEMPTS - 1}
     m._mirror_record_outcome({"symbol": "SFWL", "mirror_key": key,
                               "all_brokers": ["fidelity"], "mirror_skipped": [],
                               "results": [_result("fidelity", REJECTED)]}, 0, 1)

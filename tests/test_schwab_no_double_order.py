@@ -91,7 +91,8 @@ def test_known_pre_placement_error_keeps_friendly_message(run):
     assert client.trade_calls == []
     [acct] = out.accounts
     assert not acct.ok
-    assert acct.message == "Order failed: This may result in an oversold/overbought position."
+    assert acct.message == ("Order failed: This may result in an oversold/overbought position."
+                            " — nothing was sent")
 
 
 def test_v2_exception_on_live_order_reads_as_may_be_submitted(run):
@@ -185,7 +186,10 @@ def test_precheck_known_error_uses_friendly_text(run):
     out = run(client)
 
     assert client.live_calls == []
-    assert out.accounts[0].message == "Order failed: Stock not eligible for online entry"
+    # The verification-only pass refused it: friendly text, and positively
+    # nothing sent (round-2 audit), so a hand-back may retry it.
+    assert out.accounts[0].message == ("Order failed: Stock not eligible for online entry"
+                                       " — nothing was sent")
 
 
 def test_precheck_ok_then_live_false_says_verify(run):

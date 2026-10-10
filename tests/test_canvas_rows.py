@@ -84,7 +84,7 @@ def test_redraws_do_not_leak_tcl_commands(tk_root):
 
 def test_wrap_lines_respects_the_width(tk_root):
     rc = make(tk_root)
-    text = "exit called at BBAE DSPAC Fidelity Public Robinhood Schwab Wells Fargo"
+    text = "exit called at Chase Fennel Fidelity Public Robinhood Schwab Wells Fargo"
     lines = wrap_lines(rc, text, FONT, 120)
     assert len(lines) > 1
     assert " ".join(lines) == text

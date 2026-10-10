@@ -84,9 +84,9 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 _WEB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../web
 # Local dev has the desktop app's live picks.json at the repo root and uses it
 # directly. On Railway the deploy is only the `web/` dir, so that path doesn't
-# exist there — fall back to the picks.json BUNDLED inside web/ (kept fresh by
-# publish_picks.py, which the daily job commits + pushes). Explicit PICKS_FILE
-# overrides both.
+# exist there — fall back to a picks.json BUNDLED inside web/, if any (the old
+# publish_picks.py that committed it is gone; the feed now arrives through the
+# ingest API). Explicit PICKS_FILE overrides both.
 _default_picks = os.path.join(_REPO_ROOT, "picks.json")
 if not os.path.exists(_default_picks):
     _default_picks = os.path.join(_WEB_ROOT, "picks.json")

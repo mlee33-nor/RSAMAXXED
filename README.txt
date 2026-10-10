@@ -8,7 +8,7 @@
 ================================================================================
 
   RSAMAXXED is a Windows desktop app that runs Reverse-Split Arbitrage (RSA)
-  across up to 11 brokerages at the same time. Plays arrive on their own from
+  across up to 9 brokerages at the same time. Plays arrive on their own from
   the RSAMAXXED feed. One click (or the automation, if you turn it on) buys
   one share in every linked account, in parallel. When the reverse split
   lands and a broker rounds your fraction up to a whole share, the Exits page
@@ -122,9 +122,7 @@ CONTENTS
 │
 │    BROKER          HOW THE APP CONNECTS
 │    -------------   ------------------------------------------------
-│    BBAE            Broker's own web API
 │    Chase           Automated Chrome browser
-│    DSPAC           Broker's own web API
 │    Fennel          Broker's own web API
 │    Fidelity        Automated Chrome browser
 │    IBKR            IBKR's official API, through IB Gateway on this PC
@@ -209,12 +207,6 @@ CONTENTS
 │  password. If authenticator 2-step is already on, you usually have to
 │  turn it off and on again to see the key.
 │
-│  BBAE
-│     Email or username, and password. The first sign-in may show a
-│     picture code (the app asks you to type what it says), then sends a
-│     one-time code by email (if you log in with your email) or text (if
-│     you use a username). Type it into the app when asked.
-│
 │  CHASE
 │     Your chase.com USERNAME (not your email address) and password.
 │     Chase silently rejects an email address here. If Chase sends a
@@ -222,10 +214,6 @@ CONTENTS
 │     wants a code typed into its own page, the app brings the Chase
 │     browser window to the front and puts up a notice: type the code
 │     into that window and press Next. You have about 3 minutes.
-│
-│  DSPAC
-│     Same as BBAE: email or username and password, with a possible
-│     picture code and an emailed or texted one-time code.
 │
 │  FENNEL
 │     Just your Fennel email address; there is no password. Fennel emails
@@ -354,7 +342,7 @@ CONTENTS
 │  Also: Ctrl+K opens a quick search (jump to a page, look up or trade a
 │  ticker), Ctrl+1 ... Ctrl+9 jump between pages, Ctrl+R refreshes. The
 │  bell in the top bar collects notifications. The app version is shown
-│  at the bottom of the left sidebar (for example v1.0.0).
+│  at the bottom of the left sidebar (for example v1.0.1).
 │
 └──────────────────────────────────────────────────────────────────────────────
 
@@ -487,7 +475,7 @@ CONTENTS
 │  Check the version at the bottom of the left sidebar, and compare it
 │  with the latest release on GitHub:
 │     https://github.com/mlee33-nor/RSAMAXXED/releases
-│  The current version is v1.0.0. Close RSAMAXXED before updating.
+│  The current version is v1.0.1. Close RSAMAXXED before updating.
 │
 │  IF YOU INSTALLED WITH GIT
 │     1.  In the app folder run:   git pull
@@ -507,7 +495,9 @@ CONTENTS
 │                                    nothing of the new version is
 │                                    overwritten
 │            the sessions folder     saved broker sign-ins
-│            the logs folder         (optional) activity history
+│            the logs folder         trade results the app reads back
+│                                    (logs	rade_results.log) and your
+│                                    activity history -- keep it
 │     3.  Double-click INSTALL.bat in the NEW folder. It is quick when
 │         nothing changed, updates anything that did, and points the
 │         desktop icon at the new folder.

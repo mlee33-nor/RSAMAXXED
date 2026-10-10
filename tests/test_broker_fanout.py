@@ -1,6 +1,6 @@
 """Running a one-login broker module once per login, without rewriting it.
 
-BBAE, Chase, DSPAC, SoFi and Wells Fargo were each written around exactly one
+Chase, SoFi and Wells Fargo were each written around exactly one
 set of credentials — module-global clients, one cookie jar, one browser
 profile. Teaching all five to loop internally is five rewrites of five working
 login flows, and a broker login is the one thing here that cannot be tested
@@ -32,7 +32,7 @@ from modules.outputs import AccountOutput, BrokerOutput
 class StubBroker:
     """A broker module the way the driver sees one."""
 
-    BROKER = "bbae"
+    BROKER = "chase"
     BrokerOutput = BrokerOutput
     AccountOutput = AccountOutput
 
@@ -45,16 +45,16 @@ class StubBroker:
         self.switched.append(idx)
 
     def get_holdings(self):
-        user = os.getenv("BBAE_USER", "")
-        self.saw.append((user, BL.active_suffix("bbae")))
+        user = os.getenv("CHASE_USERNAME", "")
+        self.saw.append((user, BL.active_suffix("chase")))
         if user in self.fail_on:
             return BrokerOutput(
-                broker="bbae", state="failed",
-                accounts=[AccountOutput(account_id="BBAE", ok=False,
+                broker="chase", state="failed",
+                accounts=[AccountOutput(account_id="Chase", ok=False,
                                         message="Login failed")],
                 message="Login failed")
         return BrokerOutput(
-            broker="bbae", state="success",
+            broker="chase", state="success",
             accounts=[AccountOutput(account_id=f"Individual (****{user[-4:]})",
                                     ok=True, message="")],
             message="ok", extra={"who": user})
@@ -64,19 +64,19 @@ class StubBroker:
 def clean_env(monkeypatch):
     for idx in range(1, 6):
         for name in ("username", "password"):
-            monkeypatch.delenv(BL.env_key("bbae", name, idx), raising=False)
-        monkeypatch.delenv(BL.tag_key("bbae", idx), raising=False)
+            monkeypatch.delenv(BL.env_key("chase", name, idx), raising=False)
+        monkeypatch.delenv(BL.tag_key("chase", idx), raising=False)
 
 
 def one_login(monkeypatch):
-    monkeypatch.setenv("BBAE_USER", "first@x.com")
-    monkeypatch.setenv("BBAE_PASSWORD", "pw1")
+    monkeypatch.setenv("CHASE_USERNAME", "first@x.com")
+    monkeypatch.setenv("CHASE_PASSWORD", "pw1")
 
 
 def two_logins(monkeypatch):
     one_login(monkeypatch)
-    monkeypatch.setenv("BBAE_USER_2", "second@x.com")
-    monkeypatch.setenv("BBAE_PASSWORD_2", "pw2")
+    monkeypatch.setenv("CHASE_USERNAME_2", "second@x.com")
+    monkeypatch.setenv("CHASE_PASSWORD_2", "pw2")
 
 
 # ------------------------------------------------ the existing install
@@ -86,7 +86,7 @@ def test_one_login_is_called_once_with_nothing_changed(monkeypatch):
     one_login(monkeypatch)
     mod = StubBroker()
 
-    out = BL.fan_out("bbae", mod, mod.get_holdings)
+    out = BL.fan_out("chase", mod, mod.get_holdings)
 
     assert mod.saw == [("first@x.com", "")]
     assert [a.account_id for a in out.accounts] == ["Individual (****.com)"]
@@ -95,9 +95,9 @@ def test_one_login_is_called_once_with_nothing_changed(monkeypatch):
 
 def test_no_logins_at_all_still_reaches_the_module(monkeypatch):
     """A broker with no credentials must produce its OWN error message —
-    'Missing BBAE_USER or BBAE_PASSWORD' — not a generic one invented here."""
+    'Missing CHASE_USERNAME or CHASE_PASSWORD' — not a generic one invented here."""
     mod = StubBroker()
-    BL.fan_out("bbae", mod, mod.get_holdings)
+    BL.fan_out("chase", mod, mod.get_holdings)
     assert mod.saw == [("", "")]
 
 
@@ -108,7 +108,7 @@ def test_login_one_keeps_its_session_directory(monkeypatch):
     two_logins(monkeypatch)
     mod = StubBroker()
 
-    BL.fan_out("bbae", mod, mod.get_holdings)
+    BL.fan_out("chase", mod, mod.get_holdings)
 
     assert [suffix for _u, suffix in mod.saw] == ["", "_2"]
 
@@ -119,7 +119,7 @@ def test_each_login_sees_its_own_credentials(monkeypatch):
     two_logins(monkeypatch)
     mod = StubBroker()
 
-    BL.fan_out("bbae", mod, mod.get_holdings)
+    BL.fan_out("chase", mod, mod.get_holdings)
 
     assert [u for u, _s in mod.saw] == ["first@x.com", "second@x.com"]
 
@@ -130,10 +130,10 @@ def test_only_the_second_login_gets_a_label_prefix(monkeypatch):
     two_logins(monkeypatch)
     mod = StubBroker()
 
-    out = BL.fan_out("bbae", mod, mod.get_holdings)
+    out = BL.fan_out("chase", mod, mod.get_holdings)
 
     assert [a.account_id for a in out.accounts] == [
-        "Individual (****.com)", "BBAE 2 · Individual (****.com)"]
+        "Individual (****.com)", "Chase 2 · Individual (****.com)"]
 
 
 def test_the_cached_client_is_swapped_between_logins(monkeypatch):
@@ -143,7 +143,7 @@ def test_the_cached_client_is_swapped_between_logins(monkeypatch):
     two_logins(monkeypatch)
     mod = StubBroker()
 
-    BL.fan_out("bbae", mod, mod.get_holdings)
+    BL.fan_out("chase", mod, mod.get_holdings)
 
     assert mod.switched == [1, 1, 2, 1]      # in, out, in, out
 
@@ -152,10 +152,10 @@ def test_the_environment_is_put_back_afterwards(monkeypatch):
     two_logins(monkeypatch)
     mod = StubBroker()
 
-    BL.fan_out("bbae", mod, mod.get_holdings)
+    BL.fan_out("chase", mod, mod.get_holdings)
 
-    assert os.environ["BBAE_USER"] == "first@x.com"
-    assert BL.active_idx("bbae") == 1
+    assert os.environ["CHASE_USERNAME"] == "first@x.com"
+    assert BL.active_idx("chase") == 1
 
 
 # --------------------------------------------------- partial failures
@@ -167,7 +167,7 @@ def test_one_dead_login_does_not_hide_the_other(monkeypatch):
     two_logins(monkeypatch)
     mod = StubBroker(fail_on={"second@x.com"})
 
-    out = BL.fan_out("bbae", mod, mod.get_holdings)
+    out = BL.fan_out("chase", mod, mod.get_holdings)
 
     assert out.state == "partial"
     assert len(out.accounts) == 2
@@ -187,7 +187,7 @@ def test_a_login_that_raises_becomes_its_own_failed_account(monkeypatch):
             raise RuntimeError("chrome would not start")
         return mod.get_holdings()
 
-    out = BL.fan_out("bbae", mod, explode)
+    out = BL.fan_out("chase", mod, explode)
 
     assert out.state == "partial"
     assert out.accounts[0].ok is False
@@ -198,4 +198,4 @@ def test_a_login_that_raises_becomes_its_own_failed_account(monkeypatch):
 def test_every_login_failing_is_a_failure(monkeypatch):
     two_logins(monkeypatch)
     mod = StubBroker(fail_on={"first@x.com", "second@x.com"})
-    assert BL.fan_out("bbae", mod, mod.get_holdings).state == "failed"
+    assert BL.fan_out("chase", mod, mod.get_holdings).state == "failed"

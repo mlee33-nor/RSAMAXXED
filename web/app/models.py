@@ -175,6 +175,24 @@ class HoldingRow(Base):
 # message carries several alerts), which is what makes re-ingesting the same
 # pull a no-op instead of a duplicate.
 
+# A buy whose alert type we could not read: blank, missing, or a word the bot
+# has never used. Matches rsa_feed.UNKNOWN_KIND on the desktop. Shown on the
+# board, never actionable, and never served to a terminal as "Reg Alert" —
+# that note is what every customer's mirror auto-buys.
+UNKNOWN_KIND = "unknown"
+
+# Play.kind -> the picks.json note the desktop's mirror keys on. Must match
+# rsa_feed._PICK_NOTES: only "standard" becomes "Reg Alert" (a MIRROR_NOTES
+# entry); everything else, including any kind not listed here, is served with
+# the desktop's non-buyable unknown note.
+PICK_NOTES = {"standard": "Reg Alert", "otc": "OTC", "conditional": "conditional",
+              UNKNOWN_KIND: "unknown alert type"}
+
+
+def pick_note(kind: str | None) -> str:
+    return PICK_NOTES.get((kind or "").strip().lower(), PICK_NOTES[UNKNOWN_KIND])
+
+
 class Play(Base):
     """One BUY alert: a play to open.
 

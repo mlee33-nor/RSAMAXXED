@@ -21,6 +21,13 @@ import app as A
 import lifecycle
 
 
+@pytest.fixture(autouse=True)
+def _market_open(monkeypatch):
+    """A live auto-sell re-checks the market at fire time (it may have closed
+    during the holdings read); these tests are about what happens next."""
+    monkeypatch.setattr(A, "_market_status", lambda: ("open", "Markets open", None))
+
+
 class _Var:
     def __init__(self, v):
         self.v = v

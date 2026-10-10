@@ -97,9 +97,11 @@ def _empty() -> Dict[str, Any]:
 
 
 def load() -> Dict[str, Any]:
-    try:
-        data = json.loads(BALANCES_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    # BOM-tolerant; an unreadable file is kept and save() will not write over
+    # it this session (atomic.load_state) -- typed-in cash figures are not
+    # rebuilt by anything.
+    data = atomic.load_state(BALANCES_FILE, None)
+    if data is None:
         return _empty()
     if not isinstance(data, dict) or not isinstance(data.get("brokers"), dict):
         return _empty()
@@ -107,13 +109,10 @@ def load() -> Dict[str, Any]:
 
 
 def save(state: Dict[str, Any]) -> None:
-    """Write atomically. Copied from lifecycle.save_state rather than
-    trade_journal._save, which truncates the file first and loses everything if
-    the process dies mid-write."""
+    """Write atomically (unique temp + fsync + rename, see modules.atomic).
+    A failure leaves the previous balances in place."""
     try:
-        tmp = BALANCES_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        atomic.replace(tmp, BALANCES_FILE)
+        atomic.write_json(BALANCES_FILE, state)
     except OSError:
         pass
 
@@ -150,6 +149,11 @@ def record_broker_output(broker: str, accounts: Iterable[Any],
                 acct_id = acct.get("account_id")
                 extra = acct.get("extra")
             if not acct_id:
+                continue
+            # A failed row ("Public 2" whose login was refused) is not an
+            # account: stamping it seen made it count toward the broker's total.
+            ok = acct.get("ok") if isinstance(acct, dict) else getattr(acct, "ok", None)
+            if ok is False:
                 continue
             acct_id = str(acct_id)
             row = book.setdefault(acct_id, {})

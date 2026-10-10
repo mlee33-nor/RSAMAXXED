@@ -209,9 +209,13 @@ def test_writes_are_atomic_and_leave_no_temp_file():
     assert list(etf_journal.ETF_FILE.parent.glob("*.tmp")) == []
 
 
-def test_a_corrupt_file_reads_as_empty_rather_than_raising():
+def test_a_corrupt_file_reads_as_empty_rather_than_raising(monkeypatch):
+    """The READ path degrades (the Invest page renders off it); the write path
+    refuses -- see the unreadable tests below."""
+    monkeypatch.setattr(etf_journal, "_READ_DELAY", 0.0)
     etf_journal.ETF_FILE.write_text("{not json", encoding="utf-8")
     assert etf_journal.get_trades() == []
+    assert etf_journal.last_error()
 
 
 def test_version_changes_when_a_trade_is_recorded():
@@ -226,3 +230,58 @@ def test_delete_removes_one_row():
     assert etf_journal.delete_trade(a["id"]) is True
     assert [t["symbol"] for t in etf_journal.get_trades()] == ["SCHX"]
     assert etf_journal.delete_trade("nope") is False
+
+
+# ------------------------------------------- unreadable is not empty (QA #1)
+
+def test_a_corrupt_log_is_never_overwritten_by_a_new_fill(monkeypatch):
+    """`_load` used to return [] for an unreadable file and record_trade then
+    saved `[new row]` over every investment. It must raise instead."""
+    monkeypatch.setattr(etf_journal, "_READ_DELAY", 0.0)
+    etf_journal.ETF_FILE.write_text("{not json", encoding="utf-8")
+    with pytest.raises(etf_journal.JournalUnreadable):
+        buy()
+    assert etf_journal.ETF_FILE.read_text(encoding="utf-8") == "{not json"
+    assert etf_journal.last_error()
+
+
+def test_a_corrupt_log_recovers_from_its_backup(monkeypatch):
+    monkeypatch.setattr(etf_journal, "_READ_DELAY", 0.0)
+    buy()
+    buy("SCHX", 3, 30.43)
+    etf_journal.ETF_FILE.write_text('[{"id": "x", "sym', encoding="utf-8")
+    buy("VOO", 1, 500.0)
+    assert [t["symbol"] for t in etf_journal.get_trades()] == ["SPY", "SCHX", "VOO"]
+    assert list(etf_journal.ETF_FILE.parent.glob("etf_trades.unreadable-*.json"))
+
+
+def test_a_failed_save_raises_instead_of_dropping_the_fill(monkeypatch):
+    buy()
+
+    def die(*a, **k):
+        raise PermissionError(13, "locked")
+
+    with monkeypatch.context() as m:
+        m.setattr(etf_journal.atomic, "replace", die)
+        with pytest.raises(OSError):
+            buy("SCHX", 1, 30.0)
+    assert [t["symbol"] for t in etf_journal.get_trades()] == ["SPY"]
+    assert list(etf_journal.ETF_FILE.parent.glob("*.tmp")) == []
+
+
+def test_a_bom_saved_log_loads():
+    import codecs
+    buy()
+    raw = etf_journal.ETF_FILE.read_bytes()
+    etf_journal.ETF_FILE.write_bytes(codecs.BOM_UTF8 + raw)
+    buy("SCHX", 1, 30.0)
+    assert len(etf_journal.get_trades()) == 2
+
+
+def test_the_backup_is_not_shrunk_by_a_truncated_log():
+    buy()
+    buy("SCHX", 1, 30.0)
+    etf_journal.ETF_FILE.write_text("[]", encoding="utf-8")
+    buy("VOO", 1, 500.0)
+    bak = json.loads(etf_journal.ETF_FILE.with_suffix(".bak").read_text("utf-8"))
+    assert len(bak) == 2

@@ -55,7 +55,7 @@ def _load() -> dict:
     if not ARCHIVE.exists():
         return {k: {} for k in STREAMS}
     try:
-        raw = json.loads(ARCHIVE.read_text("utf-8"))
+        raw = json.loads(ARCHIVE.read_text("utf-8-sig"))
     except (OSError, ValueError):
         # A corrupt archive must not stop today's run from starting a new one,
         # but it must not be silently overwritten either.

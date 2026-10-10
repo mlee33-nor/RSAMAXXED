@@ -35,6 +35,7 @@ def init_db() -> None:
 
     Base.metadata.create_all(engine)
     _add_missing_columns()
+    _mask_stored_account_ids()
 
 
 # Columns added to a table that already exists in a deployed database.
@@ -61,3 +62,48 @@ def _add_missing_columns() -> None:
             if column in {c["name"] for c in inspector.get_columns(table)}:
                 continue
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+
+
+# Tables whose `account_id` came from a desktop's trades.json / get_holdings().
+_ACCOUNT_ID_TABLES: tuple[str, ...] = ("trades", "holding_rows")
+
+
+def _mask_stored_account_ids() -> int:
+    """Strip account numbers out of every stored account label. Returns rows changed.
+
+    Until desktop clients masked labels before upload, Fidelity rows arrived
+    with the FULL account number and every other broker with a last-4. This
+    rewrites any stored label with a 4+ digit run into the masked shape
+    (app.privacy). Idempotent by construction -- a masked label has no digit
+    run, so the SELECT finds nothing on every later boot -- and data-only, so
+    it sits beside _add_missing_columns rather than needing a schema tool.
+    """
+    from sqlalchemy import bindparam, inspect, text
+
+    from .privacy import mask_account_id, needs_mask
+
+    dialect = engine.dialect.name
+    if dialect == "postgresql":
+        where = "account_id ~ '[0-9]{4}'"
+    elif dialect == "sqlite":
+        where = "account_id GLOB '*[0-9][0-9][0-9][0-9]*'"
+    else:                                   # filtered in Python below
+        where = "account_id <> ''"
+
+    tables = set(inspect(engine).get_table_names())
+    changed = 0
+    with engine.begin() as conn:
+        for table in _ACCOUNT_ID_TABLES:
+            if table not in tables:
+                continue
+            rows = conn.execute(
+                text(f"SELECT id, account_id FROM {table} WHERE {where}")).all()
+            updates = [{"i": rid, "a": mask_account_id(acct)}
+                       for rid, acct in rows if needs_mask(acct)]
+            if updates:
+                conn.execute(
+                    text(f"UPDATE {table} SET account_id = :a WHERE id = :i")
+                    .bindparams(bindparam("a"), bindparam("i")),
+                    updates)
+                changed += len(updates)
+    return changed

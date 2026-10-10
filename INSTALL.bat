@@ -72,6 +72,25 @@ rem ---------------------------------------------------------------------------
 echo  [3/6] Installing RSAMAXXED's add-ons. This is the long step...
 "%PYEXE%" -m pip install -r requirements.txt --disable-pip-version-check
 if errorlevel 1 goto :pip_failed
+
+rem Check what is really installed against the pins. A library upgraded by
+rem hand (or by another tool) since the last setup -- playwright-stealth 2.x
+rem stops Schwab loading at all -- is forced back to the pinned version.
+set "RSA_PINS=%TEMP%\rsamaxxed_pins.txt"
+"%PYEXE%" -m modules.depcheck --specs > "%RSA_PINS%" 2>nul
+if errorlevel 1 (
+    echo        Some add-ons are not the tested versions. Reinstalling them...
+    "%PYEXE%" -m pip install --force-reinstall --no-deps -r "%RSA_PINS%" --disable-pip-version-check
+    "%PYEXE%" -m modules.depcheck
+    if errorlevel 1 (
+        echo.
+        echo        Warning: the add-ons above still do not match. Run
+        echo        INSTALL.bat again; if it keeps happening, send this
+        echo        window's text to support.
+        set "WARNED=1"
+    )
+)
+del "%RSA_PINS%" >nul 2>&1
 echo.
 
 rem ---------------------------------------------------------------------------

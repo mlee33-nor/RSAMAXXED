@@ -1685,6 +1685,16 @@ def _get_holdings_one(*args, **kwargs) -> BrokerOutput:
             raw_holdings_count = 0
             parsed_positions = 0
 
+            if not internal_id:
+                # Without an id its holdings can't be read: an empty ok=True
+                # row would read as "holds nothing" and auto-sell would skip it.
+                base = f"{acct_type} ({_mask_last4(apex)})"
+                outs.append(AccountOutput(
+                    account_id=base, ok=False,
+                    message="SoFi returned this account without an id — holdings could not be read",
+                    extra=acct_extra))
+                continue
+
             if internal_id:
                 url = f"https://www.sofi.com/wealth/backend/api/v3/account/{internal_id}/holdings?accountDataType=INTERNAL"
                 rr = req.get(
@@ -1707,9 +1717,18 @@ def _get_holdings_one(*args, **kwargs) -> BrokerOutput:
                     except Exception:
                         pass
 
-                holdings_list = (data.get("holdings") or []) if isinstance(data, dict) else []
+                holdings_list = data.get("holdings") if isinstance(data, dict) else None
                 if not isinstance(holdings_list, list):
-                    holdings_list = []
+                    # A 200 without its positions list is not an empty
+                    # account: an ok=True row with no holdings tells the
+                    # exits board (and auto-sell) this account holds nothing.
+                    # NEEDS LIVE VERIFICATION that an empty account answers [].
+                    base = f"{acct_type} ({_mask_last4(apex)})"
+                    outs.append(AccountOutput(
+                        account_id=base, ok=False,
+                        message="SoFi's holdings reply had no positions list — holdings could not be read",
+                        extra=acct_extra))
+                    continue
 
                 raw_holdings_count = int(len(holdings_list))
 
@@ -1859,12 +1878,37 @@ def _fmt_kv(lines: List[str], k: str, v: Any) -> None:
     lines.append(f"{k}: {v}")
 
 
+def _submitted_unverified_msg(e: BaseException) -> str:
+    """The account result when the order POST went out but its answer was lost.
+
+    "submitted" + "verify" is what the app keys on to treat the order as
+    possibly live and keep Retry from placing it twice.
+    """
+    detail = f"{type(e).__name__}: {e}".strip().rstrip(":")
+    return ("Order submitted but SoFi's response was lost — verify in SoFi "
+            f"before retrying ({detail})")
+
+
+def _order_id_from_resp(resp: Any) -> str:
+    """An order id from SoFi's order-POST answer, or "" when it has none."""
+    if not isinstance(resp, dict):
+        return ""
+    for k in ("orderId", "orderID", "order_id", "clientOrderId", "id"):
+        v = resp.get(k)
+        if isinstance(v, (str, int)) and not isinstance(v, bool) and str(v).strip():
+            return str(v).strip()
+    inner = resp.get("order")
+    if isinstance(inner, dict):
+        return _order_id_from_resp(inner)
+    return ""
+
+
 def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = False, **kwargs) -> BrokerOutput:
     if _is_cancelled(kwargs):
         return BrokerOutput(
             broker=BROKER,
             state="failed",
-            accounts=[AccountOutput(account_id="SoFi", ok=False, message="Cancelled before start")],
+            accounts=[AccountOutput(account_id="SoFi", ok=False, message="Cancelled before start — nothing was sent")],
             message="Cancelled",
         )
 
@@ -1872,6 +1916,12 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
     boot = _rehydrate_session(**kwargs)
     if getattr(boot, "state", "") not in ("success", "partial"):
         return boot
+
+    # acct_id -> result, for every account whose order POST went out in this
+    # run. It outlives a single _do_once on purpose: the unauthorized retry
+    # below must never POST an account a second time, and a failure partway
+    # through must still report the accounts that were already ordered.
+    sent: Dict[str, AccountOutput] = {}
 
     def _do_once() -> BrokerOutput:
         err = _require_session(allow_disk=False)
@@ -1897,6 +1947,11 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
                 raise ValueError()
         except Exception:
             return BrokerOutput(broker=BROKER, state="failed", accounts=[], message=f"Invalid qty: {qty!r}")
+        # A whole-share order sends str(int(q)): 1.5 would silently become 1.
+        # Only q < 1 goes down the fractional path, so refuse mixed amounts.
+        if q >= 1 and q != int(q):
+            return BrokerOutput(broker=BROKER, state="failed", accounts=[], message=(
+                f"Invalid qty: {qty!r} — SoFi whole-share orders need a whole number; nothing was sent"))
 
         req = _requests()
 
@@ -1995,6 +2050,15 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
             if _acct_i > 0:
                 time.sleep(random.uniform(1.0, 3.0))
             if _is_cancelled(kwargs):
+                # Every account the cancel kept from its order gets a row.
+                for rest in funded[_acct_i:]:
+                    rid = str(rest.get("accountId") or "")
+                    if rid in sent:
+                        outs.append(sent[rid])
+                        continue
+                    rlabel = f"{str(rest.get('accountType') or 'ACCOUNT')} ({_mask_last4(rid)})"
+                    outs.append(AccountOutput(account_id=rlabel, ok=False,
+                                              message="Skipped: cancelled — nothing was sent"))
                 break
             acct_id = str(acct.get("accountId") or "")
             acct_type = str(acct.get("accountType") or "ACCOUNT")
@@ -2004,11 +2068,16 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
                 outs.append(AccountOutput(account_id=label, ok=False, message="Missing accountId"))
                 continue
 
+            if acct_id in sent:
+                # Ordered on an earlier pass of this run (before a re-login).
+                outs.append(sent[acct_id])
+                continue
+
             is_fractional = (q < 1)
 
             if is_fractional:
                 if session_type != "CORE_HOURS":
-                    outs.append(AccountOutput(account_id=label, ok=False, message="Fractionals only supported in CORE_HOURS"))
+                    outs.append(AccountOutput(account_id=label, ok=False, message="Fractionals only supported in CORE_HOURS — nothing was sent"))
                     continue
 
                 cash_amount = round(float(chosen) * float(q), 2)
@@ -2056,24 +2125,78 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
                 outs.append(AccountOutput(account_id=label, ok=True, message="\n".join(ticket_lines)))
                 continue
 
-            rr = req.post(
-                endpoint,
-                json=payload,
-                headers=_headers(_CSRF),
-                cookies=_COOKIES,
-                impersonate="chrome",
-                timeout=120,
-            )
+            try:
+                rr = req.post(
+                    endpoint,
+                    json=payload,
+                    headers=_headers(_CSRF),
+                    cookies=_COOKIES,
+                    impersonate="chrome",
+                    timeout=120,
+                )
+            except Exception as post_err:
+                # Timeout / dropped connection: SoFi may well have the order.
+                res = AccountOutput(account_id=label, ok=False,
+                                    message=_submitted_unverified_msg(post_err))
+                sent[acct_id] = res
+                outs.append(res)
+                continue
+
+            # Provisional until the reply is read: if reading it raises, the
+            # run's failure path must still know this account was POSTed.
+            sent[acct_id] = AccountOutput(account_id=label, ok=False, message=_submitted_unverified_msg(
+                RuntimeError("SoFi's reply to the order could not be read")))
+
             if rr.status_code == 401:
-                raise RuntimeError(f"HTTP 401: {rr.text[:200]}")
+                # A 401 is SoFi refusing the session, not taking the order.
+                sent.pop(acct_id, None)
+                if not sent:
+                    # Nothing has gone out in this run, so the caller may
+                    # re-login and run the accounts again.
+                    raise RuntimeError(f"HTTP 401: {rr.text[:200]}")
+                # Earlier accounts were ordered: no re-run. This account and
+                # the rest are reported as not sent.
+                outs.append(AccountOutput(
+                    account_id=label, ok=False,
+                    message="SoFi session expired (HTTP 401) — this account's order was not sent"))
+                for rest in funded[_acct_i + 1:]:
+                    rid = str(rest.get("accountId") or "")
+                    rlabel = f"{str(rest.get('accountType') or 'ACCOUNT')} ({_mask_last4(rid)})"
+                    outs.append(AccountOutput(
+                        account_id=rlabel, ok=False,
+                        message="Skipped: SoFi session expired before this account — nothing was sent"))
+                break
+
             if rr.status_code == 200:
-                resp = rr.json() if rr.text else {}
-                if isinstance(resp, dict) and resp.get("experiment") == "ORDER_SUBMITTED":
-                    outs.append(AccountOutput(account_id=label, ok=True, message="order placed"))
+                try:
+                    resp = rr.json() if rr.text else {}
+                except Exception as parse_err:
+                    res = AccountOutput(account_id=label, ok=False,
+                                        message=_submitted_unverified_msg(parse_err))
                 else:
-                    outs.append(AccountOutput(account_id=label, ok=True, message="order submitted"))
+                    oid = _order_id_from_resp(resp)
+                    if isinstance(resp, dict) and resp.get("experiment") == "ORDER_SUBMITTED":
+                        res = AccountOutput(account_id=label, ok=True, message="order placed")
+                    elif oid:
+                        res = AccountOutput(account_id=label, ok=True,
+                                            message=f"order placed (#{oid})")
+                    else:
+                        # HTTP 200 alone is not an acknowledgement: the body
+                        # carried neither ORDER_SUBMITTED nor an order id.
+                        # NEEDS LIVE VERIFICATION: the id key names.
+                        res = AccountOutput(account_id=label, ok=False, message=(
+                            "Order submitted but SoFi did not confirm it — verify in "
+                            f"SoFi before retrying (HTTP 200: {str(rr.text or '')[:200]})"))
+            elif rr.status_code >= 500 or rr.status_code == 408:
+                # A server error / gateway timeout answers the order POST
+                # without saying it was refused: SoFi may still have taken it.
+                res = AccountOutput(account_id=label, ok=False, message=(
+                    f"Order submitted but SoFi answered HTTP {rr.status_code} — verify in "
+                    f"SoFi before retrying ({rr.text[:200]})"))
             else:
-                outs.append(AccountOutput(account_id=label, ok=False, message=f"HTTP {rr.status_code}: {rr.text[:200]}"))
+                res = AccountOutput(account_id=label, ok=False, message=f"HTTP {rr.status_code}: {rr.text[:200]}")
+            sent[acct_id] = res
+            outs.append(res)
 
         if _is_cancelled(kwargs):
             state = "partial" if any(a.ok for a in outs) else "failed"
@@ -2090,9 +2213,19 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
 
         return BrokerOutput(broker=BROKER, state=state, accounts=outs, message=broker_msg)
 
+    def _with_sent(e: BaseException) -> BrokerOutput:
+        # A failure after some accounts were ordered: keep their real results.
+        outs = list(sent.values())
+        outs.append(AccountOutput(account_id="SoFi", ok=False,
+                                  message=f"Remaining accounts not traded: {e}"))
+        state = "partial" if any(a.ok for a in outs) else "failed"
+        return BrokerOutput(broker=BROKER, state=state, accounts=outs, message=str(e))
+
     try:
         return _do_once()
     except Exception as e:
+        if sent:
+            return _with_sent(e)
         if _is_unauthorized_text(str(e)):
             try:
                 BLOG.write_log(
@@ -2120,10 +2253,15 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
                         )
                     except Exception:
                         pass
+                    if sent:
+                        return _with_sent(e2)
+                    # No order POST went out (sent is empty): the quote, the
+                    # funded-accounts list, or a 401 before the first order.
                     return BrokerOutput(
                         broker=BROKER,
                         state="failed",
-                        accounts=[AccountOutput(account_id="SoFi", ok=False, message=str(e2))],
+                        accounts=[AccountOutput(account_id="SoFi", ok=False,
+                                                message=f"{e2} — nothing was sent")],
                         message=str(e2),
                     )
         try:
@@ -2136,10 +2274,12 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
             )
         except Exception:
             pass
+        # `sent` is empty here (handled above): nothing reached an order POST.
         return BrokerOutput(
             broker=BROKER,
             state="failed",
-            accounts=[AccountOutput(account_id="SoFi", ok=False, message=str(e))],
+            accounts=[AccountOutput(account_id="SoFi", ok=False,
+                                    message=f"{e} — nothing was sent")],
             message=str(e),
         )
 

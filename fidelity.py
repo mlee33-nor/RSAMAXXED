@@ -7,8 +7,6 @@ import math
 import os
 import random
 import re
-import signal
-import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -25,8 +23,10 @@ import zendriver as uc
 from zendriver import cdp, KeyPressEvent
 from zendriver.core.keys import KeyEvents
 
+import broker_logins
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow, find_browser_executable, cleanup_orphaned_chrome
 from modules import quiet
+from modules import proc
 from modules import _2fa_prompt
 from modules.ui_keys import runtime_profile
 
@@ -89,49 +89,32 @@ def cleanup_stale_startup() -> Dict[str, int]:
     """
     Best-effort startup cleanup for Fidelity automation artifacts:
     - Terminate stray browser processes still bound to Fidelity automation profiles.
-    - Remove lingering profile lock files.
+    - Remove profile lock files whose owner process is gone.
+
+    Browsers are matched per profile dir and verified through a pinned handle
+    (modules/proc.py) -- the old ``ps aux`` + ``os.kill(pid, SIGTERM)`` route
+    read Git-for-Windows pids that are not Windows pids and killed by number.
+    A lock whose owner is alive (or cannot be told) is left alone: a startup
+    sweep must never free a profile a running order is using.
     """
     killed = 0
     removed_locks = 0
     sess = _sessions_dir()
-    me = os.getpid()
 
-    # Kill only processes that clearly reference the Fidelity automation profile path.
     try:
-        # Use a broadly portable ps invocation and parse PID + command tail.
-        out = subprocess.check_output(["ps", "aux"], text=True, stderr=subprocess.DEVNULL,
-                                     **quiet.no_window_kwargs())
-        for line in (out or "").splitlines()[1:]:
-            s = line.rstrip()
-            if not s:
-                continue
-            parts = s.split(None, 10)
-            if len(parts) < 11:
-                continue
-            pid_s, cmd = parts[1], parts[10]
-            try:
-                pid = int(pid_s)
-            except Exception:
-                continue
-            if pid == me:
-                continue
-            cmd_l = cmd.lower()
-            if "zenfidelity_" not in cmd_l and str(sess).lower() not in cmd_l:
-                continue
-            try:
-                os.kill(pid, signal.SIGTERM)
-                killed += 1
-            except Exception:
-                pass
+        for prof in sess.glob("ZenFidelity_*"):
+            if prof.is_dir():
+                killed += int(proc.terminate_browsers_on(prof) or 0)
     except Exception:
         pass
 
-    # Remove lingering lock files so profile lock acquisition won't block/reject.
     try:
         for lf in sess.glob(".profile_*.lock"):
             try:
-                lf.unlink()
-                removed_locks += 1
+                pid_text = lf.read_text().strip()
+                if pid_text.isdigit() and _lock_owner_alive(int(pid_text), lf.stat().st_mtime) is False:
+                    lf.unlink()
+                    removed_locks += 1
             except Exception:
                 pass
     except Exception:
@@ -262,6 +245,13 @@ def _set_auth_detail(label: str, why: str) -> None:
     _LAST_AUTH_DETAIL[str(label)] = why
 
 
+def _not_sent(msg: str) -> str:
+    """`msg` worded for the app's positive nothing-sent rule. Only for a
+    failure that provably came before the Place Order click."""
+    msg = (str(msg or "")).strip() or "Fidelity failed"
+    return msg if "nothing was sent" in msg.lower() else f"{msg} — nothing was sent"
+
+
 def _auth_detail(label: str, fallback: str = "auth failed") -> str:
     return _LAST_AUTH_DETAIL.pop(str(label), "") or fallback
 
@@ -368,12 +358,27 @@ def _clean_chrome_singletons(profile_dir: Path) -> None:
         except Exception:
             pass
 
-def _is_pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
+def _lock_owner_alive(pid: int, since: Optional[float] = None) -> Optional[bool]:
+    """Is the process named in a profile lock alive? True / False / None (unknown).
+
+    Never ``os.kill(pid, 0)``: on Windows that is CTRL_C_EVENT, and with no
+    console CPython falls through to TerminateProcess -- the probe killed the
+    owner (this very app, when its own abandoned thread held the lock). Our
+    own pid means a thread of this app holds it -- busy, not probed.
+    """
+    if int(pid) == os.getpid():
         return True
-    except (OSError, ProcessLookupError):
+    alive = proc.pid_alive(int(pid))
+    # `since` is the lock file's mtime: a live process that started after
+    # it is a recycled pid (crash + reboot), not the lock's owner.
+    if alive and since is not None and proc.started_after(int(pid), since):
         return False
+    return alive
+
+
+def _is_pid_alive(pid: int) -> bool:
+    return _lock_owner_alive(pid) is not False
+
 
 def _acquire_profile_lock(idx_1based: int, timeout_s: int = 60, poll_s: float = 0.25, stale_s: int = 120) -> Path:
     lock = _lock_file(idx_1based)
@@ -385,18 +390,39 @@ def _acquire_profile_lock(idx_1based: int, timeout_s: int = 60, poll_s: float = 
     while time.time() < deadline:
         try:
             if lock.exists():
+                pid_text = ""
                 try:
                     pid_text = lock.read_text().strip()
-                    if pid_text.isdigit() and not _is_pid_alive(int(pid_text)):
-                        lock.unlink()
                 except Exception:
-                    pass
-                try:
-                    age = time.time() - lock.stat().st_mtime
-                    if age > stale_s:
+                    pid_text = ""
+                alive: Optional[bool] = None
+                if pid_text.isdigit():
+                    try:
+                        alive = _lock_owner_alive(int(pid_text), lock.stat().st_mtime)
+                    except Exception:
+                        alive = None
+                if alive is False:
+                    # Owner is gone (a crash, a hard kill): take the lock over.
+                    # Its Chrome, if any survived, is reaped by the
+                    # cleanup_orphaned_chrome() that runs right after we hold it.
+                    try:
                         lock.unlink()
-                except Exception:
-                    pass
+                    except FileNotFoundError:
+                        pass
+                    except Exception:
+                        pass
+                elif alive is None:
+                    # Age alone only frees a lock whose owner cannot be told
+                    # (unreadable, or liveness unknown). One whose owner is
+                    # alive is a browser still running on this profile -- a
+                    # long trade is normal -- and stealing it put a second
+                    # Chrome on the same profile mid-order.
+                    try:
+                        age = time.time() - lock.stat().st_mtime
+                        if age > stale_s:
+                            lock.unlink()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -410,7 +436,8 @@ def _acquire_profile_lock(idx_1based: int, timeout_s: int = 60, poll_s: float = 
         except FileExistsError:
             time.sleep(poll_s)
 
-    raise RuntimeError("Fidelity profile is busy (another Fidelity browser is still running). Try again in ~10s.")
+    raise RuntimeError("Fidelity profile is busy (another Fidelity browser is still running) — "
+                       "nothing was sent. Try again in a few minutes.")
 
 def _release_profile_lock(lock: Path) -> None:
     try:
@@ -799,7 +826,9 @@ def _load_creds() -> List[_LoginCred]:
     if raw:
         parts = [p.strip() for p in raw.split(",") if p.strip()]
         for i, item in enumerate(parts, 1):
-            fields = item.split(":")
+            # Same split the login editor writes with: a ':' inside the
+            # password stays in the password (a plain split cut it short).
+            fields = broker_logins.split_fields(item, broker_logins.SCHEMAS["fidelity"])
             user = (fields[0] or "").strip()
             pw = (fields[1] or "").strip() if len(fields) > 1 else ""
             totp = (fields[2] or "").strip() if len(fields) > 2 else ""
@@ -1749,7 +1778,9 @@ async def _open_account_dropdown_and_scrape(page) -> List[Dict[str, str]]:
     )
 
     for item in (scraped or []):
-        m = re.search(r'(.*?)\s*\((Z?\d+)\)', item)
+        # Optional one-letter prefix: Z-prefixed brokerage numbers and any other
+        # lettered account type (the old Z-only pattern silently dropped those).
+        m = re.search(r'(.*?)\s*\(([A-Z]?\d+)\)', item)
         if not m:
             continue
         nickname = m.group(1).strip() or "Account"
@@ -3196,6 +3227,130 @@ async def _open_trade_drawer_from_current_page(page) -> None:
     await page.select("#eq-ticket-dest-symbol", timeout=12)
 
 
+async def _selected_account_text(page) -> str:
+    """The destination account the ticket currently shows ('' if unreadable)."""
+    try:
+        v = await page.evaluate(
+            "(function(){var d=document.querySelector('#dest-acct-dropdown');"
+            "return d?((d.innerText||d.textContent||d.value||'')+'').trim():'';})();"
+        )
+    except Exception:
+        return ""
+    return v.strip() if isinstance(v, str) else ""
+
+
+def _account_label_shows(text: str, acct_num: str) -> bool:
+    num = (acct_num or "").strip().upper()
+    return bool(num) and num in (text or "").upper()
+
+
+_ACCT_NUM_TOKEN = re.compile(r"\b[A-Z]?\d{5,}\b")
+
+
+def _account_label_conflicts(text: str, acct_num: str) -> bool:
+    """True only when the label positively names a DIFFERENT account.
+
+    The closed dropdown's exact markup has never been captured live; if it
+    shows no account number at all we cannot tell, and failing every account
+    on that guess would stop Fidelity trading outright. So an unreadable or
+    number-less label passes (the pre-readback behaviour) and only a label
+    showing some other account number is refused.
+    """
+    if _account_label_shows(text, acct_num):
+        return False
+    return bool(_ACCT_NUM_TOKEN.search((text or "").upper()))
+
+
+async def _confirm_selected_account(page, acct_num: str, *, tries: int = 3,
+                                    wait_s: float = 0.5) -> Optional[str]:
+    """None once the ticket shows acct_num (or shows no account number we
+    could compare); otherwise the conflicting text it shows instead."""
+    shown = ""
+    for i in range(tries):
+        shown = await _selected_account_text(page)
+        if not _account_label_conflicts(shown, acct_num):
+            return None
+        if i < tries - 1:
+            await page.sleep(wait_s)
+    return shown
+
+
+async def _ticket_qty_value(page) -> str:
+    """The Quantity field's current value ('' if unreadable)."""
+    try:
+        v = await page.evaluate(
+            "(function(){var q=document.querySelector('#eqt-shared-quantity');"
+            "return q?((q.value||q.getAttribute('value')||'')+'').trim():'';})();"
+        )
+    except Exception:
+        return ""
+    return v.strip() if isinstance(v, str) else ""
+
+
+def _qty_value_matches(value: str, want: str) -> bool:
+    """Does the Quantity field hold exactly `want` ("1,000" == "1000" == "1000.0")?"""
+    try:
+        return float(str(value).replace(",", "").strip()) == float(str(want).strip())
+    except Exception:
+        return False
+
+
+#: The confirmation-screen test, as one JS expression over the page. Kept as
+#: a constant so tests can run it (node, tests/test_fix5_brokers.py) against
+#: sample pages.
+#:
+#: Confirmed only when Place Order is gone AND
+#:   * no visible error/danger inline alert or dialog is up (info, success,
+#:     warning and caution alerts are just Fidelity's notes -- a market-hours
+#:     caution sits on many real confirmations), AND
+#:   * no error text is on the page ("Error: ...", "unable to place ...") --
+#:     an error can hide Place Order without any .pvd-inline-alert, AND
+#:   * a positive phrase ("order received / was received / has been placed /
+#:     submitted"), or an order/confirmation number token outside an
+#:     open-orders listing. The token is case-insensitive but must hold a
+#:     letter AND a digit and be 6-12 characters, so "Order notifications",
+#:     "Order no longer valid", "Order No. 1 of 10", "Order #2026" and a date
+#:     never read as one.
+#: Anything else is "not confirmed", which the caller reports as may-exist
+#: (submitted -- verify), never nothing-sent. NEEDS LIVE VERIFICATION against
+#: a real confirmation page.
+_ORDER_CONFIRMED_JS = r"""
+(function() {
+    const vis = (e) => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+    const b = document.querySelector('#placeOrderBtn');
+    const btnGone = !vis(b);
+    if (!btnGone) return false;
+    // An error alert or a dialog over the ticket is Fidelity refusing (or
+    // asking about) the order, never its confirmation. Typed notes are not.
+    for (const a of document.querySelectorAll('.pvd-inline-alert, .pvd-modal__dialog')) {
+        const cls = String(a.className || '');
+        const benign = /--(info|success|warning|caution)\b/i.test(cls)
+            && !/--(error|danger|critical|alert)\b/i.test(cls);
+        if (benign) continue;
+        if (vis(a)) return false;
+    }
+    const t = (document.body && document.body.innerText) ? String(document.body.innerText) : '';
+    const errorText = /(^|\n)\s*error\b|\ban error (?:has )?occurred\b|\bthere was an? (?:error|problem)\b|\bunable to (?:process|place|submit|complete)\b|\b(?:could|can) ?not be (?:placed|processed|submitted|completed)\b/i.test(t);
+    if (errorText) return false;
+    // Positive phrases: 'Order Received', 'Your order was received',
+    // 'Your order has been placed.', 'Order submitted'.
+    const phrase = /\border\s+(?:was\s+|has\s+been\s+|is\s+)?(?:received|placed|submitted)\b/i.test(t);
+    const number = /\b(?:confirmation|order)\s*(?:number|no\.?|#)\s*:?\s*(?=[a-z0-9]*\d)(?=[0-9]*[a-z])[a-z0-9]{6,12}\b/i.test(t)
+        && !/\bopen\s+orders\b/i.test(t);
+    const received = phrase || number;
+    return !!received;
+})();
+"""
+
+
+async def _order_confirmed(page) -> bool:
+    """Fidelity's confirmation screen is up: Place Order is gone, no error
+    alert or dialog is showing, AND the page shows an order-received /
+    order-number indicator. Raises if the page can't be read (it is usually
+    mid-navigation)."""
+    return bool(await page.evaluate(_ORDER_CONFIRMED_JS))
+
+
 def _submitted_unverified_msg(e: BaseException) -> str:
     """The account result for an error AFTER Place Order was clicked.
 
@@ -3226,6 +3381,41 @@ def _is_hard_error(msg: str) -> bool:
     if "stale" in m or "node with given id" in m:
         return False
     return True
+
+
+#: An account error that means this login's session is gone (every later
+#: account at this login would fail the same way).
+_AUTH_STOP_PHRASES = (
+    "bounced back to login", "bounced to login", "session expired",
+    "session has expired", "not logged in", "logged out", "login required",
+    "authentication required", "auth required", "re-authenticate",
+    "sign in again", "log in again", "authredurl",
+)
+
+#: An account error that means the browser itself is gone or unreachable.
+_BROWSER_STOP_PHRASES = (
+    "browser connection", "browser closed", "browser crashed",
+    "browser disconnected", "browser not running", "browser has been closed",
+    "browser process", "target closed", "websocket", "connection refused",
+)
+
+
+def _login_stop_kind(e: BaseException) -> str:
+    """"auth", "browser" or "" -- does this failure end the login's run?
+
+    The old test was a bare substring ("auth" / "login" / "browser" anywhere
+    in the text), so "account not authorized for this security" or a URL
+    containing "login" stopped the login and, with "browser", every later
+    login too. Specific phrases only; anything else is one account's failure.
+    """
+    if isinstance(e, ConnectionError):
+        return "browser"
+    m = str(e or "").lower()
+    if any(p in m for p in _BROWSER_STOP_PHRASES):
+        return "browser"
+    if any(p in m for p in _AUTH_STOP_PHRASES):
+        return "auth"
+    return ""
 
 
 def _fid_account_matches(acct: Dict[str, Any], label: str, wanted: set) -> bool:
@@ -3424,7 +3614,7 @@ def get_holdings(*args, **kwargs) -> BrokerOutput:
         return BrokerOutput(
             broker=BROKER,
             state="failed",
-            accounts=[AccountOutput(account_id="Fidelity", ok=False, message="Cancelled before start")],
+            accounts=[AccountOutput(account_id="Fidelity", ok=False, message=_not_sent("Cancelled before start"))],
             message="Cancelled",
         )
 
@@ -3531,7 +3721,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
         return BrokerOutput(
             broker=BROKER,
             state="failed",
-            accounts=[AccountOutput(account_id="Fidelity", ok=False, message="Cancelled before start")],
+            accounts=[AccountOutput(account_id="Fidelity", ok=False, message=_not_sent("Cancelled before start"))],
             message="Cancelled",
         )
 
@@ -3594,16 +3784,39 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
     # (set before the abandon check — see the submit block). The timeout
     # handler uses it to tell "hung before any order" from "may have placed".
     _run_flags: Dict[str, bool] = {"clicked": False}
+    # What the run has done so far, readable by the timeout handler after the
+    # run is abandoned: the per-account results (the same list _run_all
+    # appends to), the account being worked on, the account whose Place Order
+    # click is under way, the accounts still queued for the current login, and
+    # the logins not started yet.
+    _progress: Dict[str, Any] = {
+        "outs": [], "login": None, "current": None, "clicking": None,
+        "todo": [], "logins_left": [c.label for c in creds],
+    }
 
     async def _run_all() -> BrokerOutput:
-        outs: List[AccountOutput] = []
+        outs: List[AccountOutput] = _progress["outs"]
         log_lines: List[str] = []
         processed_targets: set[Tuple[str, str]] = set()
         hard_stop = False
+        hard_stop_why = ""
         # Did any login actually hold one of the requested accounts? Without
         # this a retry naming an account nobody owns returns an empty success-
         # shaped result, which reads as "nothing to do" instead of "not found".
         matched_any = not only_accounts
+        # False once a login was never looked at (cancel, hard stop, a login
+        # that failed before its account list was read). "None of the
+        # requested accounts were found" is only true when every login was.
+        _all_logins_checked = True
+
+        def _done_ids() -> set:
+            return {str(a.account_id) for a in outs}
+
+        def _login_fail(label: str, message: str) -> None:
+            nonlocal _all_logins_checked
+            _all_logins_checked = False
+            outs.extend(_login_level_rows(label, message, only_accounts=only_accounts,
+                                          done=_done_ids()))
 
         if dry_run:
             log_lines.append("DRY RUN — NO ORDER SUBMITTED")
@@ -3616,11 +3829,35 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
         any_ok = False
         any_fail = False
 
-        for c in creds:
+        for _cred_i, c in enumerate(creds):
+            if _is_cancelled(kwargs) and not _abandoned.is_set():
+                # A row for each login the cancel kept from running -- in a
+                # narrowed run, only its requested accounts (never a bare
+                # login label, which a Retry reads as "every account there").
+                for rest in creds[_cred_i:]:
+                    outs.extend(_login_level_rows(
+                        rest.label, "Skipped: cancelled — nothing was sent",
+                        only_accounts=only_accounts, done=_done_ids()))
+                _all_logins_checked = False
+                break
             if _is_cancelled(kwargs) or _abandoned.is_set():
+                _all_logins_checked = False
                 break
             if hard_stop:
+                # Browser-level failure: no later login can run either. Give
+                # each one a row so it isn't silently missing from the result
+                # (narrowed the same way as the cancel rows above).
+                for rest in creds[_cred_i:]:
+                    outs.extend(_login_level_rows(
+                        rest.label, f"Skipped: {hard_stop_why} — nothing was sent",
+                        only_accounts=only_accounts, done=_done_ids()))
+                any_fail = True
+                _all_logins_checked = False
                 break
+            _progress["login"] = c.label
+            _progress["current"] = None
+            _progress["todo"] = []
+            _progress["logins_left"] = [x.label for x in creds[_cred_i + 1:]]
             browser = None
             page = None
             try:
@@ -3639,7 +3876,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                 )
                 if not ok:
                     why = _auth_detail(c.label)
-                    outs.append(AccountOutput(account_id=c.label, ok=False, message=why))
+                    _login_fail(c.label, _not_sent(why))
                     if dry_run:
                         log_lines.append(f"[{c.label}] ERROR: {why}")
                         log_lines.append("")
@@ -3655,7 +3892,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                     if dry_run:
                         log_lines.append(f"[{c.label}] smart_sell_targets={len(smart_targets)} from_csv={csv_path.name}")
                     if not smart_targets:
-                        outs.append(AccountOutput(account_id=c.label, ok=False, message=f"Smart Sell: no holdings found for {sym}"))
+                        _login_fail(c.label, _not_sent(f"Smart Sell: no holdings found for {sym}"))
                         any_fail = True
                         continue
 
@@ -3673,7 +3910,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                 _trace(f"TRADE | {c.label} | scraping account list", notify=notify)
                 acct_list = await _open_account_dropdown_and_scrape(page)
                 if not acct_list:
-                    outs.append(AccountOutput(account_id=c.label, ok=False, message="No destination accounts found on trade ticket"))
+                    _login_fail(c.label, _not_sent("No destination accounts found on trade ticket"))
                     if dry_run:
                         log_lines.append(f"[{c.label}] ERROR: no destination accounts found")
                         log_lines.append("")
@@ -3705,11 +3942,30 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                                notify=notify)
                         acct_list = wanted
 
+                # Queued accounts for the timeout handler (smart sell only
+                # trades the accounts that hold the symbol).
+                _progress["todo"] = [
+                    f"{c.label} · {a.get('name') or 'Account'} ({a['acctNum']})"
+                    for a in acct_list
+                    if not smart_sell or _trade_account_key(
+                        a.get("name") or "Account", a["acctNum"]) in smart_targets
+                ]
+
                 # Iterate destination accounts
                 _consec_errors = 0  # stop after 2 consecutive errors
                 for _acct_i, acct in enumerate(acct_list):
                     if _acct_i > 0:
                         await asyncio.sleep(random.uniform(1.0, 3.0))
+                    if _is_cancelled(kwargs) and not _abandoned.is_set():
+                        for rest_acct in acct_list[_acct_i:]:
+                            r_name = rest_acct.get('name') or 'Account'
+                            if smart_sell and _trade_account_key(
+                                    r_name, rest_acct['acctNum']) not in smart_targets:
+                                continue
+                            outs.append(AccountOutput(
+                                account_id=f"{c.label} · {r_name} ({rest_acct['acctNum']})",
+                                ok=False, message="Skipped: cancelled — nothing was sent"))
+                        break
                     if _is_cancelled(kwargs) or _abandoned.is_set():
                         break
                     if hard_stop:
@@ -3724,6 +3980,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         if target_id in processed_targets:
                             continue
                     acct_label = f"{c.label} · {acct_name} ({acct_num})"
+                    _progress["current"] = acct_label
                     _trace(f"TRADE | {acct_label} | starting ({_acct_i+1}/{len(acct_list)})", notify=notify)
 
                     # Reset per account: a stale True from the previous account
@@ -3815,6 +4072,28 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         except Exception:
                             pass
                         await page.sleep(0.25)
+
+                        # Read the selection back. A click that landed on the
+                        # wrong option (or on nothing, on a re-rendering list)
+                        # would otherwise trade whichever account the ticket
+                        # still shows. One JS re-pick, then give up.
+                        _shown = await _confirm_selected_account(page, acct_num)
+                        if _shown is not None:
+                            try:
+                                if not await _acct_list_open():
+                                    await _js_pointer_click_selector(page, "#dest-acct-dropdown")
+                                    await page.sleep(0.3)
+                                await _js_click_option_by_text(
+                                    page, "#ett-acct-sel-list", 'div[role="option"] button', acct_num
+                                )
+                                await page.sleep(0.4)
+                            except Exception:
+                                pass
+                            _shown = await _confirm_selected_account(page, acct_num)
+                        if _shown is not None:
+                            raise RuntimeError(
+                                f"Could not select account {acct_num} on the ticket "
+                                f"(it shows {_shown[:60]!r}) — nothing was sent")
 
                         # Extended hours toggle priority
                         if dry_run:
@@ -3960,18 +4239,13 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                             if dry_run:
                                 log_lines.append(f"[{acct_label}] step=set_qty qty={qty_order}")
 
-                            async def _qty_nonempty():
-                                try:
-                                    v = await page.evaluate(
-                                        "(function(){var q=document.querySelector('#eqt-shared-quantity');"
-                                        "return q?((q.value||q.getAttribute('value')||'')+'').trim():'';})();"
-                                    )
-                                    return bool((v or "").strip())
-                                except Exception:
-                                    return False
+                            # The exact quantity, not just "something": a stale
+                            # handle can leave a half-typed or appended value.
+                            async def _qty_exact():
+                                return _qty_value_matches(await _ticket_qty_value(page), qty_order)
 
                             if not await _stale_safe_type(
-                                page, "#eqt-shared-quantity", qty_order, verify=_qty_nonempty
+                                page, "#eqt-shared-quantity", qty_order, verify=_qty_exact
                             ):
                                 raise RuntimeError(f"Could not enter quantity ({qty_order})")
 
@@ -4049,6 +4323,15 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                                 page, limit_price_str, side=side_upper, is_extended=is_extended
                             )
 
+                        # Last look at the quantity before preview: the order
+                        # type / limit price steps re-render the ticket.
+                        if qty_order != "ALL":
+                            _qty_seen = await _ticket_qty_value(page)
+                            if not _qty_value_matches(_qty_seen, qty_order):
+                                raise RuntimeError(
+                                    f"Quantity on the ticket reads {_qty_seen!r}, expected "
+                                    f"{qty_order} — nothing was sent")
+
                         # Preview
                         if dry_run:
                             log_lines.append(f"[{acct_label}] step=preview")
@@ -4092,7 +4375,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                                 AccountOutput(
                                     account_id=acct_label,
                                     ok=False,
-                                    message=f"Preview failed: {err_txt}",
+                                    message=_not_sent(f"Preview failed: {err_txt}"),
                                     extra={"symbol": sym, "qty": qty_order},
                                 )
                             )
@@ -4154,6 +4437,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         # either it sees the flag (and says "verify") or we see
                         # the event (and never click on a run nobody is waiting
                         # on any more).
+                        _progress["clicking"] = acct_label
                         _run_flags["clicked"] = True
                         _stop_click = False
                         for _place_try in range(3):
@@ -4163,14 +4447,22 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                             try:
                                 place_btn = await page.select("#placeOrderBtn", timeout=10)
                                 await place_btn.mouse_move()
-                                if _abandoned.is_set():
-                                    _stop_click = True
-                                    break
-                                await place_btn.mouse_click()
-                                _placed = True
-                                break
                             except Exception:
+                                # select / mouse_move failed: no click was
+                                # dispatched, so a fresh handle is safe.
                                 await _settle(page, sleep_s=0.5)
+                                continue
+                            if _abandoned.is_set():
+                                _stop_click = True
+                                break
+                            # Ambiguous from here on: mouse_click can dispatch
+                            # the click and still raise (stale node, page
+                            # navigating to the confirmation). Any error now
+                            # propagates to the "verify" handler — never a
+                            # second click.
+                            _placed = True
+                            await place_btn.mouse_click()
+                            break
                         if not _placed and (_stop_click or _abandoned.is_set()):
                             raise RuntimeError("Stopped before clicking Place Order: the run timed out")
                         if not _placed:
@@ -4200,14 +4492,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         for _ in range(50):
                             await page.sleep(0.5)
                             try:
-                                ok_txt = await page.evaluate(
-                                    """
-                                    (function() {
-                                        const t = (document.body && document.body.innerText) ? document.body.innerText : '';
-                                        return (t.includes('Order Received') || t.includes('Confirmation'));
-                                    })();
-                                    """
-                                )
+                                ok_txt = await _order_confirmed(page)
                                 _poll_err = None
                             except Exception as _pe:
                                 _poll_err = _pe
@@ -4215,16 +4500,17 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                             if ok_txt:
                                 confirmed = True
                                 break
-                            u = (await _current_url(page)).lower()
-                            if "confirmation" in u:
-                                confirmed = True
-                                break
                         if not confirmed and _poll_err is not None:
                             # The page never came back readable: we can't say
                             # the order went through, only that it was sent.
                             raise _poll_err
+                        if not confirmed:
+                            # Sent, but no confirmation screen in ~25s. Not a fill
+                            # (ok=False, never journaled) and never retried: the
+                            # wording below keeps Retry/mirror off this account.
+                            raise RuntimeError("no order confirmation appeared within 25s")
 
-                        msg = "order placed" if confirmed else "order submitted (verify manually)"
+                        msg = "order placed"
                         _trace(f"TRADE | {acct_label} | {msg}", notify=notify)
                         outs.append(AccountOutput(account_id=acct_label, ok=True, message=msg, order_id=None))
                         any_ok = True
@@ -4248,26 +4534,72 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                             _consec_errors = 0
                             continue
                         _trace(f"TRADE | {acct_label} | ERROR: {e}", notify=notify)
-                        outs.append(AccountOutput(account_id=acct_label, ok=False, message=str(e), order_id=None))
+                        # Place Order was never clicked for this account (that
+                        # case is the "verify" branch above).
+                        outs.append(AccountOutput(account_id=acct_label, ok=False,
+                                                  message=_not_sent(str(e)), order_id=None))
                         any_fail = True
                         if dry_run:
                             log_lines.append(f"[{acct_label}] ERROR: {e}")
                             log_lines.append("")
-                        # Only hard_stop on auth/browser-level failures, not per-account errors
-                        err_str = str(e).lower()
-                        if "auth" in err_str or "login" in err_str or "browser" in err_str:
-                            hard_stop = True
+                        # Auth/browser-level failures end this login's accounts
+                        # (each still gets a row). Only a browser-level one also
+                        # stops the later logins — an auth failure is this
+                        # login's own session.
+                        _stop_kind = _login_stop_kind(e)
+                        if _stop_kind:
+                            for remaining_acct in acct_list[_acct_i + 1:]:
+                                r_name = remaining_acct.get('name') or 'Account'
+                                if smart_sell and _trade_account_key(
+                                        r_name, remaining_acct['acctNum']) not in smart_targets:
+                                    continue
+                                r_label = f"{c.label} · {r_name} ({remaining_acct['acctNum']})"
+                                outs.append(AccountOutput(
+                                    account_id=r_label, ok=False,
+                                    message=f"Skipped: {c.label} stopped after an earlier account failed ({e}) — nothing was sent"))
+                            if _stop_kind == "browser":
+                                hard_stop = True
+                                hard_stop_why = f"browser failure on {c.label} ({e})"
                             break
                         _consec_errors = _consec_errors + 1 if _is_hard_error(str(e)) else 0
                         if _consec_errors >= 2:
                             _trace(f"TRADE | {c.label} | 2 consecutive errors, skipping remaining accounts", notify=notify)
                             for remaining_acct in acct_list[_acct_i + 1:]:
                                 r_label = f"{c.label} · {remaining_acct.get('name', 'Account')} ({remaining_acct['acctNum']})"
-                                outs.append(AccountOutput(account_id=r_label, ok=False, message=f"Skipped: {e}"))
+                                outs.append(AccountOutput(account_id=r_label, ok=False,
+                                                          message=_not_sent(f"Skipped: {e}")))
                             break
 
             except Exception as e:
-                outs.append(AccountOutput(account_id=c.label, ok=False, message=str(e), order_id=None))
+                # Outside every account's own try: browser start, sign-in, the
+                # ticket, the account list -- or something escaping the account
+                # loop. Never a bare login label carrying a raw error once this
+                # login reached its accounts: a Retry reads that as "trade the
+                # whole login" and re-buys accounts already filled.
+                done_ids = _done_ids()
+                todo_here = (list(_progress.get("todo") or [])
+                             if _progress.get("login") == c.label else [])
+                if not todo_here:
+                    # Its account list was never read, so no Place Order was
+                    # clicked at this login: nothing went out here.
+                    _login_fail(c.label, _not_sent(str(e)))
+                else:
+                    cur = _progress.get("current")
+                    for t in todo_here:
+                        if t in done_ids:
+                            continue
+                        if t == cur and _run_flags["clicked"] and not dry_run:
+                            # Reached but has no result: it may have clicked.
+                            outs.append(AccountOutput(
+                                account_id=t, ok=False,
+                                message=(f"{c.label} failed mid-run ({e}) — orders may have been "
+                                         "submitted — verify in Fidelity before retrying"),
+                                order_id=None))
+                        else:
+                            outs.append(AccountOutput(
+                                account_id=t, ok=False,
+                                message=_not_sent(f"Skipped: {c.label} failed before this account ({e})"),
+                                order_id=None))
                 any_fail = True
                 if dry_run:
                     log_lines.append(f"[{c.label}] ERROR: {e}")
@@ -4284,14 +4616,14 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
         else:
             state = "success" if any_ok and not any_fail else ("partial" if any_ok and any_fail else "failed")
 
-        if only_accounts and not matched_any:
+        if only_accounts and not matched_any and _all_logins_checked:
             outs.append(AccountOutput(
                 account_id="Fidelity", ok=False,
-                message=f"None of the requested accounts were found: {sorted(only_accounts)}"))
+                message=f"None of the requested accounts were found: {sorted(only_accounts)} — nothing was sent"))
             state = "failed"
 
         if smart_sell and (not any_ok) and (not any_fail) and not outs:
-            outs.append(AccountOutput(account_id="Fidelity", ok=False, message=f"Smart Sell: no matching destination accounts for {sym}"))
+            outs.append(AccountOutput(account_id="Fidelity", ok=False, message=_not_sent(f"Smart Sell: no matching destination accounts for {sym}")))
             state = "failed"
 
         msg = "Cancelled" if _is_cancelled(kwargs) else ""
@@ -4327,12 +4659,86 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
             why = (f"Fidelity timed out after {timeout_s}s before reaching the "
                    f"Place Order click; no order was sent")
         _trace(f"TRADE | {why}")
+        accounts = _timeout_rows(_progress, dry_run=dry_run, timeout_s=timeout_s, e=e,
+                                 only_accounts=only_accounts)
+        if not accounts:
+            accounts = [AccountOutput(account_id="Fidelity", ok=False, message=why)]
+        any_ok = any(a.ok for a in accounts)
         return BrokerOutput(
             broker=BROKER,
-            state="failed",
-            accounts=[AccountOutput(account_id="Fidelity", ok=False, message=why)],
+            state="partial" if any_ok else "failed",
+            accounts=accounts,
             message=why,
         )
+
+
+def _login_level_rows(login_label: str, message: str, *,
+                      only_accounts: Optional[set] = None,
+                      done: Optional[set] = None) -> List[AccountOutput]:
+    """Rows for a failure/skip that hit a whole login before (or between) accounts.
+
+    A bare login label means "the whole login" to a Retry or a mirror owed leg
+    (see the only_accounts match in execute_trade). Fine when the run traded
+    every account; when it was narrowed to some (an exit, a retry, an owed
+    leg), it must name just the requested accounts at that login that have no
+    row yet -- or nothing for a login holding none of them -- or a Retry would
+    re-trade accounts nobody asked for, filled ones included.
+    """
+    if not only_accounts:
+        return [AccountOutput(account_id=login_label, ok=False, message=message)]
+    done = set(done or ())
+    mine = sorted(str(a) for a in only_accounts
+                  if str(a) == login_label or str(a).startswith(f"{login_label} ·"))
+    return [AccountOutput(account_id=a, ok=False, message=message)
+            for a in mine if a not in done]
+
+
+def _timeout_rows(progress: Dict[str, Any], *, dry_run: bool, timeout_s: int,
+                  e: BaseException,
+                  only_accounts: Optional[set] = None) -> List[AccountOutput]:
+    """Per-account results for a trade run abandoned on timeout.
+
+    Accounts that finished keep their real results; the account whose Place
+    Order click was under way gets the "submitted ... verify" row; every other
+    account the run never reached (or reached but stopped short of the click
+    for) gets a nothing-sent "Skipped" row so it can be retried.
+    """
+    rows = list(progress.get("outs") or [])
+    done = {a.account_id for a in rows}
+    current = progress.get("current")
+    clicking = progress.get("clicking")
+    mins = max(1, int(timeout_s) // 60)
+    skipped = (f"Skipped: Fidelity run timed out after {mins} min before this "
+               "account's order — nothing was sent")
+
+    for label in list(progress.get("todo") or []):
+        if label in done:
+            continue
+        if label == current and label == clicking and not dry_run:
+            rows.append(AccountOutput(account_id=label, ok=False,
+                                      message=_submitted_unverified_msg(e)))
+        else:
+            rows.append(AccountOutput(account_id=label, ok=False, message=skipped))
+        done.add(label)
+    if clicking and clicking not in done and not dry_run:
+        # Belt and braces: a click under way always gets its verify row.
+        rows.append(AccountOutput(account_id=clicking, ok=False,
+                                  message=_submitted_unverified_msg(e)))
+        done.add(clicking)
+
+    def _login_rows(login_label: str) -> List[AccountOutput]:
+        return _login_level_rows(login_label, skipped, only_accounts=only_accounts,
+                                 done={str(a.account_id) for a in rows})
+
+    login = progress.get("login")
+    if login and not progress.get("todo") and not any(
+            str(a.account_id) == str(login) or str(a.account_id).startswith(f"{login} ·")
+            for a in rows):
+        # Timed out on this login before its account list was read.
+        rows.extend(_login_rows(login))
+    for label in list(progress.get("logins_left") or []):
+        rows.extend(_login_rows(label))
+    return rows
 
 
 def healthcheck(*args, **kwargs) -> BrokerOutput:

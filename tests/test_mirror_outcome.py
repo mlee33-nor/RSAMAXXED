@@ -34,6 +34,7 @@ import app as A
 
 class Mirror:
     _mirror_record_outcome = A.App._mirror_record_outcome
+    _mirror_owe_failed_legs = A.App._mirror_owe_failed_legs
 
     def __init__(self):
         self._mirror_failed: set = set()

@@ -14,7 +14,7 @@ Two tiers ship today:
                 the trades in your own brokerage accounts, and syncs the
                 journal back here.
 
-Mirror fan-out across ten brokers is built and running in the terminal, but is
+Mirror fan-out across nine brokers is built and running in the terminal, but is
 NOT sold as a tier — see `pricing.html`. Keeping the capability out of the
 price list is a product decision, so it lives here as a flag on `automation`
 rather than as a third plan nobody can buy.

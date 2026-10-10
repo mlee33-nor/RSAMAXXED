@@ -49,21 +49,59 @@ load_dotenv(".env", interpolate=False)
 
 import trade_journal  # noqa: E402
 
-BROKERS = ("bbae", "chase", "dspac", "fennel", "fidelity", "ibkr",
+BROKERS = ("chase", "fennel", "fidelity", "ibkr",
            "public", "robinhood", "schwab", "sofi", "wellsfargo")
 
 
-def _open_positions() -> dict[tuple[str, str, str], float]:
-    """(broker, account, symbol) -> shares the journal believes are held."""
+def _renames() -> dict[str, str]:
+    """CURRENT ticker -> the one we bought under, from the last TRACK board
+    the app saved (lifecycle_state.json). Empty when there is none -- which
+    only means a renamed play is matched under its journal name alone."""
+    try:
+        import lifecycle
+        rows = (lifecycle.load_state().get("rows") or {}).values()
+    except Exception:                             # noqa: BLE001
+        return {}
+    out: dict[str, str] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        new = str(r.get("sell_symbol") or "").upper()
+        old = str(r.get("symbol") or "").upper()
+        if new and old and new != old:
+            out[new] = old
+    return out
+
+
+def _open_positions(renames: dict[str, str] | None = None
+                    ) -> dict[tuple[str, str, str], float]:
+    """(broker, account label, symbol) -> shares the journal believes are held.
+
+    Netted per ACCOUNT NUMBER (trade_journal.account_key), not per label: a
+    buy under 'Fidelity 1 · Individual (Z1)' and its sale under 'Fidelity 1 ·
+    FinTec (Z1)' are one account, and netted on the label the buy would read
+    as still open -- and get closed -- after it was sold. The label reported is
+    the newest one the journal used for that account.
+
+    Renamed tickers are folded onto the bought-under name first (AIFA sold ->
+    AGAE bought) for the same reason. The symbol reported is the one the
+    newest BUY was journaled under, so a close lands on the rows it closes.
+    """
     net: dict[tuple[str, str, str], float] = collections.defaultdict(float)
-    for t in trade_journal.split_adjusted():
-        key = (t["broker"], t["account_id"], t["symbol"])
+    label: dict[tuple[str, str, str], str] = {}
+    traded: dict[tuple[str, str, str], str] = {}
+    rows = trade_journal.fold_renames(trade_journal.get_trades(), renames)
+    for t in trade_journal.split_adjusted(rows):
+        key = (t["broker"], trade_journal.account_key(t["account_id"]), t["symbol"])
+        label[key] = t["account_id"]
         q = float(t.get("qty") or 0)
         if t["side"] == "buy":
             net[key] += q
+            traded[key] = t.get("executed_symbol") or t["symbol"]
         else:                       # sell or close: both remove the position
             net[key] -= q
-    return {k: v for k, v in net.items() if v > 1e-9}
+    return {(b, label[(b, k, s)], traded.get((b, k, s), s)): v
+            for (b, k, s), v in net.items() if v > 1e-9}
 
 
 def _acct_keys(label: str) -> set[str]:
@@ -107,6 +145,12 @@ def _live_holdings(broker: str) -> tuple[dict[str, dict[str, float]], str]:
 
     live: dict[str, dict[str, float]] = {}
     for acct in out.accounts:
+        # A PARTIAL read lists the accounts it could not open too, ok=False
+        # and holding nothing. That empty list is not an empty account, and
+        # filing it would close every position in it. Not filed at all, the
+        # account is "one we cannot place" below and left alone.
+        if not getattr(acct, "ok", False):
+            continue
         book: dict[str, float] = {}
         for h in acct.holdings:
             sym = (h.symbol or "").upper()
@@ -133,7 +177,15 @@ def main(argv: list[str] | None = None) -> int:
     if unknown:
         sys.exit(f"unknown broker(s): {', '.join(unknown)}")
 
-    open_pos = _open_positions()
+    renames = _renames()
+    # Every ticker one play has gone by, so a position bought as AGAE is still
+    # found when the broker now lists it as AIFA.
+    aliases: dict[str, set[str]] = collections.defaultdict(set)
+    for new, old in renames.items():
+        aliases[old].update((old, new))
+        aliases[new].update((old, new))
+
+    open_pos = _open_positions(renames)
     by_broker: dict[str, list] = collections.defaultdict(list)
     for (broker, acct, sym), qty in open_pos.items():
         by_broker[broker].append((acct, sym, qty))
@@ -178,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             book = _book(acct)
             if book is None:
                 continue          # account we cannot place: leave it alone
-            if not book.get(sym):
+            if not any(book.get(s) for s in (aliases.get(sym) or {sym})):
                 gone.append((acct, sym, qty))
         print(f"{broker:12} journal says {len(mine):3} open, "
               f"broker confirms {len(mine) - len(gone):3}, "
@@ -192,17 +244,18 @@ def main(argv: list[str] | None = None) -> int:
 
     # What the closes are worth, using the same average-cost basis the
     # deployed figure uses, so the two numbers can be compared directly.
+    # Priced buys only: an unpriced one counted at $0 dilutes the average.
     buys: dict[str, dict[str, float]] = {}
-    for t in trade_journal.get_trades():
-        if t["side"] == "buy":
+    for t in trade_journal.fold_renames(trade_journal.get_trades(), renames):
+        if t["side"] == "buy" and t.get("fill_price") is not None:
             b = buys.setdefault(t["symbol"], {"qty": 0.0, "cost": 0.0})
             b["qty"] += float(t.get("qty") or 0)
-            b["cost"] += (t.get("fill_price") or 0) * float(t.get("qty") or 0)
+            b["cost"] += float(t["fill_price"]) * float(t.get("qty") or 0)
 
     freed = 0.0
     per_symbol: dict[str, float] = collections.defaultdict(float)
     for broker, acct, sym, qty in to_close:
-        b = buys.get(sym)
+        b = buys.get(renames.get(sym, sym))
         if b and b["qty"]:
             v = (b["cost"] / b["qty"]) * qty
             freed += v

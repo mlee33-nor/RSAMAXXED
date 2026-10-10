@@ -74,8 +74,8 @@ def test_roundup_engine_is_present(home):
 
 def test_mirror_fanout_is_present(home):
     assert 'id="fanout"' in home and 'id="fire"' in home
-    # Ten broker nodes, matching the ten supported brokers.
-    assert home.count('class="bnode"') == 10
+    # One broker node per broker on the plays board.
+    assert home.count('class="bnode"') == 8
 
 
 def test_static_assets_are_served_and_self_hosted(home):

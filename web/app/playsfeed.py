@@ -27,13 +27,13 @@ import os
 import re
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import Play, PlayExit, PlayLifecycle, PlayRoundUp
+from .models import UNKNOWN_KIND, Play, PlayExit, PlayLifecycle, PlayRoundUp, pick_note
 
 # How far back the page looks. Exits older than this are still in the database
 # and still in the API; they just don't belong on a screen about what to trade.
@@ -79,10 +79,11 @@ RESOLVED_STATUSES = frozenset({"rounded_up", "fractional", "cash_in_lieu", "canc
 # overstates the fractional ones by more than three times.
 FRACTIONAL_BROKERS = ("Public", "Robinhood", "SoFi")
 
-# The ten the terminal executes in, in the order the settings panel lists them.
-# Mirrors rsa_feed.SUPPORTED_BROKERS.
+# The brokers the terminal executes in, in the order the settings panel lists
+# them. Mirrors rsa_feed.SUPPORTED_BROKERS (less IBKR, which the board has no
+# account input for yet).
 SUPPORTED_BROKERS = (
-    "BBAE", "Chase", "DSPAC", "Fennel", "Fidelity",
+    "Chase", "Fennel", "Fidelity",
     "Public", "Robinhood", "Schwab", "SoFi", "Wells Fargo",
 )
 
@@ -510,7 +511,7 @@ class Board:
     def profit_basis(self) -> list[PlayLife]:
         """Confirmed round-ups we can price. These paid in EVERY account: the
         tracker says a whole share came back, and a whole share is a whole share
-        at all ten brokers."""
+        at every broker."""
         return [l for l in self.rounded_history if l.per_account_profit]
 
     @property
@@ -1009,26 +1010,133 @@ def feed_json(board: Board) -> dict:
     }
 
 
+def _post_rank(p: Play) -> tuple:
+    """Order of posts for one play: a row from an upstream MESSAGE outranks a
+    "picks:SYM:DATE" row (a copy of the desktop's picks.json, frozen at
+    whatever that copy said first -- ingest is insert-only); then the later
+    posted_at (created_at when the alert carried none); then the later row."""
+    when = p.posted_at or p.created_at
+    if when is not None and when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (not (p.source_id or "").startswith("picks:"),
+            when.timestamp() if when is not None else 0.0,
+            p.id or 0)
+
+
+def latest_per_play(lives: Iterable[PlayLife]) -> dict[tuple[str, str], PlayLife]:
+    """(alert_date, SYMBOL) -> the life whose alert is that play's LATEST post.
+
+    One play can sit in the table several times: a CONDITIONAL and the
+    STANDARD that upgraded it, a STANDARD and the CANCELLED that called it
+    off (the publisher sends that as watch-only), the message row and the
+    desktop's picks: row. Serving every row let a terminal keep whichever it
+    read first -- a stale conditional over the upgrade, or a Reg Alert over
+    the cancel."""
+    best: dict[tuple[str, str], PlayLife] = {}
+    for l in lives:
+        key = (l.play.alert_date or "", (l.play.symbol or "").upper())
+        cur = best.get(key)
+        if cur is None or _post_rank(l.play) > _post_rank(cur.play):
+            best[key] = l
+    return best
+
+
+def picks_json(board: Board) -> list[dict]:
+    """What `GET /plays/picks` returns: open plays in the desktop's picks.json
+    shape, ``{"symbol", "note", "date"}``, plus ``last_buy`` when the alert
+    named its last day to buy (the same rule as rsa_feed.to_pick), and the
+    alert's ``ratio``, ``entry_price``, ``est_profit``, ``roundup_history``
+    and ``posted_at`` (ISO) when it carried them.
+
+    The note is what a customer's mirror decides to buy on, so it fails
+    closed: only a standard play is "Reg Alert" (models.pick_note). The extra
+    keys are ignored by older terminals, and a row that lacks a value simply
+    omits that key (never null); for last_buy that is what the desktop reads as "no
+    deadline named".
+
+    One row per play, (alert_date, symbol): its latest post (latest_per_play),
+    and only while that post is itself open. A STANDARD later cancelled is
+    served as the cancel, never as the Reg Alert every customer's mirror buys.
+    """
+    out: list[dict] = []
+    latest = latest_per_play([*board.history, *board.open_plays])
+    served: set[tuple[str, str]] = set()
+    for l in board.open_plays:
+        key = (l.play.alert_date or "", (l.play.symbol or "").upper())
+        if key in served:
+            continue
+        best = latest.get(key, l)
+        if best is not l and not any(best is o for o in board.open_plays):
+            continue        # the play's latest post is closed: so is the play
+        l = best
+        served.add(key)
+        p = l.play
+        pick = {"symbol": p.symbol, "note": pick_note(p.kind), "date": p.alert_date}
+        last = (p.last_buy_date or "").strip()[:10]
+        if last:
+            pick["last_buy"] = last
+        # The alert's detail, for the terminal's Command Center. Each key is
+        # present only when the alert carried it, so a bare row (seeded from
+        # picks.json, or ingested before the publisher sent it) stays the
+        # plain three keys.
+        if (p.ratio or "").strip():
+            pick["ratio"] = p.ratio.strip()
+        if p.entry_price is not None:
+            pick["entry_price"] = p.entry_price
+        if p.est_profit is not None:
+            pick["est_profit"] = p.est_profit
+        if (p.roundup_history or "").strip():
+            pick["roundup_history"] = p.roundup_history.strip()
+        if p.posted_at is not None:
+            pick["posted_at"] = p.posted_at.isoformat()
+        out.append(pick)
+    return out
+
+
 # ---------------------------------------------------- load from the desktop file
 
+def iso_day(v) -> str | None:
+    """A YYYY-MM-DD string, or None for anything that is not one. A garbled
+    deadline must read as "none named", never as a date a client mis-parses."""
+    s = str(v or "").strip()[:10]
+    try:
+        return date.fromisoformat(s).isoformat() if len(s) == 10 else None
+    except ValueError:
+        return None
+
+
+# The picks.json notes the desktop's mirror buys (app.MIRROR_NOTES; "alert"
+# and "early access" are legacy spellings app.py normalises to "Reg Alert"),
+# plus the bare word itself.
+_STANDARD_NOTES = {"reg alert", "alert", "early access", "standard"}
+
+
 def _kind_from_note(note: str) -> str:
-    """The desktop app's pick `note` -> our `kind`. Mirrors `_rsa_note` in app.py:
-    'Reg Alert' is a standard listed alert, 'OTC' an OTC name, and a note that
-    mentions 'conditional' is watch-only."""
-    n = (note or "").lower()
+    """The desktop app's pick `note` -> our `kind`, failing closed.
+
+    Mirrors rsa_feed.from_pick: only a note the desktop's mirror itself buys is
+    standard. 'OTC' is an OTC name; a note that mentions 'conditional' (checked
+    first: "CONDITIONAL - OTC" is still watch-only) or 'unverified' (a ticker
+    lifted from loose chat, not an alert) is watch-only; and anything else —
+    blank, the desktop's "unknown alert type", a word nobody has seen — is
+    unknown, never standard. It used to fall through to standard, which
+    /plays/picks would then have served to every customer as "Reg Alert"."""
+    n = (note or "").lower().strip()
+    if n in _STANDARD_NOTES:
+        return "standard"
+    if "conditional" in n or "unverified" in n:
+        return "conditional"
     if "otc" in n:
         return "otc"
-    if "conditional" in n:
-        return "conditional"
-    return "standard"
+    return UNKNOWN_KIND
 
 
 def import_picks_file(db: Session, path: str) -> int:
     """Load the desktop app's picks.json into the play feed and return how many
     NEW alerts were added.
 
-    picks.json is a list of ``{"symbol", "note", "date"}`` — exactly what the
-    software persists. This is the same insert-only, source_id-keyed upsert as
+    picks.json is a list of ``{"symbol", "note", "date"}`` (plus ``last_buy``
+    when the alert named one) — exactly what the software persists. This is the same insert-only, source_id-keyed upsert as
     ``POST /api/v1/plays/ingest`` (see routes/api.py), so calling it on every
     startup and every page load is idempotent: re-reading the same file inserts
     nothing. Any read/parse problem is swallowed to a 0 — a malformed picks.json
@@ -1044,7 +1152,8 @@ def import_picks_file(db: Session, path: str) -> int:
     if not isinstance(data, list):
         return 0
 
-    rows: list[tuple[str, str, str, str]] = []  # (source_id, symbol, kind, date)
+    # (source_id, symbol, kind, date, last_buy_date)
+    rows: list[tuple[str, str, str, str, str | None]] = []
     for item in data:
         if not isinstance(item, dict):
             continue
@@ -1052,7 +1161,8 @@ def import_picks_file(db: Session, path: str) -> int:
         if not sym:
             continue
         d = str(item.get("date") or "").strip()[:10]
-        rows.append((f"picks:{sym}:{d}", sym, _kind_from_note(item.get("note")), d))
+        rows.append((f"picks:{sym}:{d}", sym, _kind_from_note(item.get("note")), d,
+                     iso_day(item.get("last_buy"))))
     if not rows:
         return 0
 
@@ -1080,12 +1190,13 @@ def import_picks_file(db: Session, path: str) -> int:
     ).all()}
 
     added = 0
-    for source_id, sym, kind, d in rows:
+    for source_id, sym, kind, d, last_buy in rows:
         if source_id in existing or (sym, d) in seen:
             continue
         existing.add(source_id)  # dedupe within the same file too
         seen.add((sym, d))
-        db.add(Play(source_id=source_id, symbol=sym, kind=kind, alert_date=d))
+        db.add(Play(source_id=source_id, symbol=sym, kind=kind, alert_date=d,
+                    last_buy_date=last_buy))
         added += 1
     if added:
         db.commit()

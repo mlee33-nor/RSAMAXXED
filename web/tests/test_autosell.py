@@ -733,9 +733,21 @@ def test_a_leg_that_failed_outright_is_handed_back(tmp_path, monkeypatch):
     app = _settler(tmp_path, monkeypatch)
     batch = {"exit_task": _task(), "autosell": True}
     app._exit_batch_settle(batch, [_leg("public", 21, 0),
-                                   _leg("robinhood", 0, 3)])
+                                   _leg("robinhood", 0, 3, errors=[
+                                       "Login failed: device not approved"])])
     assert _key(_task()) not in app._autosell_sold
     assert any("robinhood" in m for m in app.logs)
+
+
+def test_a_leg_that_failed_without_saying_nothing_was_sent_stays_claimed(
+        tmp_path, monkeypatch):
+    """Positive evidence only: an unexplained (or unrecognized) failure may
+    have reached the broker, so the play is not handed back to sell again."""
+    app = _settler(tmp_path, monkeypatch)
+    batch = {"exit_task": _task(), "autosell": True}
+    app._exit_batch_settle(batch, [_leg("public", 21, 0),
+                                   _leg("robinhood", 0, 3, errors=["HTTP 502"])])
+    assert _key(_task()) in app._autosell_sold
 
 
 def test_a_clean_batch_stays_sold(tmp_path, monkeypatch):

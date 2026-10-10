@@ -447,8 +447,14 @@ def _connect(ib: Any, sess: _Session, claimed: List[int],
         _trace(f"connecting to IB Gateway {gw.host}:{gw.port} (client id {cid})")
         exc: Optional[BaseException] = None
         try:
+            # raiseSyncErrors: by default ib_async only LOGS a startup sync
+            # that timed out (positions, account updates) and returns a
+            # connected IB with empty positions -- which a holdings read, or a
+            # sell sizing itself from _held, takes as "holds nothing". Raised,
+            # it is a connect failure below: nothing sent, plain wording.
             ib.connect(gw.host, gw.port, clientId=cid,
-                       timeout=CONNECT_TIMEOUT, readonly=readonly)
+                       timeout=CONNECT_TIMEOUT, readonly=readonly,
+                       raiseSyncErrors=True)
         except BaseException as e:      # noqa: BLE001 -- includes CancelledError
             exc = e
         errs = sess.errors_since(mark)
@@ -564,8 +570,20 @@ _STALLED_MSG = ("IB Gateway stopped responding — check it is logged in and not
                 "showing a dialog, then try again")
 
 
-def _session_outputs(sess: _Session) -> List[AccountOutput]:
-    """Every account's outcome, including the ones a stall left unfinished."""
+def _not_sent(msg: str) -> str:
+    """`msg` worded for the app's positive nothing-sent rule. Only for a row
+    no placeOrder stands behind."""
+    msg = str(msg or "").strip() or "IBKR failed"
+    return msg if "nothing was sent" in msg.lower() else f"{msg} — nothing was sent"
+
+
+def _session_outputs(sess: _Session, trading: bool = False) -> List[AccountOutput]:
+    """Every account's outcome, including the ones a stall left unfinished.
+
+    `trading`: the rows that provably stand for no order (an account never
+    reached, a session that never listed its accounts) say "nothing was sent",
+    which the app's hand-backs need in words."""
+    ns = _not_sent if trading else (lambda m: m)
     gw = sess.gw
     # Abandoned alone decides, not "abandoned and still running": a worker that
     # finishes after the caller gave up may have left accounts it never
@@ -589,7 +607,8 @@ def _session_outputs(sess: _Session) -> List[AccountOutput]:
                     account_id=label, ok=False,
                     message=f"{_STALLED_MSG} (nothing was sent for this account)"))
         if not todo and not outs:
-            outs.append(AccountOutput(account_id=gw.name, ok=False, message=_STALLED_MSG))
+            # Stalled before the account list: no order was placed anywhere.
+            outs.append(AccountOutput(account_id=gw.name, ok=False, message=ns(_STALLED_MSG)))
     elif fatal:
         reached = {o.account_id for o in outs}
         left = [l for l in todo if l not in reached]
@@ -597,12 +616,12 @@ def _session_outputs(sess: _Session) -> List[AccountOutput]:
             outs.append(AccountOutput(
                 account_id=label, ok=False,
                 message=(_verify("IBKR raised an error right after the order "
-                                 "went out") if label in sent else fatal)))
+                                 "went out") if label in sent else ns(fatal))))
         # The Gateway-named row means "nothing reached any account" (a Retry
         # of it trades them all), so only a run that never listed its
         # accounts may produce one. Past that, every account has a row.
         if not todo:
-            outs.append(AccountOutput(account_id=gw.name, ok=False, message=fatal))
+            outs.append(AccountOutput(account_id=gw.name, ok=False, message=ns(fatal)))
         elif not left:
             _trace(f"session ended with an error after every account had a "
                    f"result: {fatal}")
@@ -776,6 +795,45 @@ _LIVE = ("PreSubmitted", "Submitted")
 _HARD_REJECT = frozenset({200, 201, 202, 203})
 _CANCELLED = ("Cancelled", "ApiCancelled")
 
+#: The codes ib_async's wrapper.error() treats as WARNINGS (plus 2100-2199).
+#: For one of these it sets the order's status to "ValidationError" and keeps
+#: the order -- it is still live at IBKR. 399 is the everyday one: "your order
+#: will not be placed at the exchange until 09:30" on a pre-market buy.
+_IB_WARNING_CODES = frozenset({105, 110, 165, 321, 329, 399, 404, 434, 492, 10167})
+
+
+def _is_ib_warning(code: Any) -> bool:
+    try:
+        c = int(code or 0)
+    except (TypeError, ValueError):
+        return False
+    return c in _IB_WARNING_CODES or 2100 <= c < 2200
+
+
+def _effective_status(trade: Any, status: str) -> str:
+    """The status to judge an order by.
+
+    ib_async overwrites orderStatus.status with "ValidationError" whenever a
+    warning code arrives for the order, burying the PreSubmitted/Submitted
+    IBKR had already sent. Read as-is, a pre-market buy IBKR accepted ("won't
+    be placed until 09:30") waited out ORDER_WAIT and came back as "verify".
+    When every ValidationError in the log is a warning code (and none is the
+    read-only refusal), the last real status from IBKR stands -- but only if
+    it is a live one; anything else keeps ValidationError and its old path.
+    """
+    if status != "ValidationError":
+        return status
+    last_real = ""
+    for entry in list(getattr(trade, "log", None) or []):
+        st = str(getattr(entry, "status", "") or "")
+        if st == "ValidationError":
+            if not _is_ib_warning(getattr(entry, "errorCode", 0)) or \
+                    _is_read_only(str(getattr(entry, "message", "") or "")):
+                return status
+        elif st:
+            last_real = st
+    return last_real if last_real in _LIVE else status
+
 
 @dataclass
 class _Request:
@@ -948,7 +1006,8 @@ def _outcome(ib: Any, sess: _Session, trade: Any, label: str, req: _Request,
     settle_end: Optional[float] = None
     connected = True
     while True:
-        status = str(getattr(trade.orderStatus, "status", "") or "")
+        status = _effective_status(
+            trade, str(getattr(trade.orderStatus, "status", "") or ""))
         if status == "Filled":
             break
         now = time.monotonic()
@@ -970,7 +1029,7 @@ def _outcome(ib: Any, sess: _Session, trade: Any, label: str, req: _Request,
         ib.sleep(0.25)
 
     st = trade.orderStatus
-    status = str(getattr(st, "status", "") or "")
+    status = _effective_status(trade, str(getattr(st, "status", "") or ""))
     filled = _float(getattr(st, "filled", 0)) or 0.0
     avg = _float(getattr(st, "avgFillPrice", 0)) or 0.0
     order_id = getattr(order, "permId", 0) or getattr(order, "orderId", 0)
@@ -1100,7 +1159,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
         return BrokerOutput(broker=BROKER, state="failed", accounts=[],
                             message=f"Invalid qty: {qty!r}")
     if q != q.to_integral_value():
-        msg = "IBKR: fractional quantities aren't supported via the API here"
+        msg = "IBKR: fractional quantities aren't supported via the API here — nothing was sent"
         return BrokerOutput(broker=BROKER, state="failed", message=msg,
                             accounts=[AccountOutput(account_id="IBKR", ok=False,
                                                     message=msg)])
@@ -1109,7 +1168,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
     if not gws:
         return BrokerOutput(broker=BROKER, state="failed", message=_NOT_SET_UP,
                             accounts=[AccountOutput(account_id="IBKR", ok=False,
-                                                    message=_NOT_SET_UP)])
+                                                    message=_not_sent(_NOT_SET_UP))])
 
     only = ({str(a).strip() for a in only_accounts if str(a).strip()}
             if only_accounts else None)
@@ -1123,11 +1182,13 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
         whole = only is not None and gw.name in only
         if gw.problem:
             if only is None or whole:
-                outs.append(_config_failure(gw))
+                cf = _config_failure(gw)
+                cf.message = _not_sent(cf.message)
+                outs.append(cf)
                 matched = matched or whole
             continue
         sess = _run(gw, lambda ib, s, accounts: _trade_job(ib, s, accounts, req))
-        got = _session_outputs(sess)
+        got = _session_outputs(sess, trading=True)
         matched = matched or (whole and bool(got))
         outs.extend(got)
 
@@ -1137,7 +1198,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
             and all(o.ok for o in outs):
         outs.append(AccountOutput(
             account_id="IBKR", ok=False,
-            message=f"None of the requested accounts were found: {sorted(only)}"))
+            message=f"None of the requested accounts were found: {sorted(only)} — nothing was sent"))
 
     ok_ct = sum(1 for a in outs if a.ok)
     state = _state_from_counts(ok_ct, len(outs) - ok_ct)

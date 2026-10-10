@@ -1,10 +1,12 @@
 # modules/brokers/schwab/schwab.py
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
 import sys
+import threading
 import time
 import requests
 from datetime import datetime
@@ -13,6 +15,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow
 from modules.brokers.schwab.schwab_normalizer import normalize as schwab_normalize
+from modules import http_timeouts
+import broker_logins
 
 try:
     from modules import broker_logging as BLOG
@@ -189,12 +193,34 @@ def _mask_last4(s: str) -> str:
     return f"****{s[-4:]}" if len(s) >= 4 else "****"
 
 
+#: Which login the account-scoping settings are being read for, per thread
+#: (get_holdings and execute_trade can run at the same time).
+_ENV_LOGIN = threading.local()
+
+
+def _set_env_login(idx: int) -> None:
+    _ENV_LOGIN.idx = int(idx or 1)
+
+
+def _login_env(name: str) -> str:
+    """A per-login account-scoping setting.
+
+    SCHWAB_ACCOUNT_ID / SCHWAB_ACCOUNT_NUMBERS belong to login 1 only (they
+    were written when there was one login). They used to apply to EVERY
+    login, so login 2 traded login 1's account numbers -- or found none of
+    them and reported "SCHWAB_ACCOUNT_ID not found". Login N (N >= 2) reads
+    its own SCHWAB_ACCOUNT_ID_N / SCHWAB_ACCOUNT_NUMBERS_N.
+    """
+    idx = int(getattr(_ENV_LOGIN, "idx", 1) or 1)
+    return _env(name) if idx <= 1 else _env(f"{name}_{idx}")
+
+
 def _selected_account_id() -> str:
-    return _env("SCHWAB_ACCOUNT_ID")
+    return _login_env("SCHWAB_ACCOUNT_ID")
 
 
 def _purchase_accounts_filter() -> List[str]:
-    raw = _env("SCHWAB_ACCOUNT_NUMBERS")
+    raw = _login_env("SCHWAB_ACCOUNT_NUMBERS")
     return [p.strip() for p in raw.split(":") if p.strip()]
 
 
@@ -212,7 +238,9 @@ def _parse_accounts_from_env() -> List[Tuple[str, str, Optional[str]]]:
     if blob:
         parts = [p.strip() for p in blob.split(",") if p.strip()]
         for p in parts:
-            seg = p.split(":")
+            # A ':' inside the password stays in the password (a plain
+            # split(":") truncated it and sent the tail as the TOTP secret).
+            seg = broker_logins.split_fields(p, broker_logins.SCHEMAS["schwab"])
             if len(seg) < 2:
                 continue
             u = seg[0].strip()
@@ -311,6 +339,168 @@ def _load_schwab_class():
     raise RuntimeError(f"Missing dependency schwab_api: {first_err}; vendor path not found: {vendor_root}")
 
 
+def _harden_client(client: Any) -> None:
+    """Default timeouts for schwab_api's HTTP: the client's own Session and the
+    module-level requests.post its v2 order calls use. Neither passes one, so a
+    stalled socket hung the Schwab slot for good. Never raises."""
+    try:
+        http_timeouts.patch_session(getattr(client, "session", None))
+        http_timeouts.patch_module_requests(sys.modules.get("schwab_api.schwab"))
+    except Exception:
+        pass
+
+
+def _legacy_trade_tracked(client: Any, **kw: Any
+                          ) -> Tuple[Any, bool, bool, Optional[BaseException]]:
+    """client.trade(), plus whether its confirmation POST went out.
+
+    The legacy call POSTs verifyOrder, then confirmorder -- and only the
+    second places anything. Its failures look alike either side of that line
+    (a False, or an exception), so the session's post() is watched for the
+    confirmation URL. Returns (messages, success, confirm_sent, exception).
+    confirm_sent is None when there was no session post() to watch: then
+    nobody knows, and the caller must not claim nothing was sent.
+    """
+    sent = [False]
+    sess = getattr(client, "session", None)
+    orig = getattr(sess, "post", None) if sess is not None else None
+    had_own = sess is not None and "post" in getattr(sess, "__dict__", {})
+    watched = False
+    if callable(orig):
+        def _post(url: Any, *a: Any, **k: Any) -> Any:
+            if "confirmorder" in str(url).lower():
+                sent[0] = True
+            return orig(url, *a, **k)
+        try:
+            sess.post = _post
+            watched = True
+        except Exception:
+            orig = None
+    try:
+        messages, success = client.trade(**kw)
+        return messages, bool(success), (sent[0] if watched else None), None
+    except Exception as e:      # noqa: BLE001 -- the caller words it
+        return None, False, (sent[0] if watched else None), e
+    finally:
+        if callable(orig):
+            try:
+                if had_own:
+                    sess.post = orig
+                else:
+                    del sess.post
+            except Exception:
+                pass
+
+
+def _cache_user_hash(username: str) -> str:
+    """schwab_api's own fingerprint of a username (what it stores as
+    username_hash in the session cache)."""
+    return hashlib.md5((username or "").encode("utf-8")).hexdigest()
+
+
+def _cache_owner_hash(path: Path) -> Optional[str]:
+    """The username_hash stored in a session cache, or None if unreadable."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    h = data.get("username_hash") if isinstance(data, dict) else None
+    return str(h) if h else None
+
+
+def _discard_cache(path: Path) -> None:
+    """Delete a session cache and the account-id list kept beside it."""
+    for f in (Path(path), Path(path).with_name(f"{Path(path).stem}_accounts.json")):
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _keyed_cache_path(legacy: Path, username: str) -> Path:
+    """The session cache for one USERNAME, next to the positional files."""
+    return Path(legacy).parent / f"schwab_{_cache_user_hash(username)[:16]}.json"
+
+
+def _login_cache_paths(usernames: List[str]) -> List[Path]:
+    """One session cache per login, keyed by its username, not its position.
+
+    The cache used to be schwab<position>.json, and schwab_api restores the
+    cookies and Bearer token from it BEFORE it compares credential hashes --
+    and keeps them when the hashes differ (it only re-hashes and logs in
+    lazily). So re-pointing login 1 at another person, or reordering SCHWAB=
+    in .env, traded login B through login A's session.
+
+    Migration: a positional file (schwab.json, schwab<N>.json) whose stored
+    username_hash belongs to a configured login is moved to that login's
+    keyed path, so login 1 keeps its session across the upgrade. Positional
+    files are never read again, so one that belongs to no configured login
+    is LEFT where it is: that login may only be missing from .env right now,
+    and it migrates when it comes back. A move that fails (PermissionError,
+    Google Drive's WinError 5) leaves the file in place too -- the next start
+    retries -- instead of deleting a valid session.
+
+    The only file deleted is a keyed one whose readable stored owner is not
+    the login that would use that path: that is the one case where a session
+    could trade one person through another's cookies.
+    """
+    legacy = [Path(_session_cache_path(i)) for i in range(1, len(usernames) + 1)]
+    if not legacy:
+        return []
+    keyed = [_keyed_cache_path(legacy[i], u) for i, u in enumerate(usernames)]
+    by_hash = {_cache_user_hash(u): k for u, k in zip(usernames, keyed)}
+
+    candidates: List[Path] = []
+    seen = set()
+    dirs = {p.parent for p in legacy}
+    for d in dirs:
+        try:
+            found = sorted(d.glob("schwab*.json"))
+        except OSError:
+            found = []
+        for f in found:
+            if f.name.startswith("schwab_") or f.stem.endswith("_accounts"):
+                continue
+            candidates.append(f)
+    candidates += legacy + [legacy[0].parent / "schwab.json"]
+    for f in candidates:
+        key = str(f).lower()
+        if key in seen or not f.exists() or f in keyed:
+            continue
+        seen.add(key)
+        dest = by_hash.get(_cache_owner_hash(f) or "")
+        if dest is None or dest.exists():
+            continue                   # not ours to move (or already moved): left as is
+        try:
+            f.replace(dest)
+        except OSError:
+            continue                   # locked (Drive, AV): leave it, retry next start
+        acc = f.with_name(f"{f.stem}_accounts.json")
+        try:
+            if acc.exists():
+                acc.replace(dest.with_name(f"{dest.stem}_accounts.json"))
+        except OSError:
+            pass
+
+    for u, k in zip(usernames, keyed):
+        if not k.exists():
+            continue
+        try:
+            text = k.read_text(encoding="utf-8")
+        except OSError:
+            continue                   # can't read it now; never delete on a guess
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = None
+        owner = data.get("username_hash") if isinstance(data, dict) else None
+        if str(owner or "") != _cache_user_hash(u):
+            _discard_cache(k)
+    return keyed
+
+
 def _build_sessions() -> List[Dict[str, Any]]:
     global _SESSIONS
 
@@ -319,17 +509,26 @@ def _build_sessions() -> List[Dict[str, Any]]:
         _SESSIONS = []
         return _SESSIONS
 
-    if _SESSIONS and len(_SESSIONS) == len(accts):
+    # Keyed by the logins themselves, not by how many there are: editing one
+    # login's username or password used to keep trading through the old client.
+    if _SESSIONS and [(s.get("username"), s.get("password"), s.get("totp"))
+                      for s in _SESSIONS] == list(accts):
         return _SESSIONS
 
     Schwab = _load_schwab_class()
     debug = _debug()
 
     out: List[Dict[str, Any]] = []
+    cache_paths = _login_cache_paths([u for (u, _pw, _t) in accts])
     for i, (u, pw, totp) in enumerate(accts, start=1):
-        label = f"Schwab {i}" if len(accts) > 1 else "Schwab"
-        cache_path = _session_cache_path(i)
+        # Login 1 stays "Schwab" whatever else is configured: its accounts
+        # trade (and are journaled) as "Schwab (****1234)", and trades.json
+        # nets buys against sells on that exact string. Renaming it to
+        # "Schwab 1" when a second login appeared orphaned every open position.
+        label = f"Schwab {i}" if i > 1 else "Schwab"
+        cache_path = cache_paths[i - 1]
         client = Schwab(session_cache=str(cache_path), debug=debug)
+        _harden_client(client)
         out.append(
             {
                 "idx": i,
@@ -654,20 +853,33 @@ def _probe_account_info_v2(client: Any) -> Optional[dict]:
         _dump_schwab_payload("holdings_v2_no_accounts", "No account ids discovered for holdings.", label="all")
         return None
 
-    merged: Dict[int, dict] = {}
+    merged: Dict[Any, dict] = {}
+
+    def _failed(acc_id: Any, why: str) -> None:
+        # An account whose read failed is KEPT, marked, instead of skipped.
+        # Skipping it made the account vanish from an otherwise good result:
+        # no row, no failure, and the exits board read "holds nothing" for
+        # stock it really holds. get_holdings turns this into an ok=False row.
+        merged[_read_error_key(acc_id)] = {"account_id": str(acc_id), "positions": [],
+                                           _READ_ERROR: why}
 
     for acc_id in ids:
         scoped = dict(base_headers)
         scoped["schwab-client-account"] = str(acc_id)
         scoped["schwab-client-ids"] = str(acc_id)
 
-        rr = requests.get(schwab_urls.positions_v2(), headers=scoped, timeout=30)
+        try:
+            rr = requests.get(schwab_urls.positions_v2(), headers=scoped, timeout=30)
+        except Exception as e:
+            _failed(acc_id, f"{type(e).__name__}: {e}")
+            continue
         if rr.status_code != 200:
             _dump_schwab_payload(
                 f"holdings_v2_http_{rr.status_code}",
                 rr.text,
                 label=str(acc_id),
             )
+            _failed(acc_id, f"HTTP {rr.status_code}")
             continue
 
         try:
@@ -678,22 +890,43 @@ def _probe_account_info_v2(client: Any) -> Optional[dict]:
                 rr.text,
                 label=str(acc_id),
             )
+            _failed(acc_id, "the reply was not JSON")
             continue
-        except Exception:
+        except Exception as e:
+            _failed(acc_id, f"{type(e).__name__}: {e}")
             continue
 
         parsed = _parse(pp)
-        if _debug() and not parsed:
-            _dump_schwab_payload(
-                "holdings_v2_empty_scoped",
-                json.dumps(pp, ensure_ascii=False, indent=2),
-                label=str(acc_id),
-            )
+        if not parsed:
+            if _debug():
+                _dump_schwab_payload(
+                    "holdings_v2_empty_scoped",
+                    json.dumps(pp, ensure_ascii=False, indent=2),
+                    label=str(acc_id),
+                )
+            _failed(acc_id, "the reply held no account")
             continue
 
         merged.update(parsed)
 
     return merged or None
+
+
+#: Marks an account in a holdings dict whose positions could not be read.
+_READ_ERROR = "_read_error"
+
+
+def _read_error_key(acc_id: Any) -> Any:
+    """The int key _parse gives a good read of the same account."""
+    try:
+        return int(str(acc_id).replace("-", ""))
+    except Exception:
+        return str(acc_id)
+
+
+def _has_read_errors(info: Any) -> bool:
+    return isinstance(info, dict) and any(
+        isinstance(v, dict) and v.get(_READ_ERROR) for v in info.values())
 
 
 def _probe_account_info_legacy(client: Any) -> Optional[dict]:
@@ -740,11 +973,18 @@ def _ensure_authed(sess: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # A v2 read where some account failed. If nothing better turns up it is
+    # returned at the end instead of {}, so those accounts report their own
+    # failure rather than one generic "Holdings returned empty".
+    partial: Optional[dict] = None
+
     # 1) v2 probe
     try:
         info_v2 = _probe_account_info_v2(c)
         if info_v2 is not None and not _looks_stale_account_info(info_v2):
             return info_v2
+        if _has_read_errors(info_v2):
+            partial = info_v2
     except Exception as e:
         _log_exc("positions_v2", e)
 
@@ -779,6 +1019,8 @@ def _ensure_authed(sess: Dict[str, Any]) -> Dict[str, Any]:
         info_v2b = _probe_account_info_v2(c)
         if info_v2b is not None and not _looks_stale_account_info(info_v2b):
             return info_v2b
+        if _has_read_errors(info_v2b):
+            partial = info_v2b
     except Exception as e:
         _log_exc("positions_v2", e)
 
@@ -790,7 +1032,53 @@ def _ensure_authed(sess: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         _log_exc("positions_legacy", e)
 
-    return {}
+    return partial or {}
+
+
+def _account_ids_file(sess: Dict[str, Any]) -> Optional[Path]:
+    """Where this login's last good account-id list is kept, next to its
+    session cache. None for a session without one (nothing is remembered)."""
+    cache = sess.get("cache_path")
+    if not cache:
+        return None
+    p = Path(cache)
+    return p.with_name(f"{p.stem}_accounts.json")
+
+
+def _remember_account_ids(sess: Dict[str, Any], ids: List[str]) -> None:
+    path = _account_ids_file(sess)
+    if path is None or not ids:
+        return
+    try:
+        from modules import atomic
+        atomic.write_json(path, {"username": str(sess.get("username") or ""),
+                                 "account_ids": [str(i) for i in ids]})
+    except Exception:
+        pass
+
+
+def _remembered_account_ids(sess: Dict[str, Any]) -> List[str]:
+    """The account ids this login last discovered, for when discovery comes
+    back empty.
+
+    schwab_api 0.4.3 has no get_account_numbers, so without
+    SCHWAB_ACCOUNT_NUMBERS discovery IS the holdings read, and a holdings
+    outage stopped every trade with "no Schwab accounts discovered". Only for
+    the same username: a login re-pointed at someone else must never trade
+    the previous person's accounts.
+    """
+    path = _account_ids_file(sess)
+    if path is None:
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if (not isinstance(data, dict)
+            or str(data.get("username") or "") != str(sess.get("username") or "")):
+        return []
+    ids = data.get("account_ids")
+    return [str(i) for i in ids if str(i).strip()] if isinstance(ids, list) else []
 
 
 def _discover_account_ids_for_trade(client: Any) -> List[str]:
@@ -886,6 +1174,7 @@ def bootstrap(*args, **kwargs) -> BrokerOutput:
 
         for sess in sessions:
             idx = int(sess.get("idx") or 0) or 0
+            _set_env_login(idx)
             label = f"schwab_{idx}" if idx else "schwab"
             try:
                 _login_one(sess)
@@ -940,7 +1229,6 @@ def get_holdings(*args, **kwargs) -> BrokerOutput:
                 )
             )
 
-        selected = _selected_account_id().strip()
         outs: List[AccountOutput] = []
         any_ok = False
         any_fail = False
@@ -955,7 +1243,9 @@ def get_holdings(*args, **kwargs) -> BrokerOutput:
 
         for sess in sessions:
             idx = int(sess.get("idx") or 0) or 0
+            _set_env_login(idx)
             lbl = f"schwab_{idx}" if idx else "schwab"
+            selected = _selected_account_id().strip()
 
             try:
                 info = _ensure_authed(sess)
@@ -996,6 +1286,19 @@ def get_holdings(*args, **kwargs) -> BrokerOutput:
 
                 for k in keys:
                     acc = info.get(k, {}) or {}
+
+                    if acc.get(_READ_ERROR):
+                        outs.append(AccountOutput(
+                            account_id=f"{sess['label']} ({_mask_last4(str(k))} = ?)",
+                            ok=False,
+                            message=(f"Schwab holdings read failed: {acc.get(_READ_ERROR)} "
+                                     f"— holdings unknown"),
+                            holdings=[],
+                            extra={"session_idx": idx,
+                                   "account_last4": str(k)[-4:] if str(k) else "----"},
+                        ))
+                        any_fail = True
+                        continue
 
                     acc_value = _to_float(acc.get("account_value"))
                     acct_line = f"{_mask_last4(str(k))} = ${acc_value:.2f}" if acc_value is not None else f"{_mask_last4(str(k))} = ?"
@@ -1178,6 +1481,10 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                 raise ValueError()
         except Exception:
             return schwab_normalize(BrokerOutput(broker=BROKER, state="failed", accounts=[], message=f"Invalid qty: {qty!r}"))
+        # schwab_api sends str(qty), and str(1.0) is "1.0". A whole number goes
+        # out as an int, "1".
+        if q.is_integer():
+            q = int(q)
 
         error_messages = {
             "One share buy orders for this security must be phoned into a representative.": "Order failed: One share buy orders must be phoned in.",
@@ -1189,9 +1496,13 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
         any_ok = False
         any_fail = False
         _acct_i = 0
+        # Set before any call that can place an order (the legacy fallback,
+        # the live trade_v2). The except at the bottom reads it.
+        live_called = [False]
 
         for sess in sessions:
             idx = int(sess.get("idx") or 0) or 0
+            _set_env_login(idx)
             lbl = f"schwab_{idx}" if idx else "schwab"
             client = sess["client"]
 
@@ -1203,8 +1514,14 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                     pass
 
             account_ids = _discover_account_ids_for_trade(client)
+            if account_ids:
+                _remember_account_ids(sess, account_ids)
+            else:
+                account_ids = _remembered_account_ids(sess)
             if not account_ids:
-                outs.append(AccountOutput(account_id=sess["label"], ok=False, message="Unauthorized / no Schwab accounts discovered"))
+                outs.append(AccountOutput(
+                    account_id=sess["label"], ok=False,
+                    message="Unauthorized / no Schwab accounts discovered — nothing was sent"))
                 any_fail = True
                 continue
 
@@ -1249,9 +1566,11 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         known = any(err in str(m) for m in (pre_msgs or [])
                                     for err in error_messages)
                         if known:
+                            # The verification-only pass: no order exists.
                             outs.append(AccountOutput(
                                 account_id=acct_label, ok=False,
-                                message=_schwab_friendly_error(pre_msgs, error_messages)))
+                                message=(_schwab_friendly_error(pre_msgs, error_messages)
+                                         + " — nothing was sent")))
                             any_fail = True
                             continue
                         # v2's verification refused for a reason Schwab didn't
@@ -1260,23 +1579,33 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                         # safe here and places at most one order — the fallback
                         # this module always had, just moved ahead of the live
                         # v2 call where it can no longer double up.
-                        try:
-                            messages2, success2 = client.trade(
-                                ticker=sym,
-                                side=side_cap,
-                                qty=q,
-                                account_id=acc_id,
-                                dry_run=False,
-                            )
-                        except Exception as e:
+                        # Its confirmation POST is the one that places the
+                        # order; a failure after it went out may be a live
+                        # order and says so (see _legacy_trade_tracked).
+                        live_called[0] = True
+                        messages2, success2, confirm_sent, e = _legacy_trade_tracked(
+                            client,
+                            ticker=sym,
+                            side=side_cap,
+                            qty=q,
+                            account_id=acc_id,
+                            dry_run=False,
+                        )
+                        if e is not None:
                             if BLOG is not None:
                                 try:
                                     BLOG.log_exception(ctx, broker=BROKER, action="trade", label=lbl, exc=e, secrets=None)
                                 except Exception:
                                     pass
-                            outs.append(AccountOutput(
-                                account_id=acct_label, ok=False,
-                                message=f"Schwab order failed: {e}"))
+                            if confirm_sent:
+                                text = ("Schwab raised an error after the order may have been "
+                                        f"submitted — verify in Schwab before retrying: {e}")
+                            elif confirm_sent is False:
+                                # Watched: the confirmation POST never went out.
+                                text = f"Schwab order failed before it was confirmed: {e} — nothing was sent"
+                            else:
+                                text = f"Schwab order failed: {e}"
+                            outs.append(AccountOutput(account_id=acct_label, ok=False, message=text))
                             any_fail = True
                             continue
                         if success2:
@@ -1284,11 +1613,20 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                             any_ok = True
                         else:
                             text = "\n".join(str(m) for m in (messages2 or [])) if messages2 else "Order failed"
+                            if confirm_sent:
+                                text = ("Schwab returned an error after the order may have been "
+                                        f"submitted — verify in Schwab before retrying: {text}")
+                            elif confirm_sent is False:
+                                # verifyOrder refused (or answered non-200):
+                                # confirmorder, the only POST that places, never ran.
+                                text = f"{text} — nothing was sent"
                             outs.append(AccountOutput(account_id=acct_label, ok=False, message=text))
                             any_fail = True
                         continue
 
                 try:
+                    if not dry_run:
+                        live_called[0] = True
                     messages, success = client.trade_v2(
                         ticker=sym,
                         side=side_cap,
@@ -1371,11 +1709,21 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
                 BLOG.log_exception(ctx, broker=BROKER, action="trade", label="schwab", exc=e, secrets=None)
             except Exception:
                 pass
+        # Outside every account's own try (a session refresh, discovery for a
+        # later login): keep the rows already written -- an order may stand
+        # behind them -- and say nothing-sent only if no live call was made.
+        done = list(locals().get("outs") or [])
+        if (locals().get("live_called") or [False])[0]:
+            row = (f"Schwab failed partway through ({e}) — earlier orders may have been "
+                   f"submitted; verify in Schwab before retrying")
+        else:
+            row = f"{e} — nothing was sent"
+        done.append(AccountOutput(account_id="Schwab", ok=False, message=row))
         return schwab_normalize(
             BrokerOutput(
                 broker=BROKER,
-                state="failed",
-                accounts=[AccountOutput(account_id="Schwab", ok=False, message=str(e))],
+                state="partial" if any(a.ok for a in done) else "failed",
+                accounts=done,
                 message=str(e),
             )
         )

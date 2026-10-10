@@ -59,8 +59,9 @@ class FakeIB:
         world.instances.append(self)
 
     # -- connection
-    def connect(self, host, port, clientId, timeout, readonly):
+    def connect(self, host, port, clientId, timeout, readonly, raiseSyncErrors=False):
         self.w.connects.append((host, port, clientId, readonly))
+        self.w.raise_sync.append(raiseSyncErrors)
         script = self.w.connect_script.pop(0) if self.w.connect_script else None
         if script:
             for err in script.get("errors", ()):
@@ -175,7 +176,7 @@ def world(monkeypatch, tmp_path):
     w = SimpleNamespace(
         accounts=["DU1234567"], positions={}, connect_script=[], connects=[],
         disconnects=0, placed=[], what_ifs=[], trades=[], instances=[],
-        unknown_symbol=False, on_place=None, on_sleep=None)
+        unknown_symbol=False, on_place=None, on_sleep=None, raise_sync=[])
     monkeypatch.setattr(ibkr, "_new_ib", lambda: FakeIB(w))
     monkeypatch.setattr(ibkr, "_root_dir", lambda: tmp_path)
     monkeypatch.setattr(ibkr, "ORDER_WAIT", 0.3)
@@ -204,7 +205,7 @@ def test_gateway_not_running_says_exactly_what_to_do(world):
     assert out.state == "failed"
     msg = out.accounts[0].message
     assert msg == ("IB Gateway isn't running or the API is off — open IB Gateway, "
-                   "log in, and enable the API (port 4002)")
+                   "log in, and enable the API (port 4002) — nothing was sent")
     assert not _forbidden(msg)
     assert world.placed == []
 
@@ -359,7 +360,7 @@ def test_fractional_quantity_is_refused_before_connecting(world):
     out = buy(qty="1.5")
     assert out.state == "failed"
     assert out.accounts[0].message == ("IBKR: fractional quantities aren't "
-                                       "supported via the API here")
+                                       "supported via the API here — nothing was sent")
     assert world.connects == []
 
 
@@ -733,3 +734,53 @@ def test_labels_unmask_only_as_far_as_needed():
     labels = ibkr._labels(gw, ["U1111234", "U1121234", "U9995678"])
     assert labels == {"U1111234": "U****11234", "U1121234": "U****21234",
                       "U9995678": "U****5678"}
+
+
+# ------------------------------------------------- warnings and startup sync
+
+def test_a_warning_after_presubmitted_is_still_placed(world):
+    # 399 "won't be placed at the exchange until 09:30": ib_async turns the
+    # status into ValidationError, but IBKR already had it PreSubmitted. It
+    # used to wait out ORDER_WAIT and come back "verify".
+    def on_place(ib, trade):
+        ib_status(trade, "PreSubmitted")
+        ib_error(ib, trade, 399, "Order Message: BUY 1 ABCD ... will not be "
+                                 "placed at the exchange until 09:30")
+    world.on_place = on_place
+    out = buy()
+    acct = out.accounts[0]
+    assert acct.ok and "PreSubmitted" in acct.message, acct.message
+    assert len(world.placed) == 1
+
+
+def test_a_warning_before_any_status_from_ibkr_still_says_verify(world):
+    world.on_place = lambda ib, trade: ib_error(ib, trade, 399, "Order Message")
+    out = buy()
+    acct = out.accounts[0]
+    assert not acct.ok
+    assert A._account_order_may_exist({"ok": False, "message": acct.message})
+
+
+def test_a_non_warning_validation_error_is_not_promoted(world):
+    def on_place(ib, trade):
+        ib_status(trade, "PreSubmitted")
+        trade.orderStatus.status = "ValidationError"
+        trade.log.append(SimpleNamespace(status="ValidationError",
+                                         message="Error 999: odd", errorCode=999))
+    world.on_place = on_place
+    assert not buy().accounts[0].ok
+
+
+def test_every_connect_raises_startup_sync_errors(world):
+    ibkr.get_holdings()
+    world.on_place = fill_at(2.0)
+    buy()
+    assert world.raise_sync and all(world.raise_sync)
+
+
+def test_a_startup_sync_timeout_is_a_failed_read_not_empty_holdings(world):
+    world.connect_script = [{"raise": ConnectionError(["positions request timed out"])}]
+    out = ibkr.get_holdings()
+    assert out.state == "failed"
+    assert not any(a.ok for a in out.accounts)
+    assert all(not a.holdings for a in out.accounts)

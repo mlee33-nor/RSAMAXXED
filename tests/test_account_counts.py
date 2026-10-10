@@ -278,4 +278,4 @@ def test_neither_mono_font_changes_nothing(mono_state):
 # ------------------------------------------------------------------ version
 
 def test_the_release_is_versioned():
-    assert A.APP_VERSION == "1.0.0"
+    assert A.APP_VERSION == "1.0.1"

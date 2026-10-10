@@ -47,7 +47,7 @@ from rsa_feed import LifecycleRow
 
 __all__ = [
     "STATE_FILE", "Transition", "SellTask",
-    "load_state", "save_state", "apply", "diff",
+    "load_state", "saved_renames", "save_state", "apply", "diff",
     "brokers_for", "held_accounts", "sell_worklist", "fetch", "pull", "app_key",
     "BrokerLeg", "ResolvedExit", "resolve", "qty_text",
 ]
@@ -71,9 +71,11 @@ def load_state(path: Optional[Path] = None) -> dict[str, Any]:
     reported as first-seen rather than as a change.
     """
     p = path or STATE_FILE
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    # BOM-tolerant, and a file that exists but will not read is kept and never
+    # saved over (atomic.load_state): it is the only record of every rename the
+    # board has shown, and "empty board, then save" threw that history away.
+    data = atomic.load_state(p, None)
+    if data is None:
         return {"rows": {}, "last_pull": ""}
     if not isinstance(data, dict):
         return {"rows": {}, "last_pull": ""}
@@ -82,15 +84,56 @@ def load_state(path: Optional[Path] = None) -> dict[str, Any]:
     return data
 
 
+def saved_renames(path: Optional[Path] = None) -> dict[str, str]:
+    """CURRENT ticker -> the one we bought under, from the last board we saw.
+
+    The sell side nets the journal (which knows AGAE) against exits (which say
+    AIFA) through this map. In memory it comes from the board pulled this
+    session; before that pull lands, or when it fails, the stored board is the
+    only thing that still knows the two names are one position.
+    """
+    p = Path(path or STATE_FILE)
+    try:
+        st = p.stat()
+        stamp = (str(p), st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    if stamp is not None and _renames_cache.get("stamp") == stamp:
+        return dict(_renames_cache["map"])
+    out: dict[str, str] = {}
+    state = load_state(p)
+    # A read that failed (a transient lock) came back as an empty board. Not
+    # cached: keyed on an unchanged file it would serve {} -- every rename
+    # forgotten -- until the file next changed, long after the lock lifted.
+    failed = atomic.is_unreadable(p)
+    prev = _renames_cache.get("stamp")
+    if failed and prev and prev[0] == str(p):
+        # The last map this file DID give is a better answer than none.
+        return dict(_renames_cache["map"])
+    for row in (state.get("rows") or {}).values():
+        if not isinstance(row, dict):
+            continue
+        new_sym = str(row.get("sell_symbol") or "").upper().strip()
+        old_sym = str(row.get("symbol") or "").upper().strip()
+        if new_sym and old_sym and new_sym != old_sym:
+            out[new_sym] = old_sym
+    if stamp is not None and not failed:
+        _renames_cache.update(stamp=stamp, map=dict(out))
+    return out
+
+
+#: saved_renames, keyed on the state file's (path, mtime, size). The sell side
+#: asks for it once per leg per render; parsing ~70KB each time is waste.
+_renames_cache: dict[str, Any] = {"stamp": None, "map": {}}
+
+
 def save_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
     """Write atomically — a crash mid-write must not cost us the board history."""
     p = path or STATE_FILE
     try:
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        atomic.replace(tmp, p)
+        atomic.write_json(p, state)
     except OSError:
-        pass
+        pass                    # incl. StateUnreadable -- see load_state
 
 
 # ----------------------------------------------------------------- transitions
@@ -257,7 +300,8 @@ class SellTask:
         return f"{name} [{self.status}] {self.accounts} acct(s) at {where}"
 
 
-def held_accounts(trades: Optional[Iterable[dict]] = None) -> dict[str, dict[str, int]]:
+def held_accounts(trades: Optional[Iterable[dict]] = None,
+                  renames: Optional[dict[str, str]] = None) -> dict[str, dict[str, int]]:
     """SYMBOL -> {broker: open account count}, from the trade journal.
 
     An account counts as open when its net (buys - sells) for that symbol is
@@ -272,17 +316,32 @@ def held_accounts(trades: Optional[Iterable[dict]] = None) -> dict[str, dict[str
     1.0 - 0.1 = 0.9 against the raw journal and reads as OPEN — which is exactly
     how the worklist ends up offering to sell the same position a second time,
     the one thing this function promises not to do.
+
+    `renames` (CURRENT ticker -> bought-under) is folded in FIRST, so a
+    renamed play nets as one position filed under the name it was bought as:
+    a remnant sold as AIFA restates against the AGAE buy instead of leaving
+    AGAE open forever. None means the stored board's renames.
     """
+    if renames is None:
+        try:
+            renames = saved_renames()
+        except Exception:
+            renames = {}
     # Adjusted whichever way the rows arrived, so a caller that hands us a raw
     # journal slice cannot reintroduce the bug by the back door.
-    rows = trade_journal.split_adjusted(trades)
+    base = trade_journal.get_trades() if trades is None else list(trades)
+    rows = trade_journal.split_adjusted(trade_journal.fold_renames(base, renames))
     net: dict[tuple[str, str, str], float] = {}
     for t in rows:
         sym = str(t.get("symbol") or "").upper()
         if not sym:
             continue
         broker = rsa_feed.normalize_broker(str(t.get("broker") or ""))
-        acct = str(t.get("account_id") or "")
+        # Per account NUMBER, not label: a buy under 'Fidelity 1 · Individual
+        # (Z1)' and its sell under 'Fidelity 1 · FinTec (Z1)' are one account,
+        # and netted on the label they left a phantom open account to sell.
+        acct = trade_journal.account_key(trade_journal.canonical_account(
+            t.get("broker"), t.get("account_id")))
         try:
             qty = float(t.get("qty") or 0)
         except (TypeError, ValueError):
@@ -315,7 +374,17 @@ def sell_worklist(rows: Sequence[LifecycleRow],
     Rows we hold nowhere are dropped unless `include_unheld`, which the UI uses
     to show the board in full rather than only our own positions.
     """
-    held = held if held is not None else held_accounts()
+    if held is None:
+        # This board's own renames on top of the stored ones: the rows in hand
+        # are the newest word on which tickers are one play.
+        renames = {}
+        try:
+            renames.update(saved_renames())
+        except Exception:
+            pass
+        renames.update({r.sell_symbol.upper(): r.symbol.upper()
+                        for r in rows if getattr(r, "renamed", False)})
+        held = held_accounts(renames=renames)
     out: list[SellTask] = []
 
     for row in rows:
@@ -362,7 +431,7 @@ def sell_worklist(rows: Sequence[LifecycleRow],
 #
 # `execute_trade(side, qty, symbol)` has no account parameter — every broker
 # module fans one quantity out to all of its own accounts. Per-account sizing
-# would mean changing all ten modules.
+# would mean changing every broker module.
 #
 # That is acceptable here, and not by luck: RSA buys exactly one share in every
 # account, so a 1-for-N split leaves every account at that broker holding the

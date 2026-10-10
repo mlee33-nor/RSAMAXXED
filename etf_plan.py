@@ -90,8 +90,6 @@ BROKER_CAPABILITY: Dict[str, Capability] = {
     "ibkr":       Capability.WHOLE_ONLY,    # ibkr.py execute_trade refuses fractions
     "schwab":     Capability.UNVERIFIED,
     "fennel":     Capability.UNVERIFIED,
-    "bbae":       Capability.UNVERIFIED,
-    "dspac":      Capability.UNVERIFIED,
 }
 
 #: Decimal places a fractional order is rounded to. Broker APIs take the

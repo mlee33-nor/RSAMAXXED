@@ -19,6 +19,7 @@ import sys
 import broker_logins
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow, find_browser_executable, cleanup_orphaned_chrome
 from modules import quiet
+from modules import proc
 from modules._2fa_prompt import universal_2fa_prompt
 from modules import broker_logging as BLOG
 
@@ -128,6 +129,9 @@ def _flatten_safe(obj: Any, *, prefix: str = "", max_items: int = 120) -> Dict[s
 SIGNON_URL = "https://www.wellsfargoadvisors.com/online-access/signon.htm"
 BROKOVERVIEW_HINT = "brokoverview"
 HOLDINGS_URL_TMPL = "https://wfawellstrade.wellsfargo.com/BW/holdings.do?account={account_index}"
+
+#: Per-account cap on loading the trade ticket (page.get), like Fidelity's _nav.
+_TRADE_NAV_TIMEOUT_S = 60.0
 
 
 # =============================================================================
@@ -304,6 +308,10 @@ def _notify_terminal() -> NotifyFn:
 # Async runner
 # =============================================================================
 
+class _WorkerCancelled(RuntimeError):
+    """The worker's coroutine was cancelled (asyncio.CancelledError) mid-run."""
+
+
 def _run_coro(coro_factory: Callable[[], Coroutine[Any, Any, Any]], *, timeout_s: int = 900):
     # ALWAYS run the coroutine in a dedicated worker thread (with its own event
     # loop) and enforce timeout_s via t.join(). Do NOT take an "asyncio.run()
@@ -327,6 +335,12 @@ def _run_coro(coro_factory: Callable[[], Coroutine[Any, Any, Any]], *, timeout_s
         try:
             res = loop.run_until_complete(coro_factory())
             q.put((True, res))
+        except asyncio.CancelledError:
+            # A BaseException: without this the thread died with nothing in
+            # the queue and the caller reported a "timed out after Ns" that
+            # never happened (the join returned at once).
+            q.put((False, _WorkerCancelled(
+                "Wells Fargo operation was cancelled inside its worker before it finished")))
         except Exception as e:
             q.put((False, e))
         finally:
@@ -340,6 +354,8 @@ def _run_coro(coro_factory: Callable[[], Coroutine[Any, Any, Any]], *, timeout_s
     t.join(timeout_s)
 
     if q.empty():
+        if not t.is_alive():
+            raise _WorkerCancelled("Wells Fargo worker ended without a result")
         raise TimeoutError(f"Wells Fargo operation timed out after {timeout_s}s")
 
     ok, payload = q.get()
@@ -364,14 +380,28 @@ def _clean_chrome_singletons(profile_dir: Path) -> None:
         except Exception:
             pass
 
-def _is_pid_alive(pid: int) -> bool:
-    """Check if a process with the given PID is still running."""
-    try:
-        import signal
-        os.kill(pid, 0)
+def _lock_owner_alive(pid: int, since: Optional[float] = None) -> Optional[bool]:
+    """Is the process named in the profile lock alive? True / False / None (unknown).
+
+    Never ``os.kill(pid, 0)``: on Windows that is CTRL_C_EVENT, and with no
+    console (pythonw) CPython falls through to TerminateProcess -- the probe
+    killed the owner, which after a _run_coro timeout is this app itself. Our
+    own pid means an abandoned thread of this app holds it: busy, not probed.
+    """
+    if int(pid) == os.getpid():
         return True
-    except (OSError, ProcessLookupError):
+    alive = proc.pid_alive(int(pid))
+    # `since` is the lock file's mtime: a live process that started after
+    # it is a recycled pid (crash + reboot), not the lock's owner.
+    if alive and since is not None and proc.started_after(int(pid), since):
         return False
+    return alive
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process with the given PID is still running (unknown counts as alive)."""
+    return _lock_owner_alive(pid) is not False
+
 
 def _acquire_profile_lock(timeout_s: int = 60, poll_s: float = 0.25, stale_s: int = 120) -> Path:
     lock = _lock_file()
@@ -381,20 +411,34 @@ def _acquire_profile_lock(timeout_s: int = 60, poll_s: float = 0.25, stale_s: in
     while time.time() < deadline:
         try:
             if lock.exists():
-                # Check if owning PID is still alive
+                pid_text = ""
                 try:
                     pid_text = lock.read_text().strip()
-                    if pid_text.isdigit() and not _is_pid_alive(int(pid_text)):
-                        lock.unlink()
                 except Exception:
-                    pass
-                # Fall back to age-based staleness
-                try:
-                    age = time.time() - lock.stat().st_mtime
-                    if age > stale_s:
+                    pid_text = ""
+                alive: Optional[bool] = None
+                if pid_text.isdigit():
+                    try:
+                        alive = _lock_owner_alive(int(pid_text), lock.stat().st_mtime)
+                    except Exception:
+                        alive = None
+                if alive is False:
+                    # Owner is gone: take over (its Chrome is reaped by the
+                    # cleanup_orphaned_chrome() that runs once we hold it).
+                    try:
                         lock.unlink()
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+                elif alive is None:
+                    # Age-based staleness only when the owner cannot be told.
+                    # A live owner is a browser mid-run on this profile; taking
+                    # its lock put a second Chrome on the profile mid-order.
+                    try:
+                        age = time.time() - lock.stat().st_mtime
+                        if age > stale_s:
+                            lock.unlink()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -408,7 +452,7 @@ def _acquire_profile_lock(timeout_s: int = 60, poll_s: float = 0.25, stale_s: in
         except FileExistsError:
             time.sleep(poll_s)
 
-    raise RuntimeError("Wells Fargo profile is busy (another browser is running). Try again.")
+    raise RuntimeError("Wells Fargo profile is busy (another browser is running) — nothing was sent. Try again.")
 
 
 def _release_profile_lock(lock: Path) -> None:
@@ -487,9 +531,15 @@ async def _start_browser(*, headless: Optional[bool] = None):
     use_headless = _headless() if headless is None else bool(headless)
 
     profile = _profile_dir()
-    # Kill any orphaned Chrome still using this profile
-    cleanup_orphaned_chrome(profile)
+    # Lock first, THEN reap orphans: the other way round killed the Chrome of
+    # a run still holding the lock (an abandoned attempt mid-order) before we
+    # had even waited for it.
     lock = _acquire_profile_lock(timeout_s=60)
+    try:
+        # Kill any orphaned Chrome still using this profile
+        cleanup_orphaned_chrome(profile)
+    except Exception:
+        pass
 
     browser_args: List[str] = ["--no-sandbox"]
     if use_headless:
@@ -842,6 +892,7 @@ async def _fetch_holdings_for_account(page, acct: Dict[str, Any], *, notify: Opt
     holding_rows = soup.select("tbody > tr.level1")
 
     rows: List[HoldingRow] = []
+    unreadable = 0
     for r in holding_rows:
         sym_el = r.select_one("a.navlink.quickquote")
         if not sym_el:
@@ -866,6 +917,8 @@ async def _fetch_holdings_for_account(page, acct: Dict[str, Any], *, notify: Opt
                 except Exception:
                     px = None
 
+        if symbol and qty is None:
+            unreadable += 1
         if symbol and qty and qty > 0:
             # minimal extras for discovery (no raw HTML, no x-param, no account ids)
             hextra: Dict[str, Any] = {
@@ -879,7 +932,36 @@ async def _fetch_holdings_for_account(page, acct: Dict[str, Any], *, notify: Opt
 
             rows.append(HoldingRow(symbol=symbol, shares=qty, price=px, extra=hextra))
 
+    if not rows and not _holdings_page_loaded(soup):
+        # No rows AND no holdings table: the page never arrived (sign-on
+        # bounce, interstitial, slow render). "Holds nothing" would be a lie
+        # the exits board and auto-sell would act on.
+        raise _HoldingsNotLoaded("holdings page did not load")
+    if unreadable:
+        # A position row whose share count can't be read: dropping it would
+        # say "not held" and auto-sell would skip it. Unknown, not empty.
+        raise _HoldingsNotLoaded(
+            f"holdings page did not load: {unreadable} position row(s) had no readable quantity")
+
     return rows
+
+
+class _HoldingsNotLoaded(RuntimeError):
+    """The holdings page for one account never rendered its table."""
+
+
+def _holdings_page_loaded(soup) -> bool:
+    """Is this really a rendered holdings page (possibly with zero positions)?"""
+    if soup.select("tbody > tr.level1"):
+        return True
+    for table in soup.select("table"):
+        head = " ".join(th.get_text(" ", strip=True) for th in table.select("th")).lower()
+        if "symbol" in head and ("quantity" in head or "qty" in head):
+            return True
+    text = soup.get_text(" ", strip=True).lower()
+    return any(p in text for p in (
+        "no holdings", "no positions", "you have no", "does not have any",
+        "do not have any", "no securities"))
 
 
 # =============================================================================
@@ -928,6 +1010,9 @@ def _build_ctx(kwargs: Dict[str, Any]) -> Dict[str, Any]:
         # Optional: trade only these accounts (a retry of the ones that failed).
         # Empty/absent means every account, which is the normal path.
         "only_accounts": list(kwargs.get("only_accounts") or []),
+        # Which login this run is (broker_logins.fan_out): a request naming
+        # this login's own failure row means all of this login's accounts.
+        "login_idx": broker_logins.active_idx(BROKER),
 
         "_write_dry_run_log": _write_dry_run_log,
 
@@ -1159,9 +1244,16 @@ async def _cmd_positions(ctx) -> BrokerOutput:
         for acct in accts:
             if _is_cancelled_ctx(ctx):
                 break
-            rows = await ctx["_fetch_holdings_for_account"](page, acct, notify=notify)
             total = acct.get("balance")
             label = f"{acct['account_id']} = ${total:.2f}" if total is not None else f"{acct['account_id']} = ?"
+            try:
+                rows = await ctx["_fetch_holdings_for_account"](page, acct, notify=notify)
+            except _HoldingsNotLoaded as e:
+                # Unknown, not empty: this account's positions were never seen.
+                outputs.append(AccountOutput(account_id=label, ok=False, message=str(e),
+                                             extra={"mask": acct.get("mask"), "balance": total}))
+                broker_extra["accounts_failed"] = int(broker_extra["accounts_failed"]) + 1
+                continue
 
             acct_extra: Dict[str, Any] = {
                 "mask": acct.get("mask"),
@@ -1186,7 +1278,11 @@ async def _cmd_positions(ctx) -> BrokerOutput:
             state = "partial" if any(a.ok for a in outputs) else "failed"
             return BrokerOutput(broker=BROKER, state=state, accounts=outputs, message="Cancelled", extra=broker_extra)
 
-        return BrokerOutput(broker=BROKER, state="success", accounts=outputs, message="", extra=broker_extra)
+        ok_ct = sum(1 for a in outputs if a.ok)
+        state = "success" if ok_ct == len(outputs) else ("partial" if ok_ct else "failed")
+        return BrokerOutput(broker=BROKER, state=state, accounts=outputs,
+                            message="" if state == "success" else "holdings page did not load for some accounts",
+                            extra=broker_extra)
 
     except Exception as e:
         try:
@@ -1242,11 +1338,35 @@ def _norm_dd(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
-async def _dropdown_shows(page, opener_selector: str, option_value: str) -> bool:
+#: Filler words an opener button label may carry around the chosen value.
+_DD_FILLER = {"action", "select", "order", "selected"}
+
+
+def _label_is_exactly(label: str, option_value: str) -> bool:
+    """The opener label shows option_value and nothing else.
+
+    For the side of the order: "Sell Short" contains "Sell" (and the token
+    fallback in _dropdown_shows matches it), and a short sale is a different
+    order, not a near miss. NEEDS LIVE VERIFICATION: WF's #BuySellBtn label.
+    """
+    want = _norm_dd(option_value)
+    if not want:
+        return False
+    if _norm_dd(label) == want:
+        return True
+    have_words = [w for w in re.split(r"[^a-z0-9]+", (label or "").lower())
+                  if w and w not in _DD_FILLER]
+    want_words = [w for w in re.split(r"[^a-z0-9]+", option_value.lower()) if w]
+    return bool(have_words) and have_words == want_words
+
+
+async def _dropdown_shows(page, opener_selector: str, option_value: str, *,
+                          exact: bool = False) -> bool:
     """True if the dropdown's button label reflects option_value, i.e. WF's
     handleCustomSelectClick actually registered the selection. These custom
     selects display the chosen option's label in the opener button (#BuySellBtn /
-    #OrderTypeBtn / #TIFBtn)."""
+    #OrderTypeBtn / #TIFBtn). exact=True (the order side) accepts only the
+    value itself -- no substring or token match."""
     try:
         opener = await page.select(opener_selector, timeout=2.0)
     except Exception:
@@ -1255,6 +1375,8 @@ async def _dropdown_shows(page, opener_selector: str, option_value: str) -> bool
         txt = getattr(opener, "text_all", "") or ""
     except Exception:
         txt = ""
+    if exact:
+        return _label_is_exactly(txt, option_value)
     want = _norm_dd(option_value)          # "Good til Cancel" -> "goodtilcancel"
     have = _norm_dd(txt)                    # button "Good 'Til Cancel" -> "goodtilcancel"
     if not want or not have:
@@ -1268,7 +1390,8 @@ async def _dropdown_shows(page, opener_selector: str, option_value: str) -> bool
     return any(t in have for t in tokens)
 
 
-async def _select_dropdown_option(page, dropdown_opener_selector: str, option_value: str, *, timeout_s: float = 10.0) -> None:
+async def _select_dropdown_option(page, dropdown_opener_selector: str, option_value: str, *,
+                                  timeout_s: float = 10.0, require: bool = False) -> None:
     # WF's Buy/Sell / OrderType / TIF controls are custom selects (an opener button
     # + an <a data-val='...' data-toggle='handleCustomSelectClick'> menu list).
     # Two failure modes we have to defend against:
@@ -1290,7 +1413,7 @@ async def _select_dropdown_option(page, dropdown_opener_selector: str, option_va
 
     for _attempt in range(5):
         # Already selected (e.g. Day is the default, or a prior attempt took)?
-        if await _dropdown_shows(page, dropdown_opener_selector, option_value):
+        if await _dropdown_shows(page, dropdown_opener_selector, option_value, exact=require):
             return
         try:
             opener = await page.select(dropdown_opener_selector, timeout=timeout_s)
@@ -1336,7 +1459,7 @@ async def _select_dropdown_option(page, dropdown_opener_selector: str, option_va
 
         # Let handleCustomSelectClick settle, then verify it registered.
         await page.sleep(0.4)
-        if await _dropdown_shows(page, dropdown_opener_selector, option_value):
+        if await _dropdown_shows(page, dropdown_opener_selector, option_value, exact=require):
             return
         await page.sleep(0.4)
 
@@ -1350,7 +1473,14 @@ async def _select_dropdown_option(page, dropdown_opener_selector: str, option_va
     except Exception as e:
         last_exc = e
 
-    if not await _dropdown_shows(page, dropdown_opener_selector, option_value) and last_exc is not None:
+    shown = await _dropdown_shows(page, dropdown_opener_selector, option_value, exact=require)
+    if not shown and require:
+        # The side of the order: never "proceed and let the confirm page
+        # sort it out" — a missed Buy/Sell is a different order, not an error.
+        raise RuntimeError(
+            f"Could not set {dropdown_opener_selector} to {option_value} on the "
+            f"ticket — nothing was sent")
+    if not shown and last_exc is not None:
         raise last_exc
 
 
@@ -1506,6 +1636,45 @@ async def _wait_for_quote(page, symbol: str, acct_label: str,
     _trace(f"TRADE | Wells Fargo | {acct_label}: quote arrived on retry", notify=notify)
 
 
+_ORDER_RESULT_JS = (
+    "(function(){var d=document;"
+    "var b=d.querySelector('.btn-wfa-primary.btn-wfa-submit');"
+    "var vis=function(e){return !!(e&&(e.offsetWidth||e.offsetHeight||e.getClientRects().length));};"
+    "var t=(d.body&&d.body.innerText)||'';"
+    "var a=d.querySelector('.alert-msg-summary');"
+    "var ok=/order\\s+(has\\s+been\\s+|was\\s+)?(received|placed|submitted|accepted)"
+    "|(confirmation|order|reference)\\s*(number|no\\.?|#)\\s*:?\\s*[A-Z0-9][A-Z0-9-]{3,}"
+    "|order\\s+confirmation/i.test(t);"
+    "return JSON.stringify({submit:vis(b),ok:ok,"
+    "alert:a?(a.innerText||'').trim().replace(/\\s+/g,' ').slice(0,240):'',"
+    "url:location.href});})();"
+)
+
+
+async def _read_order_result(page, *, tries: int = 20, wait_s: float = 0.5) -> Dict[str, Any]:
+    """What the page says after the submit click.
+
+    {"ok": True} only when the submit button is gone AND the page shows an
+    order-received / order-number indicator. Otherwise {"ok": False} plus any
+    alert text shown (a rejection). Polls ~10s for the result page to settle;
+    never raises.
+    """
+    last: Dict[str, Any] = {"ok": False, "alert": ""}
+    for i in range(tries):
+        try:
+            raw = await page.evaluate(_ORDER_RESULT_JS)
+            st = json.loads(raw) if isinstance(raw, str) and raw else {}
+        except Exception:
+            st = {}
+        if isinstance(st, dict) and st:
+            if st.get("ok") and not st.get("submit"):
+                return {"ok": True, "alert": str(st.get("alert") or "")}
+            last = {"ok": False, "alert": str(st.get("alert") or "")}
+        if i < tries - 1:
+            await page.sleep(wait_s)
+    return last
+
+
 def _submitted_unverified_msg(e: BaseException) -> str:
     """The account result for an error AFTER the confirm click.
 
@@ -1541,6 +1710,66 @@ def _is_hard_error(msg: str) -> bool:
     return True
 
 
+def _mask_is_real(mask: Any) -> bool:
+    """A parsed last-4 mask ("****1234"), not the "****" fallback."""
+    return bool(re.search(r"[0-9A-Za-z]{4}$", str(mask or "").strip()))
+
+
+def _ticket_account_check(acct: Dict[str, Any], ticket_mask: str) -> None:
+    """Raise when the ticket opened on a different account than the one asked.
+
+    The ticket is deep-linked by account INDEX; if WF's list order shifted (a
+    new or closed account) the index points at another account, and merely
+    relabelling the row would place this account's order there. Only a
+    positive mismatch refuses: an unreadable mask on either side proceeds as
+    before. NEEDS LIVE VERIFICATION: .acctmask text format on the ticket.
+    """
+    want = re.sub(r"[^0-9A-Za-z]", "", str(acct.get("mask") or ""))
+    have = re.sub(r"[^0-9A-Za-z]", "", str(ticket_mask or ""))
+    if not _mask_is_real(acct.get("mask")) or len(want) < 4 or len(have) < 4:
+        return
+    if have[-4:] != want[-4:]:
+        raise RuntimeError(
+            f"Ticket opened on account ending {have[-4:]}, expected {want[-4:]} — "
+            f"stopped before Continue, nothing was sent")
+
+
+_LOGIN_PREFIX_RE = re.compile(r"^Wells Fargo (\d+) · ")
+
+
+def _login_names(idx: int) -> set:
+    """Every label a whole-login failure row of login `idx` can carry.
+
+    The module words such a row "Wells Fargo" (login failed, no accounts,
+    an error before any Place Order click) and broker_logins.fan_out labels a
+    login that raised with its own name ("Wells Fargo 2"); login 2 and up
+    then get the "Wells Fargo 2 · " prefix. Bare "Wells Fargo" is login 1's
+    alone -- every other login's rows carry the prefix.
+    """
+    idx = max(1, int(idx or 1))
+    base = {"Wells Fargo", f"Wells Fargo {idx}"}
+    if idx == 1:
+        return base
+    pre = f"Wells Fargo {idx} · "
+    return {f"Wells Fargo {idx}"} | {pre + b for b in base}
+
+
+def _row_login_idx(label: str) -> int:
+    """The login a result row belongs to, from its fan_out prefix (1 if none)."""
+    m = _LOGIN_PREFIX_RE.match(str(label or ""))
+    return int(m.group(1)) if m else 1
+
+
+def _wants_whole_login(only, idx: int) -> bool:
+    """True when the caller asked for login `idx`'s failure row back: a retry
+    of a login that failed as a whole, before any order was clicked there
+    (that is the only time a row is labelled with the login, not an account).
+    Like Fidelity's `c.label in only_accounts`: it means every account of
+    THIS login, never another login's."""
+    names = _login_names(idx)
+    return any(str(w).strip() in names for w in (only or ()))
+
+
 def _account_matches(acct: Dict[str, Any], wanted: set) -> bool:
     """True when this account is one the caller asked to trade.
 
@@ -1549,6 +1778,8 @@ def _account_matches(acct: Dict[str, Any], wanted: set) -> bool:
     well as a bare "0012".
     """
     mask = str(acct.get("mask") or "").strip()
+    if not _mask_is_real(mask):
+        mask = ""  # "****" alone would match every requested label
     label = str(acct.get("account_id") or "").strip()
     for w in wanted:
         w = str(w).strip()
@@ -1615,7 +1846,7 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
             return BrokerOutput(
                 broker=BROKER,
                 state="failed",
-                accounts=[AccountOutput(account_id="Wells Fargo", ok=False, message="Cancelled before start")],
+                accounts=[AccountOutput(account_id="Wells Fargo", ok=False, message="Cancelled before start — nothing was sent")],
                 message="Cancelled",
             )
 
@@ -1651,30 +1882,59 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
 
         # Caller asked for specific accounts (a retry of the ones that failed).
         only = {str(a) for a in (ctx.get("only_accounts") or []) if str(a).strip()}
-        if only:
-            wanted = [a for a in accts if _account_matches(a, only)]
-            if not wanted:
+        if only and _wants_whole_login(only, ctx.get("login_idx") or 1):
+            # This login failed as a whole last time (nothing was clicked
+            # here), so the retry is every account it has.
+            _trace(f"TRADE | Wells Fargo | retrying the whole login "
+                   f"({len(accts)} account(s))", notify=notify)
+        elif only:
+            if any(not _mask_is_real(a.get("mask")) for a in accts):
+                # An unparsed mask is the bare "****", which sits inside every
+                # requested label — matching on it would trade every account.
+                why = ("Cannot match the requested accounts: Wells Fargo account "
+                       "numbers could not be read — nothing was sent")
                 return BrokerOutput(
                     broker=BROKER,
                     state="failed",
-                    accounts=[AccountOutput(account_id="Wells Fargo", ok=False,
-                                            message=f"None of the requested accounts were found: {sorted(only)}")],
-                    message="Requested accounts not found",
+                    accounts=[AccountOutput(account_id="Wells Fargo", ok=False, message=why)],
+                    message=why,
                 )
+            wanted = [a for a in accts if _account_matches(a, only)]
+            if not wanted:
+                # Quiet, like Fidelity / IBKR: with several logins the requested
+                # accounts usually belong to ANOTHER login, and a failed row
+                # here read as a failed sell. execute_trade adds the one
+                # "none found" row if no login held any of them.
+                _trace(f"TRADE | Wells Fargo | none of the requested accounts at "
+                       f"this login", notify=notify)
+                return BrokerOutput(broker=BROKER, state="success", accounts=[],
+                                    message="", extra={"only_unmatched": True})
             _trace(f"TRADE | Wells Fargo | limited to {len(wanted)}/{len(accts)} account(s)", notify=notify)
             accts = wanted
 
-        outputs: List[AccountOutput] = []
+        # Shared with _dispatch (ctx["_outputs"]) so a run it abandons on timeout
+        # still reports the accounts that finished. _todo / _current /
+        # _clicking tell it which account was mid-click and which never ran.
+        outputs: List[AccountOutput] = ctx.get("_outputs") if isinstance(ctx.get("_outputs"), list) else []
+        ctx["_outputs"] = outputs
+        ctx["_todo"] = [a.get("account_id") or "Wells Fargo" for a in accts]
         _consec_hard_errors = 0  # stop after 2 consecutive hard errors (e.g. security not allowed)
 
         for _acct_i, acct in enumerate(accts):
             if _acct_i > 0:
                 await asyncio.sleep(random.uniform(1.0, 3.0))
             if _is_cancelled_ctx(ctx):
+                # A row for every account the cancel kept from its order: a
+                # missing row read as nothing to report.
+                for remaining in accts[_acct_i:]:
+                    outputs.append(AccountOutput(
+                        account_id=remaining.get("account_id") or "Wells Fargo", ok=False,
+                        message="Skipped: cancelled — nothing was sent"))
                 break
             idx = acct.get("index")
             x_param = acct.get("x_param") or ""
             acct_label = acct.get("account_id") or "Wells Fargo"
+            ctx["_current"] = acct_label
 
             _trace(f"TRADE | Wells Fargo | {acct_label} | starting "
                    f"({_acct_i + 1}/{len(accts)}) {action} {qty_int} {symbol}",
@@ -1695,7 +1955,14 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                 if x_param:
                     trade_url = f"{trade_url}&{x_param}"
 
-                await page.get(trade_url)
+                # Bounded like Fidelity's _nav: a page.get() that never returns
+                # held the whole run until the 20-min backstop, and every
+                # account after it died with it.
+                try:
+                    await asyncio.wait_for(page.get(trade_url), timeout=_TRADE_NAV_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"Trade page did not load within {_TRADE_NAV_TIMEOUT_S:.0f}s for this account")
                 await page.wait_for_ready_state("complete")
                 await page.wait()
 
@@ -1714,10 +1981,11 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                             f"Order form did not load for this account (url: {u or 'unknown'})")
 
                 mask = await _get_account_mask(page)
+                _ticket_account_check(acct, mask)
                 if mask and mask not in acct_label:
                     acct_label = f"{acct_label} [*{mask}]"
 
-                await _select_dropdown_option(page, "#BuySellBtn", action)
+                await _select_dropdown_option(page, "#BuySellBtn", action, require=True)
 
                 await _wait_for_quote(page, symbol, acct_label, notify=notify)
 
@@ -1758,6 +2026,12 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                 last_price = _to_float_any(last_val)
                 if last_price is None:
                     raise RuntimeError("Quote loaded but last price (#last) was empty")
+                if last_price <= 0:
+                    # Like Fidelity: a $0.00 quote means the ticket never
+                    # resolved a price, and a $0.01 "limit" off it is a guess.
+                    raise RuntimeError(
+                        f"Quote loaded but last price (#last) was ${last_price:.2f} — "
+                        f"refusing to price an order; nothing was sent")
 
                 order_type = "Market" if last_price >= 2.00 else "Limit"
 
@@ -1780,6 +2054,10 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                 limit_price: Optional[float] = None
                 if order_type == "Limit":
                     limit_price = round(last_price + 0.01, 2) if action == "Buy" else round(last_price - 0.01, 2)
+                    if limit_price <= 0:
+                        # Sub-penny last: last - 0.01 is zero or negative. Send
+                        # the smallest legal price, never a $0.00 limit.
+                        limit_price = 0.01
                     price_in = await page.select("#Price", timeout=10)
                     await price_in.scroll_into_view()
                     try:
@@ -1806,10 +2084,13 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                     confirm_btn = await page.select(".btn-wfa-primary.btn-wfa-submit", timeout=10)
                     await confirm_btn.scroll_into_view()
                 except Exception:
-                    err_txt = "Confirmation page did not load"
+                    # Before the submit click: nothing was sent, so none of
+                    # the may-exist words ("confirmation", "submitted", ...)
+                    # belong in this text — they would keep it out of Retry.
+                    err_txt = "Order review page did not load — nothing was sent"
                     try:
                         err_el = await page.select(".alert-msg-summary p", timeout=10)
-                        err_txt = (getattr(err_el, "text_all", "") or "").strip().replace("\n", " ")
+                        err_txt = (getattr(err_el, "text_all", "") or "").strip().replace("\n", " ") or err_txt
                     except Exception:
                         pass
                     outputs.append(AccountOutput(account_id=acct_label, ok=False, message=f"Wells Fargo HARD Error for {symbol}: {err_txt}"))
@@ -1862,17 +2143,35 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                 # either it sees the flag (and says "verify") or we see the
                 # event (and never click). A run _dispatch already gave up on
                 # must not place an order nobody is waiting to hear about.
+                ctx["_clicking"] = acct_label
                 ctx["_clicked"] = True
                 if _is_abandoned_ctx(ctx):
                     outputs.append(AccountOutput(
                         account_id=acct_label, ok=False,
-                        message="Stopped before clicking Place Order: the run timed out"))
+                        message="Stopped before clicking Place Order: the run timed out — nothing was sent"))
                     break
                 _submitted = True
                 await confirm_btn.mouse_click()
                 await page.wait_for_ready_state("complete", timeout=20)
                 await page.wait()
                 await page.sleep(0.25)
+
+                # Read what Wells Fargo answered. "No exception" is not a fill:
+                # only a success indicator (with the submit button gone) is.
+                result = await _read_order_result(page)
+                if not result.get("ok"):
+                    shown = str(result.get("alert") or "").strip()
+                    if shown:
+                        smsg = (f"Order submitted but Wells Fargo showed: {shown[:200]} — "
+                                f"verify in Wells Fargo before retrying")
+                    else:
+                        smsg = _submitted_unverified_msg(
+                            RuntimeError("no order confirmation on the result page"))
+                    outputs.append(AccountOutput(account_id=acct_label, ok=False, message=smsg))
+                    _trace(f"TRADE | Wells Fargo | {acct_label} | {smsg} "
+                           f"state={await _capture_page_state(page, symbol)}", notify=notify)
+                    _consec_hard_errors = 0
+                    continue
 
                 msg = f"Placed {action} {qty_int} {symbol} ({order_type}" + (f" @{limit_price:.2f}" if limit_price is not None else "") + f", {tif})"
                 if warn_txt:
@@ -1892,7 +2191,10 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                            f"state={await _capture_page_state(page, symbol)}", notify=notify)
                     _consec_hard_errors = 0
                     continue
-                outputs.append(AccountOutput(account_id=acct_label, ok=False, message=str(e)))
+                # Before the confirm click (the ticket, the quote's #prevdata,
+                # the preview): no order went out for this account.
+                outputs.append(AccountOutput(account_id=acct_label, ok=False,
+                                             message=f"{e} — nothing was sent"))
                 _trace(f"TRADE | Wells Fargo | {acct_label} | FAILED: {e} "
                        f"state={await _capture_page_state(page, symbol)}", notify=notify)
                 # Only a refusal counts toward the breaker. A page timeout is
@@ -1905,10 +2207,15 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                         outputs.append(AccountOutput(account_id=r_label, ok=False, message=f"Skipped: {e}"))
                     break
 
+        ok_ct = sum(1 for a in outputs if a.ok)
         if _is_cancelled_ctx(ctx):
-            state = "partial" if any(a.ok for a in outputs) else "failed"
+            state = "partial" if ok_ct else "failed"
+        elif ok_ct and ok_ct == len(outputs):
+            state = "success"
         else:
-            state = "success" if any(a.ok for a in outputs) else "failed"
+            # Some accounts failed: "success" here hid them from the
+            # broker-level status.
+            state = "partial" if ok_ct else "failed"
 
         msg = "Cancelled" if _is_cancelled_ctx(ctx) else ""
         if dry_run:
@@ -1923,10 +2230,25 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
         return BrokerOutput(broker=BROKER, state=state, accounts=outputs, message=msg)
 
     except Exception as e:
+        if not ctx.get("_clicked"):
+            # Browser start, login, the account list: before any order.
+            return BrokerOutput(
+                broker=BROKER,
+                state="failed",
+                accounts=[AccountOutput(account_id="Wells Fargo", ok=False,
+                                        message=f"{e} — nothing was sent")],
+                message=str(e),
+            )
+        # Escaped the account loop after a Place Order click: keep the rows
+        # already written and say an order may be live.
+        done = list(ctx.get("_outputs") or [])
+        done.append(AccountOutput(account_id="Wells Fargo", ok=False, message=(
+            f"Wells Fargo failed mid-run ({e}) — an order may have been submitted; "
+            f"verify in Wells Fargo before retrying")))
         return BrokerOutput(
             broker=BROKER,
-            state="failed",
-            accounts=[AccountOutput(account_id="Wells Fargo", ok=False, message=str(e))],
+            state="partial" if any(a.ok for a in done) else "failed",
+            accounts=done,
             message=str(e),
         )
     finally:
@@ -1962,8 +2284,25 @@ def _dispatch(command: str, *, timeout_s: int = 1200, **kwargs) -> BrokerOutput:
 
     ctx["_abandoned"] = threading.Event()
     ctx["_clicked"] = False
+    ctx["_outputs"] = []
+    ctx["_todo"] = []
+    ctx["_current"] = None
+    ctx["_clicking"] = None
     try:
         return _run_coro(lambda: _run(), timeout_s=timeout_s)
+    except _WorkerCancelled as e:
+        ctx["_abandoned"].set()
+        why = f"Wells Fargo trade stopped before it finished: {e}"
+        _trace(f"TRADE | Wells Fargo | {why}")
+        accounts = _abandoned_rows(ctx, e, skipped=(
+            "Skipped: the Wells Fargo run was cancelled before this account's "
+            "order — nothing was sent"))
+        return BrokerOutput(
+            broker=BROKER,
+            state="partial" if any(a.ok for a in accounts) else "failed",
+            accounts=accounts or [AccountOutput(account_id="Wells Fargo", ok=False, message=why)],
+            message=why,
+        )
     except TimeoutError as e:
         # The abandoned run stops at its next account boundary, but orders may
         # already be live on the accounts it got through and their results died
@@ -1982,12 +2321,44 @@ def _dispatch(command: str, *, timeout_s: int = 1200, **kwargs) -> BrokerOutput:
             why = (f"Wells Fargo timed out after {timeout_s}s before reaching "
                    f"the Place Order click; no order was sent")
         _trace(f"TRADE | Wells Fargo | {why}")
+        accounts = _abandoned_rows(ctx, e, skipped=(
+            f"Skipped: Wells Fargo run timed out after {max(1, timeout_s // 60)} min "
+            "before this account's order — nothing was sent"))
+        if not accounts:
+            accounts = [AccountOutput(account_id="Wells Fargo", ok=False, message=why)]
         return BrokerOutput(
             broker=BROKER,
-            state="failed",
-            accounts=[AccountOutput(account_id="Wells Fargo", ok=False, message=why)],
+            state="partial" if any(a.ok for a in accounts) else "failed",
+            accounts=accounts,
             message=why,
         )
+
+
+def _abandoned_rows(ctx: Dict[str, Any], e: BaseException, *, skipped: str) -> List[AccountOutput]:
+    """Per-account results for a trade run _dispatch gave up on.
+
+    Finished accounts keep their real results; the account whose submit click
+    was under way gets "submitted ... verify"; every account the run never
+    reached (or stopped short of the click for) gets a nothing-sent Skipped
+    row. Empty when the run never got as far as the account list.
+    """
+    rows = list(ctx.get("_outputs") or [])
+    todo = list(ctx.get("_todo") or [])
+    clicking = ctx.get("_clicking")
+    dry_run = bool(ctx.get("dry_run"))
+
+    def _has_row(label: str) -> bool:
+        # The row label may carry a " [*mask]" suffix added mid-ticket.
+        return any(str(a.account_id).startswith(str(label)) for a in rows)
+
+    if clicking and not dry_run and not _has_row(clicking):
+        rows.append(AccountOutput(account_id=clicking, ok=False,
+                                  message=_submitted_unverified_msg(e)))
+    for label in todo:
+        if _has_row(label) or (clicking and str(clicking).startswith(str(label))):
+            continue
+        rows.append(AccountOutput(account_id=label, ok=False, message=skipped))
+    return rows
 
 
 # =============================================================================
@@ -2043,8 +2414,74 @@ def bootstrap(*args, **kwargs) -> BrokerOutput:
 def get_holdings(*args, **kwargs) -> BrokerOutput:
     return broker_logins.fan_out(BROKER, _MODULE, _get_holdings_one, *args, **kwargs)
 
+def _wf_login_no(label: str) -> int:
+    """Which login a label belongs to: "Wells Fargo 2 · ..." -> 2, else 1."""
+    m = re.match(r"\s*Wells Fargo (\d+)(?: ·|\s*$)", str(label or ""))
+    return int(m.group(1)) if m else 1
+
+
+def _row_may_exist(row: AccountOutput) -> bool:
+    low = str(getattr(row, "message", "") or "").lower()
+    return (not getattr(row, "ok", False)) and (
+        "may have been submitted" in low or ("submitted" in low and "verify" in low))
+
+
+def _requested_unmatched(only: List[str], rows: List[AccountOutput]) -> List[str]:
+    """Requested account labels no result row stands for (same match as
+    _account_matches: the exact label, or its "****1234" mask).
+
+    A login whose run ended in a login-level may-exist row ("failed mid-run —
+    an order may have been submitted; verify") stands for every requested
+    account at that login: which account's order went out is unknown, so a
+    "not found — nothing was sent" row there would invite a Retry to place
+    it a second time.
+    """
+    labels = {str(a.account_id or "") for a in rows}
+    # A login's own name stands for that whole login: found when the run
+    # reported any row of that login (its accounts, or its failure again).
+    logins = {_row_login_idx(lab) for lab in labels}
+    masks = set()
+    for lab in labels:
+        masks.update(m for m in re.findall(r"\*{4}[0-9A-Za-z]{4}", lab))
+    unsure_logins = {_wf_login_no(a.account_id) for a in rows
+                     if _row_may_exist(a)
+                     and not re.search(r"\*{4}[0-9A-Za-z]{4}", str(a.account_id or ""))}
+    out = []
+    for w in only:
+        if w in labels or any(m in w or w == m[-4:] for m in masks):
+            continue
+        if any(w in _login_names(i) for i in logins):
+            continue
+        if _wf_login_no(w) in unsure_logins:
+            continue
+        out.append(w)
+    return out
+
+
 def execute_trade(**kwargs) -> BrokerOutput:
-    return broker_logins.fan_out(BROKER, _MODULE, _execute_trade_one, **kwargs)
+    out = broker_logins.fan_out(BROKER, _MODULE, _execute_trade_one, **kwargs)
+    only = sorted({str(a) for a in (kwargs.get("only_accounts") or []) if str(a).strip()})
+    if only and (out.accounts or []):
+        # Some requested accounts traded (or failed), others matched nothing
+        # at any login: one row each, or a retry of three that found two read
+        # as a clean success.
+        missing = _requested_unmatched(only, out.accounts or [])
+        if missing:
+            for w in missing:
+                out.accounts.append(AccountOutput(
+                    account_id=w, ok=False,
+                    message="Skipped: requested account not found — nothing was sent"))
+            out.state = "partial" if any(a.ok for a in out.accounts) else "failed"
+        return out
+    if only and not (out.accounts or []) and out.state == "success":
+        # No login held any requested account: one row saying so, not an
+        # empty success for a retry that traded nothing.
+        why = f"None of the requested accounts were found: {only} — nothing was sent"
+        return BrokerOutput(broker=BROKER, state="failed",
+                            accounts=[AccountOutput(account_id="Wells Fargo", ok=False,
+                                                    message=why)],
+                            message="Requested accounts not found", extra=out.extra)
+    return out
 
 #: Handed to fan_out so it can reach BrokerOutput/AccountOutput and the
 #: _on_login_switch hook without importing this module back.

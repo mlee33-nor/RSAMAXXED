@@ -65,26 +65,39 @@ _attempts: dict[str, list[float]] = {}
 
 
 def _client(request: Request) -> str:
-    """Best available caller identity. Behind Railway's proxy the socket peer is
-    the proxy, so trust the forwarded address it sets — uvicorn runs with
-    --proxy-headers (see Procfile), and a spoofed value only throttles a
-    fictional address, never lets one through."""
+    """Best available caller identity for the throttles (this page and /login).
+
+    NOT the leftmost X-Forwarded-For entry, and not `request.client.host`
+    either: uvicorn runs with --forwarded-allow-ips=* (see Procfile), and with
+    that setting it copies the LEFTMOST entry into request.client -- the one the
+    caller wrote. A script that sends a fresh X-Forwarded-For on every guess
+    would then get a fresh throttle bucket every time, i.e. no throttle at all.
+
+    There is exactly one proxy hop in front of us (Railway's edge), and it
+    APPENDS the address it actually received the connection from. So the
+    right-most entry is the one value here the caller cannot choose. With no
+    header at all (local dev, tests) the socket peer is the caller.
+    """
     fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    hops = [h.strip() for h in fwd.split(",") if h.strip()]
+    if hops:
+        return hops[-1]
     return request.client.host if request.client else "?"
 
 
-def _throttled(key: str) -> bool:
+def _throttled(key: str, store: dict[str, list[float]] | None = None,
+               limit: int | None = None, window: float | None = None) -> bool:
+    store = _attempts if store is None else store
     now = time.monotonic()
-    window = config.PLAYS_ATTEMPT_WINDOW_SECONDS
-    recent = [t for t in _attempts.get(key, ()) if now - t < window]
-    _attempts[key] = recent
-    return len(recent) >= config.PLAYS_MAX_ATTEMPTS
+    window = config.PLAYS_ATTEMPT_WINDOW_SECONDS if window is None else window
+    limit = config.PLAYS_MAX_ATTEMPTS if limit is None else limit
+    recent = [t for t in store.get(key, ()) if now - t < window]
+    store[key] = recent
+    return len(recent) >= limit
 
 
-def _record_failure(key: str) -> None:
-    _attempts.setdefault(key, []).append(time.monotonic())
+def _record_failure(key: str, store: dict[str, list[float]] | None = None) -> None:
+    (_attempts if store is None else store).setdefault(key, []).append(time.monotonic())
 
 
 def remember_token() -> str:

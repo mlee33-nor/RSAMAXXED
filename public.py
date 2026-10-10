@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -144,6 +145,11 @@ def _validate_trade_inputs(
 # Public client
 # =============================================================================
 
+class _OrderMayExist(RuntimeError):
+    """The order POST went out but its outcome is unknown. The message carries
+    the "submitted ... verify" wording that keeps the app from re-sending it."""
+
+
 class _PublicClient:
     """
     Minimal Public REST client with short-lived access tokens.
@@ -233,12 +239,35 @@ class _PublicClient:
         if market_session:
             body["equityMarketSession"] = market_session
 
-        r = requests.post(url, json=body, headers=self._headers(), timeout=30)
+        try:
+            headers = self._headers()   # token refresh: before anything is sent
+        except Exception as e:
+            raise RuntimeError(f"Public sign-in refresh failed ({e}) — nothing was sent") from e
+        try:
+            r = requests.post(url, json=body, headers=headers, timeout=30)
+        except requests.exceptions.ConnectTimeout as e:
+            # Never connected, so the order never left this machine.
+            raise RuntimeError(f"Order not sent: could not reach Public ({e})") from e
+        except Exception as e:
+            # A read timeout or dropped connection: the POST went out and
+            # Public may well have taken it.
+            raise _OrderMayExist(
+                f"Public did not answer after the order may have been submitted "
+                f"({type(e).__name__}: {e}) — verify in Public before retrying") from e
+        if r.status_code >= 500:
+            raise _OrderMayExist(
+                f"Public returned HTTP {r.status_code} after the order may have been "
+                f"submitted ({r.text[:200]}) — verify in Public before retrying")
         if r.status_code >= 400:
             raise RuntimeError(f"Order failed: HTTP {r.status_code} - {r.text}")
 
-        data = r.json() or {}
-        return data.get("orderId") or oid
+        try:
+            data = r.json() or {}
+        except Exception:
+            # 2xx: Public accepted it, the body just didn't parse. We chose
+            # the orderId ourselves, so we still know which order it is.
+            data = {}
+        return (data.get("orderId") if isinstance(data, dict) else None) or oid
 
 
 # =============================================================================
@@ -271,9 +300,15 @@ def _ensure_clients() -> Tuple[bool, str, List[Tuple[int, _PublicClient, List[Di
     if not pairs:
         return False, "Missing PUBLIC_SECRET_TOKEN_1 (and _2, _3, ... for more logins)", []
 
-    ready: List[Tuple[int, _PublicClient, List[Dict[str, Any]]]] = []
+    ready: List[Tuple[int, Any, Any]] = []
     last_err = ""
 
+    # A login that fails is KEPT, as (idx, None, reason). It used to be
+    # dropped, so a dead token's accounts simply vanished from the result --
+    # no row, no failure, nothing for Retry -- and when every login failed the
+    # callers returned accounts=[], which the app counted as no failure at
+    # all. Callers turn these entries into one ok=False "Public <idx>" row.
+    any_ok = False
     for idx, secret in pairs:
         try:
             client = _get_client_for_secret(idx, secret)
@@ -281,12 +316,84 @@ def _ensure_clients() -> Tuple[bool, str, List[Tuple[int, _PublicClient, List[Di
             if not isinstance(accounts, list):
                 raise RuntimeError("unexpected accounts response")
             ready.append((idx, client, accounts))
+            any_ok = True
         except Exception as e:
             last_err = str(e)
+            ready.append((idx, None, last_err or "Auth failed"))
 
-    if not ready:
-        return False, (last_err or "Auth failed"), []
+    if not any_ok:
+        return False, (last_err or "Auth failed"), ready
     return True, "ok", ready
+
+
+def _failed_login_row(idx: int, reason: Any, **extra: Any) -> AccountOutput:
+    """One row for a Public login that could not sign in. Nothing was sent."""
+    text = f"Public login {idx} failed: {reason}"
+    if "nothing was sent" not in text.lower():
+        text += " — nothing was sent"
+    return AccountOutput(account_id=f"Public {idx}", ok=False, message=text, **extra)
+
+
+_CAP_LABEL = re.compile(r"^Public\s+\d+\s+(.+?)\s+\(([^()]{4})\)$")
+
+
+def _cap_key(label: str) -> Optional[Tuple[str, str]]:
+    """("BROKERAGE", "0001") from "Public 2 BROKERAGE (0001)" -- the account's
+    identity without the login number, which moves when .env is reordered."""
+    m = _CAP_LABEL.match(str(label or "").strip())
+    return (m.group(1).strip().upper(), m.group(2)) if m else None
+
+
+def _match_caps(caps: Dict[str, Decimal], labels: List[str],
+                fallback: bool = True) -> Dict[str, str]:
+    """account label -> the caps key that applies to it.
+
+    The exact label first. Failing that, the same account type and last 4
+    under a different login number: caps are keyed by the label each buy was
+    journaled under, "Public {login#} {type} ({last4})", and moving a token in
+    .env renumbers the logins -- every account then read as "not ours", was
+    silently left unsold, and the late-round-up check was marked done. The
+    fallback only takes a pair that is unique on both sides, so it can never
+    hand one account another account's cap.
+
+    Unique among the labels that were READ, though: with login 1 down, its
+    account is not in `labels`, and a login-2 account of the same type and
+    last 4 looked unique and took login 1's cap. So `fallback=False` -- the
+    caller passes it unless every configured login answered -- takes exact
+    labels only.
+    """
+    out: Dict[str, str] = {}
+    used = set()
+    for lab in labels:
+        if lab in caps:
+            out[lab] = lab
+            used.add(lab)
+    if not fallback:
+        return out
+    by_key: Dict[Tuple[str, str], List[str]] = {}
+    for k in caps:
+        if k in used:
+            continue
+        ck = _cap_key(k)
+        if ck:
+            by_key.setdefault(ck, []).append(k)
+    acct_keys: Dict[Tuple[str, str], List[str]] = {}
+    for lab in labels:
+        ck = _cap_key(lab)
+        if ck:
+            acct_keys.setdefault(ck, []).append(lab)
+    for lab in labels:
+        if lab in out:
+            continue
+        ck = _cap_key(lab)
+        if ck and len(by_key.get(ck, [])) == 1 and len(acct_keys.get(ck, [])) == 1:
+            out[lab] = by_key[ck][0]
+    return out
+
+
+def _failed_login_rows(ready: List[Tuple[int, Any, Any]], **extra: Any) -> List[AccountOutput]:
+    return [_failed_login_row(idx, reason, **extra)
+            for idx, client, reason in ready if client is None]
 
 
 # =============================================================================
@@ -463,12 +570,16 @@ def healthcheck(*args, **kwargs) -> BrokerOutput:
         return BrokerOutput(
             broker=BROKER,
             state="failed",
-            accounts=[AccountOutput(account_id="Public", ok=False, message=msg)],
+            accounts=(_failed_login_rows(ready)
+                      or [AccountOutput(account_id="Public", ok=False, message=msg)]),
             message=msg,
         )
 
     # Per-secret status lines
     for idx, _client, accounts in ready:
+        if _client is None:
+            accs.append(_failed_login_row(idx, accounts))
+            continue
         label = f"Public {idx}"
         accs.append(AccountOutput(account_id=label, ok=True, message=f"ok (accounts={len(accounts)})"))
 
@@ -480,7 +591,9 @@ def healthcheck(*args, **kwargs) -> BrokerOutput:
             text=f"OK: accounts={len(accounts)}",
         )
 
-    return BrokerOutput(broker=BROKER, state="success", accounts=accs, message="ok")
+    ok_ct = sum(1 for a in accs if a.ok)
+    return BrokerOutput(broker=BROKER, state=_state_from_counts(ok_ct, len(accs) - ok_ct),
+                        accounts=accs, message="ok")
 
 
 # =============================================================================
@@ -592,8 +705,19 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
     `extra["qty"]`, so the journal records what was sold rather than `qty`.
     """
     ok, msg, ready = _ensure_clients()
+    sized = bool(size_from_holdings) and str(side or "").strip().lower() == "sell"
+
+    def _login_failed(idx: int, reason: Any) -> AccountOutput:
+        row = _failed_login_row(idx, reason)
+        if sized:
+            # Same words as a failed per-account read, so the exit batch
+            # hands the play back exactly as it does for that.
+            row.message = f"Could not read the position before selling: {row.message}"
+        return row
+
     if not ok:
-        return BrokerOutput(broker=BROKER, state="failed", message=msg, accounts=[])
+        return BrokerOutput(broker=BROKER, state="failed", message=msg,
+                            accounts=[_login_failed(i, r) for i, c, r in ready if c is None])
 
     # Holdings-sized sells ignore `qty`, so only they may arrive without one.
     # A buy or a plain sell with a blank quantity is a caller bug and keeps
@@ -627,6 +751,22 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
     log_sections: List[str] = []
     _acct_i = 0
 
+    # Which cap belongs to which account (see _match_caps), and which caps
+    # found their account: one that found none is reported, never dropped.
+    cap_for: Dict[str, str] = {}
+    caps_used: set = set()
+    if per_account:
+        all_labels = [
+            f"Public {pi} {(a.get('accountType') or '').strip() or 'ACCOUNT'} "
+            f"({_safe_last4((a.get('accountId') or '').strip())})"
+            for pi, c, accts in ready if c is not None
+            for a in (accts or []) if isinstance(a, dict)]
+        # The renumbered-login fallback only when every login was read: an
+        # unread login's accounts are missing from all_labels, so "unique"
+        # there proves nothing (see _match_caps).
+        every_login_read = all(c is not None and accts for _pi, c, accts in ready)
+        cap_for = _match_caps(caps, all_labels, fallback=every_login_read)
+
     log_sections.append("DRY RUN — NO ORDER SUBMITTED" if dry_run else "LIVE ORDER MODE")
     log_sections.append(f"broker: {BROKER}")
     log_sections.append(f"requested: side={api_side} symbol={sym} qty={qty_s}")
@@ -634,6 +774,9 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
     log_sections.append("")
 
     for pub_idx, client, accounts in ready:
+        if client is None:
+            outs.append(_login_failed(pub_idx, accounts))
+            continue
         if not accounts:
             outs.append(AccountOutput(
                 account_id=f"Public {pub_idx} (auth)",
@@ -665,7 +808,10 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
             order_sym = sym
             extra: Optional[Dict[str, Any]] = None
             if per_account:
-                cap = caps.get(acct_label)
+                cap_label = cap_for.get(acct_label)
+                cap = caps.get(cap_label) if cap_label else None
+                if cap_label:
+                    caps_used.add(cap_label)
                 if cap is None:
                     # Checked before the read: an account we have no share in
                     # is not ours to sell, whatever it holds, so there is no
@@ -740,6 +886,20 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
             except Exception as e:
                 outs.append(AccountOutput(account_id=acct_label, ok=False, message=str(e), order_id=None))
 
+    if per_account:
+        failed_logins = [pi for pi, c, _a in ready if c is None]
+        for cap_label in caps:
+            if cap_label in caps_used:
+                continue
+            # Shares this tool bought in an account no signed-in login shows:
+            # a renamed or reordered login, or one that did not sign in.
+            # Unsold either way, so never a clean "nothing to sell".
+            why = ("its login did not sign in" if failed_logins
+                   else "no Public login shows this account — check the Public tokens in .env")
+            outs.append(AccountOutput(
+                account_id=cap_label, ok=False, order_id=None,
+                message=f"Skipped: could not find this account to sell ({why}) — nothing was sent"))
+
     ok_ct = sum(1 for a in outs if a.ok)
     fail_ct = sum(1 for a in outs if not a.ok)
     state = _state_from_counts(ok_ct, fail_ct)
@@ -763,11 +923,15 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
 def get_accounts(*args, **kwargs) -> BrokerOutput:
     ok, msg, ready = _ensure_clients()
     if not ok:
-        return BrokerOutput(broker=BROKER, state="failed", message=msg, accounts=[])
+        return BrokerOutput(broker=BROKER, state="failed", message=msg,
+                            accounts=_failed_login_rows(ready))
 
     outs: List[AccountOutput] = []
 
     for pub_idx, client, accounts in ready:
+        if client is None:
+            outs.append(_failed_login_row(pub_idx, accounts))
+            continue
         if not accounts:
             outs.append(AccountOutput(account_id=f"Public {pub_idx} (auth)", ok=False, message="No accounts returned for this login."))
             continue
@@ -818,13 +982,17 @@ def get_accounts(*args, **kwargs) -> BrokerOutput:
 def get_holdings(*args, **kwargs) -> BrokerOutput:
     ok, msg, ready = _ensure_clients()
     if not ok:
-        return BrokerOutput(broker=BROKER, state="failed", message=msg, accounts=[])
+        return BrokerOutput(broker=BROKER, state="failed", message=msg,
+                            accounts=_failed_login_rows(ready, holdings=[]))
 
     outs: List[AccountOutput] = []
     total_value = Decimal("0")
     total_value_seen = False
 
     for pub_idx, client, accounts in ready:
+        if client is None:
+            outs.append(_failed_login_row(pub_idx, accounts, holdings=[]))
+            continue
         if not accounts:
             outs.append(AccountOutput(account_id=f"Public {pub_idx} (auth) = ?", ok=False, message="No accounts returned for this login.", holdings=[]))
             continue

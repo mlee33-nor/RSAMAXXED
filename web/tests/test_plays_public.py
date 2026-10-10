@@ -302,12 +302,12 @@ def test_the_dashboard_reads_before_javascript_runs(board):
 
 
 def test_the_settings_gear_offers_every_broker(board):
-    """The account counts are the multiplier for the whole dashboard, so all ten
-    brokers have to be settable — and the three that hold fractions marked."""
-    for key in ("bbae", "chase", "dspac", "fennel", "fidelity",
+    """The account counts are the multiplier for the whole dashboard, so every
+    broker has to be settable — and the three that hold fractions marked."""
+    for key in ("chase", "fennel", "fidelity",
                 "public", "robinhood", "schwab", "sofi", "wellsfargo"):
         assert f'data-broker="{key}"' in board, f"no account input for {key}"
-    assert board.count('data-broker=') == 10
+    assert board.count('data-broker=') == 8
 
 
 def test_a_broker_named_by_an_alert_can_be_told_apart_from_yours(board):
@@ -556,11 +556,11 @@ def payouts(anon):
     one that came back fractional."""
     anon.post("/api/v1/plays/ingest", headers=KEY, json={
         "buys": [
-            {"source_id": "p:1", "symbol": "ONLYCHASE", "alert_date": "2026-07-10",
+            {"source_id": "p:1", "symbol": "ONLYCHASE", "kind": "standard", "alert_date": "2026-07-10",
              "ratio": "1:11", "entry_price": 1.0, "last_buy_date": "2026-07-11"},
-            {"source_id": "p:2", "symbol": "WHOLE", "alert_date": "2026-07-10",
+            {"source_id": "p:2", "symbol": "WHOLE", "kind": "standard", "alert_date": "2026-07-10",
              "ratio": "1:11", "entry_price": 1.0, "last_buy_date": "2026-07-11"},
-            {"source_id": "p:3", "symbol": "FRAC", "alert_date": "2026-07-10",
+            {"source_id": "p:3", "symbol": "FRAC", "kind": "standard", "alert_date": "2026-07-10",
              "ratio": "1:11", "entry_price": 1.0, "last_buy_date": "2026-07-11"},
         ],
         "sells": [

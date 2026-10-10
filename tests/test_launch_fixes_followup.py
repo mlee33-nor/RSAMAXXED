@@ -161,12 +161,15 @@ class _Stub:
 
 def test_journal_error_is_surfaced_once(monkeypatch):
     err = {"v": None}
+    rec = {"v": None}
     monkeypatch.setattr(trade_journal, "last_error", lambda: err["v"])
+    monkeypatch.setattr(trade_journal, "last_recovery", lambda: rec["v"])
     s = _Stub()
     A.App._surface_journal_error(s)
     assert s.logs == [] and s.notes == []
 
-    err["v"] = "trades.json is corrupt (x); recovered 4 trades from trades.bak."
+    # A clean .bak recovery is reported via last_recovery(), not last_error().
+    rec["v"] = "trades.json is corrupt (x); recovered 4 trades from trades.bak."
     for _ in range(3):
         A.App._surface_journal_error(s)
     assert len(s.logs) == 1 and s.logs[0][1] == "warn"

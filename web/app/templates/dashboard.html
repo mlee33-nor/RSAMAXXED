@@ -36,8 +36,9 @@
       <b>Heads up:</b>
       {{ s.zero_basis_symbols | join(', ') }}
       {{ 'was' if s.zero_basis_symbols|length == 1 else 'were' }} bought without a recorded
-      fill price, so {{ 'its' if s.zero_basis_symbols|length == 1 else 'their' }} cost basis
-      counts as $0 and the profit above is overstated by whatever you actually paid.
+      fill price, so {{ 'it has' if s.zero_basis_symbols|length == 1 else 'they have' }} no
+      cost basis and {{ 'its sales are' if s.zero_basis_symbols|length == 1 else 'their sales are' }}
+      left out of the profit above rather than counted as pure profit.
       Everything else is exact.
     </div>
   {% endif %}

@@ -12,6 +12,8 @@ No browser, no network: every zendriver touchpoint is a fake.
 from __future__ import annotations
 
 import asyncio
+import json
+import gc
 import threading
 import time
 from types import SimpleNamespace
@@ -92,7 +94,10 @@ class _WFPage:
     async def sleep(self, *_a):
         pass
 
-    async def evaluate(self, *_a, **_k):
+    async def evaluate(self, js="", *_a, **_k):
+        if "btn-wfa-submit" in js:  # the post-submit result read
+            done = "confirm" in self.clicks
+            return json.dumps({"submit": not done, "ok": done, "alert": "", "url": ""})
         return ""
 
     async def select(self, sel, timeout=None):
@@ -299,6 +304,7 @@ class _FidPage:
         pass
 
     async def find(self, text, best_match=True):
+        self.selected = text.strip("()")
         return _FidEl(self, f"acct:{text}")
 
     async def select(self, sel, timeout=None):
@@ -309,16 +315,22 @@ class _FidPage:
         raise asyncio.TimeoutError(sel)
 
     async def evaluate(self, js, *_a, **_k):
-        if "placeOrderBtn" in js:
-            self.clicks.append("place")  # b.click() ran...
-            if self.js_place_raises is not None:
-                raise self.js_place_raises  # ...then the context went away
-            return True
+        # The confirmation poll also names #placeOrderBtn (it must be gone),
+        # so it is matched before the JS-click fallback.
         if "Order Received" in js:
             item = self.confirm_evals.pop(0) if len(self.confirm_evals) > 1 else self.confirm_evals[0]
             if isinstance(item, BaseException):
                 raise item
             return item
+        if "placeOrderBtn" in js:
+            self.clicks.append("place")  # b.click() ran...
+            if self.js_place_raises is not None:
+                raise self.js_place_raises  # ...then the context went away
+            return True
+        if "dest-acct-dropdown" in js:
+            return f"Individual ({getattr(self, 'selected', '')})"
+        if "eqt-shared-quantity" in js:
+            return "1"
         if "location.href" in js:
             return "https://digital.fidelity.com/ftgw/digital/trade-equity/index/orderEntry"
         return ""
@@ -397,6 +409,12 @@ def _fid_run(monkeypatch, pages, *, preview=None, accounts=("X11111111",),
     monkeypatch.setattr(fidelity, "_set_order_type", _noop)
     monkeypatch.setattr(fidelity, "_preview_and_check_error", _preview)
     monkeypatch.setattr(fidelity.random, "uniform", lambda a, b: 0.0)
+    # Collect HERE, on the main thread. Earlier tests leave tk Variables in
+    # reference cycles; if a GC pass lands on the trade's worker thread instead,
+    # Variable.__del__ waits ~1s for a Tk mainloop that is not running — longer
+    # than the 0.3s budget_s these tests use — and the run times out before it
+    # ever reaches Place Order. Load-dependent, so it failed only in full runs.
+    gc.collect()
     return fidelity.execute_trade(side="buy", qty="1", symbol="ABC")
 
 

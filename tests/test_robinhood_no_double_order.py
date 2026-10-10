@@ -31,11 +31,11 @@ class _StubRH:
             raise self.order_exc
         return self.order_result
 
-    def order_buy_market(self, sym, q, account_number=None):
+    def order_buy_market(self, sym, q, account_number=None, timeInForce="gtc"):
         self.market_calls.append((sym, q, account_number))
         return {"id": "mkt-1", "state": "queued"}
 
-    def order_sell_market(self, sym, q, account_number=None):
+    def order_sell_market(self, sym, q, account_number=None, timeInForce="gtc"):
         self.market_calls.append((sym, q, account_number))
         return {"id": "mkt-2", "state": "queued"}
 
@@ -71,13 +71,38 @@ def test_order_none_never_falls_through_to_market_helper(run):
     assert "verify" in msg and "submitted" in msg
 
 
-def test_type_error_still_falls_back_to_market_helper(run):
-    rh = _StubRH(order_exc=TypeError("unexpected keyword argument 'account_number'"))
+def test_type_error_from_order_never_falls_back_to_market_helper(run):
+    """Falling back on a TypeError raised by the call itself could send a
+    second order if the library raised it after its POST. The call shape is
+    chosen from the signature up front instead."""
+    rh = _StubRH(order_exc=TypeError("something inside order() broke"))
     out = run(rh)
 
-    assert len(rh.market_calls) == 1
+    assert rh.market_calls == []
     [acct] = out.accounts
-    assert acct.ok and acct.order_id == "mkt-1"
+    assert not acct.ok
+
+
+def test_order_without_account_kwarg_uses_market_helper(run):
+    """A build whose order() can't take account_number is routed to the market
+    helper before anything is sent, and the helper gets a day order."""
+    rh = _StubRH()
+
+    def narrow_order(symbol, quantity, side):
+        rh.order_calls.append((symbol, quantity, side))
+        return {"id": "never"}
+
+    def market(sym, q, account_number=None, timeInForce="gtc"):
+        rh.market_calls.append((sym, q, account_number, timeInForce))
+        return {"id": "mkt-1", "state": "queued"}
+
+    rh.order = narrow_order
+    rh.order_buy_market = market
+    out = run(rh)
+
+    assert rh.order_calls == []
+    assert [c[3] for c in rh.market_calls] == ["gfd"]
+    assert out.accounts[0].ok and out.accounts[0].order_id == "mkt-1"
 
 
 def test_missing_order_fn_uses_market_helper(run):
@@ -116,3 +141,16 @@ def test_fractional_none_reads_as_may_be_submitted(run):
     assert rh.market_calls == []
     [acct] = out.accounts
     assert not acct.ok and "verify" in acct.message.lower()
+
+
+def test_an_unreadable_non_dict_reply_is_verify_not_rejected(run):
+    # A reply we can't read after the POST is not proof of a refusal; calling
+    # it "rejected" let the mirror hand-back re-buy over a live order.
+    rh = _StubRH(order_result=["unexpected"])
+    out = run(rh)
+
+    assert rh.market_calls == []
+    [acct] = out.accounts
+    assert not acct.ok
+    msg = acct.message.lower()
+    assert "verify" in msg and "submitted" in msg and "rejected" not in msg

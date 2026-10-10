@@ -24,12 +24,12 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from .. import config, playsfeed, plans, security
+from .. import config, playsfeed, plans, privacy, security
 from ..db import get_db
 from ..deps import current_user, require_device
 from ..models import (
     Device, HoldingRow, HoldingSnapshot, PairingCode, Play, PlayExit,
-    PlayLifecycle, PlayRoundUp, Trade, User, utcnow,
+    PlayLifecycle, PlayRoundUp, Trade, UNKNOWN_KIND, User, utcnow,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -74,8 +74,11 @@ class TradeIn(BaseModel):
     @classmethod
     def _side(cls, v: str) -> str:
         v = v.lower().strip()
-        if v not in {"buy", "sell"}:
-            raise ValueError("side must be 'buy' or 'sell'")
+        # "close": a position a corporate action dissolved (the desktop's
+        # trade_journal.SIDE_CLOSE). Refusing it failed the WHOLE batch it was
+        # in; analytics already treats it as closing the holding, no P/L.
+        if v not in {"buy", "sell", "close"}:
+            raise ValueError("side must be 'buy', 'sell' or 'close'")
         return v
 
     @field_validator("timestamp")
@@ -184,20 +187,43 @@ def sync_trades(
             detail=f"send at most {config.MAX_TRADES_PER_REQUEST} trades per request",
         )
     if not body.trades:
-        return {"inserted": 0, "skipped": 0, "total": 0}
+        return {"inserted": 0, "updated": 0, "skipped": 0, "total": 0}
 
     incoming = {t.id: t for t in body.trades}  # dedupe within the batch itself
-    existing = set(
-        db.scalars(
-            select(Trade.client_id).where(
+    existing = {
+        row.client_id: row
+        for row in db.scalars(
+            select(Trade).where(
                 Trade.user_id == device.user_id, Trade.client_id.in_(list(incoming))
             )
         )
-    )
+    }
 
-    inserted = 0
+    inserted = updated = 0
     for cid, t in incoming.items():
-        if cid in existing:
+        # Never store an account number, whatever the client sent. An updated
+        # desktop masks before upload (and this is then a no-op); an old one
+        # still sends "(Z12345678)".
+        account_id = privacy.mask_account_id(t.account_id)
+        row = existing.get(cid)
+        if row is not None:
+            # A re-push of a trade we already hold updates what the desktop
+            # may legitimately change after the fact, and nothing else:
+            #   account_id  re-masked labels (one token per account)
+            #   fill_price  a price backfilled after the first push -- the
+            #               push can beat the worker's quote lookup, and a row
+            #               left unpriced here never reached realized P/L
+            #   symbol      a renamed ticker folded onto the name it was
+            #               bought as, once the desktop learnt the rename
+            # Never side, qty, broker or time: those are the trade itself.
+            changed = False
+            for name, value in (("account_id", account_id),
+                                ("fill_price", t.fill_price),
+                                ("symbol", t.symbol.upper())):
+                if getattr(row, name) != value:
+                    setattr(row, name, value)
+                    changed = True
+            updated += int(changed)
             continue
         db.add(
             Trade(
@@ -206,7 +232,7 @@ def sync_trades(
                 client_id=cid,
                 timestamp=t.timestamp,
                 broker=t.broker.lower(),
-                account_id=t.account_id,
+                account_id=account_id,
                 side=t.side,
                 symbol=t.symbol.upper(),
                 qty=t.qty,
@@ -219,7 +245,8 @@ def sync_trades(
     total = db.scalar(
         select(func.count()).select_from(Trade).where(Trade.user_id == device.user_id)
     )
-    return {"inserted": inserted, "skipped": len(incoming) - inserted, "total": total}
+    return {"inserted": inserted, "updated": updated,
+            "skipped": len(incoming) - inserted - updated, "total": total}
 
 
 @router.post("/sync/holdings")
@@ -240,7 +267,7 @@ def sync_holdings(
         snap.rows.append(
             HoldingRow(
                 broker=h.broker.lower(),
-                account_id=h.account_id,
+                account_id=privacy.mask_account_id(h.account_id),
                 symbol=h.symbol.upper(),
                 qty=h.qty,
                 value=h.value,
@@ -303,7 +330,8 @@ def whoami(device: Device = Depends(require_device)) -> dict[str, Any]:
 class PlayIn(BaseModel):
     source_id: str = Field(min_length=1, max_length=80)
     symbol: str = Field(min_length=1, max_length=24)
-    kind: str = "standard"
+    # No default promotion: a buy that does not say what it is is not a buy.
+    kind: str = Field(default=UNKNOWN_KIND, validate_default=True)
     alert_date: str = Field(default="", max_length=10)
     ratio: str = Field(default="", max_length=24)
     ratio_n: int | None = None
@@ -317,8 +345,33 @@ class PlayIn(BaseModel):
     @field_validator("kind")
     @classmethod
     def _kind(cls, v: str) -> str:
+        # Fail closed. Only an explicit "standard" is a standard play — the
+        # kind /plays/picks serves as "Reg Alert", the note every customer's
+        # mirror auto-buys. Blank or missing used to be promoted to standard on
+        # the theory that old clients never sent one; every publisher does
+        # (rsa_feed.BuyAlert always carries a kind), so a blank one is a type
+        # nobody could read and must not buy. Loose chat ("unverified") stays
+        # watch-only as before; any other word is filed as unknown.
         v = (v or "").lower().strip()
-        return v if v in {"standard", "otc", "conditional"} else "standard"
+        if v in {"standard", "otc", "conditional"}:
+            return v
+        if v == "unverified":
+            return "conditional"
+        return UNKNOWN_KIND
+
+    @field_validator("posted_at", mode="before")
+    @classmethod
+    def _posted(cls, v):
+        # rsa_feed.BuyAlert.posted_at defaults to "", which is "not known",
+        # not a reason to reject the whole batch.
+        return None if isinstance(v, str) and not v.strip() else v
+
+    @field_validator("last_buy_date")
+    @classmethod
+    def _last_buy(cls, v: str | None) -> str | None:
+        # Served to terminals as `last_buy`, which keeps a pick buyable through
+        # that day. Anything that is not a real YYYY-MM-DD is dropped.
+        return playsfeed.iso_day(v)
 
     @field_validator("symbol")
     @classmethod
@@ -675,20 +728,13 @@ def read_plays(
 def read_picks(
     user: User = Depends(require_feed_reader),
     db: Session = Depends(get_db),
-) -> list[dict[str, str]]:
-    """The three-key shape the desktop's picks.json has always held.
+) -> list[dict[str, Any]]:
+    """The shape the desktop's picks.json holds (see playsfeed.picks_json).
 
     Exists so the terminal can move off the public JSON blob and onto an
     authenticated feed without a single change to its mirror queue.
     """
-    notes = {"standard": "Reg Alert", "otc": "OTC", "conditional": "conditional"}
-    board = playsfeed.load_board(db)
-    return [
-        {"symbol": l.play.symbol,
-         "note": notes.get(l.play.kind, "Reg Alert"),
-         "date": l.play.alert_date}
-        for l in board.open_plays
-    ]
+    return playsfeed.picks_json(playsfeed.load_board(db))
 
 
 @router.get("/plays/lifecycle")
@@ -784,16 +830,9 @@ def read_plays_public(db: Session = Depends(get_db)) -> dict[str, Any]:
 
 
 @router.get("/public/plays/picks")
-def read_picks_public(db: Session = Depends(get_db)) -> list[dict[str, str]]:
+def read_picks_public(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     """Open plays in the shape picks.json holds. Open to any caller."""
-    notes = {"standard": "Reg Alert", "otc": "OTC", "conditional": "conditional"}
-    board = playsfeed.load_board(db)
-    return [
-        {"symbol": l.play.symbol,
-         "note": notes.get(l.play.kind, "Reg Alert"),
-         "date": l.play.alert_date}
-        for l in board.open_plays
-    ]
+    return playsfeed.picks_json(playsfeed.load_board(db))
 
 
 @router.get("/public/plays/lifecycle")

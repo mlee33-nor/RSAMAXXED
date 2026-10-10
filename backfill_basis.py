@@ -4,12 +4,12 @@
 WHY THIS EXISTS
 
 Profit is what you sold for minus what you paid. The second half goes missing
-in two ways, and they break the total in opposite directions:
+in two ways, and both drop real money from the total:
 
     no buy row at all       the symbol is skipped, so real proceeds vanish from
                             realized P/L.                       UNDERSTATES.
-    a buy row with no price  cost divides out to zero, so the whole of the
-                            proceeds books as profit.           OVERSTATES.
+    a buy row with no price  no basis to subtract, so (since 2026-10) the
+                            symbol is left out of realized.  UNDERSTATES.
 
 Neither is recoverable from anything the app stored — a trade placed outside
 this tool leaves no trace here, and a fill the broker never priced cannot be
@@ -108,12 +108,12 @@ def audit(trades: list[dict]) -> None:
         elif b["cost"] <= 0:
             found = True
             per = rev / sells[sym]["qty"] if sells[sym]["qty"] else 0
-            print(f"{sym:8}{rev:10.2f}  {b['n']} buys, none priced — counts as 100% profit")
+            print(f"{sym:8}{rev:10.2f}  {b['n']} buys, none priced — no basis, left out of realized P/L")
             print(f"{'':18}  fix: --symbol {sym} --price <what you paid>   (sold ~{per:,.4f})")
         elif b["unpriced"]:
             found = True
             print(f"{sym:8}{rev:10.2f}  {b['unpriced']} of {b['n']} buys unpriced — "
-                  f"average cost too low, profit too high")
+                  f"basis averaged over the priced ones only")
             print(f"{'':18}  fix: --symbol {sym} --price <what you paid>")
     if not found:
         print("nothing missing — every sold symbol has a real cost basis.")
@@ -213,6 +213,20 @@ def record_sale(trades: list[dict], symbol: str, broker: str,
     } for acct, qty in sorted(open_accounts.items())]
 
 
+def _insert_buys(trades: list[dict], made: list[dict], symbol: str) -> None:
+    """Put created buys just before the first sell of `symbol`, in place.
+
+    The split lens walks rows in FILE order, so a buy appended after its own
+    sell would never be seen opening the position it pays for. Inserting
+    there, rather than re-sorting the whole file, leaves every other row
+    exactly where it was.
+    """
+    at = next((i for i, t in enumerate(trades)
+               if t.get("symbol") == symbol and t.get("side") == "sell"),
+              len(trades))
+    trades[at:at] = made
+
+
 def _write(trades: list[dict]) -> None:
     """Back up, then write. Never overwrites a previous backup.
 
@@ -221,7 +235,10 @@ def _write(trades: list[dict]) -> None:
     captured the file AFTER the first had already changed it. The true original
     was gone, which is the one thing a backup exists to prevent.
     """
-    with trade_journal._lock:
+    # _writing(): the GUI's thread lock AND the cross-process journal lock,
+    # held across the version check and the save, so a trade the app records
+    # in between cannot be overwritten -- the check alone left a window.
+    with trade_journal._writing():
         if trade_journal.version() != _loaded_version:
             sys.exit("trades.json changed while this was running (a trade was "
                      "recorded?). Nothing written -- run it again.")
@@ -232,10 +249,11 @@ def _write(trades: list[dict]) -> None:
             backup = FILE.with_suffix(f".{stamp}-{n}.bak.json")
             n += 1
         shutil.copy2(FILE, backup)
-        # Sorted by time: the split lens in trade_journal walks rows in file
-        # order, and a created buy appended after its own sell would never be
-        # seen opening the position it pays for.
-        trades.sort(key=lambda t: str(t.get("timestamp") or ""))
+        # NOT re-sorted. It used to sort the whole journal by timestamp, which
+        # moved every after-the-fact correction (a `when=` row, deliberately
+        # appended so the split lens sees it AFTER the history it corrects) in
+        # front of trades it was recorded knowing about. Created buys are
+        # inserted ahead of their own first sell instead -- see _insert_buys.
         # The journal's own atomic save (temp + fsync + retried rename), never
         # write_text: truncate-then-write is a torn file for any reader that
         # lands in between, and a crash mid-write costs the whole history.
@@ -302,7 +320,7 @@ def main(argv=None) -> int:
         made = create_buys(trades, symbol, args.price)
         if not made:
             sys.exit(f"no {symbol} sells to build a basis against")
-        trades.extend(made)
+        _insert_buys(trades, made, symbol)
         qty = sum(t["qty"] for t in made)
         changed = made
         what = f"created {len(made)} buy row(s), {qty:g} share(s)"

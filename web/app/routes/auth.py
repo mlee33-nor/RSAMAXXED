@@ -9,8 +9,16 @@ from .. import config, plans, security
 from ..db import get_db
 from ..models import User
 from ..templating import render
+from .plays import _client, _record_failure, _throttled
 
 router = APIRouter()
+
+# Wrong-password throttle for /login, per caller address (see plays._client for
+# why that is the right-most X-Forwarded-For entry). In process memory, same
+# reasoning as the /plays one: the point is to make a guessing script slow.
+_login_attempts: dict[str, list[float]] = {}
+LOGIN_MAX_ATTEMPTS = 10
+LOGIN_ATTEMPT_WINDOW_SECONDS = 15 * 60
 
 
 def _redirect(path: str) -> RedirectResponse:
@@ -35,12 +43,18 @@ def login(
     if not security.csrf_ok(request.session.get("csrf"), csrf_token):
         return render(request, "login.html", error="Session expired. Try again.")
 
+    key = _client(request)
+    if _throttled(key, _login_attempts, LOGIN_MAX_ATTEMPTS, LOGIN_ATTEMPT_WINDOW_SECONDS):
+        return render(request, "login.html",
+                      error="Too many attempts. Wait 15 minutes.", email=email)
+
     user = db.scalar(select(User).where(User.email == email.strip().lower()))
 
     # Hash even when the user doesn't exist, so response time doesn't reveal
     # whether an email is registered.
     stored = user.password_hash if user else security.hash_password("no-such-user")
     if not security.verify_password(password, stored) or user is None:
+        _record_failure(key, _login_attempts)
         return render(request, "login.html", error="Wrong email or password.", email=email)
 
     request.session.clear()  # drop any pre-login session, defeats fixation

@@ -34,6 +34,13 @@ import fidelity
 import lifecycle
 
 
+@pytest.fixture(autouse=True)
+def _market_open(monkeypatch):
+    """A live auto-sell re-checks the market at fire time (it may have closed
+    during the holdings read); these tests are about what happens next."""
+    monkeypatch.setattr(A, "_market_status", lambda: ("open", "Markets open", None))
+
+
 # The header exactly as Fidelity wrote it on 2026-09-08.
 NEW_HEADER = ("Account number,Account name,Symbol,Description,Quantity,"
               "Last price,Last price change,Current value\n")

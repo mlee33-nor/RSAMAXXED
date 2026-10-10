@@ -80,6 +80,35 @@ app.add_middleware(
     max_age=14 * 24 * 3600,
 )
 
+class _HeadAsGet:
+    """Answer HEAD wherever GET is answered.
+
+    FastAPI routes declared with @router.get do not accept HEAD (Starlette's
+    plain Route adds it; APIRoute does not), so `HEAD /` -- what uptime
+    monitors, link checkers and `curl -I` send -- got a 405 in production.
+    The request runs as a GET and the body is dropped; status and headers,
+    Content-Length included, are exactly what the GET would send.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("method") != "HEAD":
+            return await self.app(scope, receive, send)
+        scope = dict(scope, method="GET")
+
+        async def send_headers_only(message):
+            if message.get("type") == "http.response.body":
+                message = {"type": "http.response.body", "body": b"",
+                           "more_body": message.get("more_body", False)}
+            await send(message)
+
+        return await self.app(scope, receive, send_headers_only)
+
+
+app.add_middleware(_HeadAsGet)
+
 app.mount("/static", StaticFiles(directory=os.path.join(_HERE, "static")), name="static")
 
 app.include_router(site.router)

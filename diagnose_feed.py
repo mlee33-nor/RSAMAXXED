@@ -24,46 +24,25 @@ def main() -> int:
         return 1
     print(f"{OK} Found the app folder: {HERE}")
 
-    # 2. Does a .env exist at all?  A fresh clone ships .env.example only.
+    # 2. The feed needs no .env, no password and no key (README section 5).
+    #    A .env is only loaded so a deployment-specific setting the app would
+    #    honour (a custom server URL, an old plays key) is honoured here too.
     env_file = HERE / ".env"
-    if not env_file.exists():
-        print(f"{BAD} There is no .env file.")
-        print("       You have .env.example, which is the template, not the")
-        print("       real thing. Copy it:   copy .env.example .env")
-        print("       then put your plays password in it (see step 4 below).")
-        return 1
-    print(f"{OK} .env exists")
+    if env_file.exists():
+        try:
+            from dotenv import load_dotenv
+        except ImportError:
+            print(f"{BAD} python-dotenv is not installed for THIS interpreter.")
+            print("       Run:  py -3.13 -m pip install -r requirements.txt")
+            print("       (a bare 'pip' installs into the wrong Python)")
+            return 1
+        load_dotenv(env_file, interpolate=False)
+        print(f"{OK} .env loaded")
+    else:
+        print(f"{INFO} No .env yet. The feed does not need one; your broker")
+        print("       logins will (copy .env.example to .env when you add them).")
 
-    # 3. Load it the same way the app does.
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        print(f"{BAD} python-dotenv is not installed for THIS interpreter.")
-        print("       Run:  py -3.13 -m pip install -r requirements.txt")
-        print("       (a bare 'pip' installs into the wrong Python)")
-        return 1
-    load_dotenv(env_file, interpolate=False)
-
-    # 4. Is the key present?
-    key = (os.environ.get("RSAMAXXED_PLAYS_KEY") or "").strip()
-    if not key:
-        print(f"{BAD} RSAMAXXED_PLAYS_KEY is not set in .env.")
-        print("       THIS IS ALMOST ALWAYS THE PROBLEM. Open .env, find the")
-        print("       line 'RSAMAXXED_PLAYS_KEY=' and put the password you")
-        print("       were given after the '='. No quotes, no spaces:")
-        print()
-        print("           RSAMAXXED_PLAYS_KEY=yourpasswordhere")
-        print()
-        print("       Make sure the line does NOT start with a '#'.")
-        return 1
-    print(f"{OK} RSAMAXXED_PLAYS_KEY is set ({len(key)} chars, "
-          f"starts '{key[:2]}...')")
-
-    if key != key.strip() or " " in key:
-        print(f"{INFO} Note: the key contains a space. That is usually a "
-              f"copy/paste slip.")
-
-    # 5. Ask the server, through the app's own client.
+    # 3. Ask the server, through the app's own client.
     sys.path.insert(0, str(HERE))
     try:
         import cloud_sync
@@ -75,16 +54,15 @@ def main() -> int:
     client = cloud_sync.CloudSync()
     print(f"{INFO} Server: {client.base_url if hasattr(client, 'base_url') else cloud_sync.DEFAULT_BASE_URL}")
     print(f"{INFO} Paired to an account: "
-          f"{'yes' if client.device_token else 'no (using the password, which is normal)'}")
+          f"{'yes' if client.device_token else 'no (the public feed, which is normal)'}")
 
     try:
         picks = client.fetch_picks()
     except Exception as exc:                       # noqa: BLE001
         print(f"{BAD} The server refused: {exc}")
         print()
-        print("       If it mentions the board password, the key in .env is")
-        print("       wrong or expired. Check it opens rsamaxxed.com/plays in")
-        print("       a browser -- same password, same spelling.")
+        print("       Check this PC can reach rsamaxxed.com in a browser. If")
+        print("       .env sets RSAMAXXED_CLOUD_URL, make sure it is correct.")
         return 1
 
     print(f"{OK} Server answered. Open picks right now: {len(picks)}")

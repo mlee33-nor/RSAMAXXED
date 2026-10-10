@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import pickle
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -10,7 +11,8 @@ from zoneinfo import ZoneInfo
 import uuid
 
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow
-from modules._2fa_prompt import universal_2fa_prompt
+from modules._2fa_prompt import request_text, universal_2fa_prompt
+from modules import http_timeouts
 
 BROKER = "fennel"
 OtpProvider = Callable[[str, int], Optional[str]]
@@ -140,15 +142,84 @@ def _looks_like_2fa(exc_text: str) -> bool:
 
 
 def _otp_provider_terminal() -> OtpProvider:
-    """OTP provider that prompts in the terminal."""
+    """OTP provider: asks through modules._2fa_prompt.
+
+    That is the GUI's modal when one is registered and the terminal for
+    runner.py. It used to call input() directly, which under pythonw has no
+    stdin (EOFError, so "OTP not received" with a code sitting on the phone)
+    and which robinhood.py may have patched process-wide at that moment.
+    """
     def provider(label: str, timeout_s: int) -> Optional[str]:
-        try:
-            raw = input(universal_2fa_prompt(label) + " ").strip()
-            digits = "".join(c for c in raw if c.isdigit())
-            return digits if len(digits) == 6 else None
-        except (EOFError, KeyboardInterrupt):
-            return None
+        raw = request_text(label, universal_2fa_prompt(label), int(timeout_s or 300)) or ""
+        digits = "".join(c for c in raw if c.isdigit())
+        return digits if len(digits) == 6 else None
     return provider
+
+
+def _order_refused(text: str) -> bool:
+    """fennel_invest_api's own words for an order POST answered 4xx: Fennel
+    looked at it and said no, so nothing is working."""
+    t = (text or "").lower()
+    return "order request failed with status code 4" in t
+
+
+def _login_label(idx0: int) -> str:
+    """The label a login's accounts trade under ("<label> · Account 1").
+
+    LOGIN 1 NEVER MOVES: it stays "Fennel" whether or not other logins exist.
+    It used to become "Fennel 1" the moment a second email was added, and
+    trades.json nets buys against sells on that exact account_id -- so adding
+    a login orphaned every open position at the first. See
+    multi-login-per-broker in broker_logins.py.
+    """
+    return "Fennel" if idx0 == 0 else f"Fennel {idx0 + 1}"
+
+
+def _open_fennel_client(Fennel: Any, pkl: str, sessions_dir: Path) -> Any:
+    """Construct the library client, surviving a truncated session pickle.
+
+    Fennel(...) unpickles its saved tokens in __init__, so a file cut short
+    (a kill mid-write, a sync client) raised EOFError/UnpicklingError there,
+    every time, and the login was dead until someone deleted the file by
+    hand. Move the bad file aside (kept for diagnosis) and start once more
+    without it -- that only costs a fresh email code.
+    """
+    try:
+        client = Fennel(filename=pkl, path=str(sessions_dir))
+    except (EOFError, pickle.UnpicklingError, AttributeError, ValueError) as e:
+        bad = Path(sessions_dir) / pkl
+        if not bad.exists():
+            raise
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        try:
+            bad.replace(bad.with_name(f"{bad.name}.corrupt-{stamp}"))
+        except OSError:
+            raise RuntimeError(f"Fennel session file {bad} is unreadable ({e}) "
+                               f"and could not be moved aside") from e
+        client = Fennel(filename=pkl, path=str(sessions_dir))
+    _harden_client(client)
+    return client
+
+
+def _harden_client(client: Any) -> None:
+    """Default timeout on the client's session, and a flag that says when the
+    order mutation is about to go out (see place_order_all)."""
+    http_timeouts.patch_session(getattr(client, "session", None))
+    ep = getattr(client, "endpoints", None)
+    build = getattr(ep, "stock_order_query", None)
+    if not callable(build) or getattr(build, "_rsa_tracked", False):
+        return
+
+    def stock_order_query(*args: Any, **kwargs: Any) -> Any:
+        # Built immediately before the order POST, and only for it.
+        client._rsa_order_attempted = True
+        return build(*args, **kwargs)
+
+    stock_order_query._rsa_tracked = True   # type: ignore[attr-defined]
+    try:
+        ep.stock_order_query = stock_order_query
+    except Exception:
+        pass
 
 
 @dataclass(frozen=True)
@@ -196,6 +267,11 @@ class FennelBroker:
         self.cfg = cfg
         self.otp_provider = otp_provider
         self._sessions: List[_LoginSession] = []
+        # The ok=False rows ensure_authenticated produced for logins that did
+        # not sign in. Trading and holdings report them alongside the logins
+        # that did: dropping them made one dead login's accounts vanish from a
+        # "success" result, with nothing for Retry or the exits board to see.
+        self._login_failures: List[AccountOutput] = []
 
     def _pkl_name(self, idx0: int) -> str:
         # Legacy naming
@@ -208,7 +284,7 @@ class FennelBroker:
             raise RuntimeError("Missing dependency: fennel-invest-api") from e
 
         pkl = self._pkl_name(idx0)
-        client = Fennel(filename=pkl, path=str(self.cfg.sessions_dir))
+        client = _open_fennel_client(Fennel, pkl, self.cfg.sessions_dir)
         return client, pkl
 
     def _get_accounts(self, client) -> List[Tuple[str, str]]:
@@ -275,9 +351,10 @@ class FennelBroker:
         any_ok = False
         any_fail = False
         self._sessions.clear()
+        self._login_failures = []
 
         for idx0, email in enumerate(self.cfg.emails):
-            label = "Fennel" if len(self.cfg.emails) == 1 else f"Fennel {idx0 + 1}"
+            label = _login_label(idx0)
             try:
                 client, pkl = self._make_client(idx0)
 
@@ -321,8 +398,14 @@ class FennelBroker:
                 any_fail = True
                 accounts_out.append(AccountOutput(account_id=label, ok=False, message=f"Auth failed: {e}"))
 
+        self._login_failures = [a for a in accounts_out if not a.ok]
         state = "success" if any_ok and not any_fail else ("partial" if any_ok and any_fail else "failed")
         return BrokerOutput(broker=BROKER, state=state, accounts=accounts_out, message="")
+
+    def _failed_login_rows(self, **extra: Any) -> List[AccountOutput]:
+        """Fresh copies of the failed-login rows (nothing was sent for them)."""
+        return [AccountOutput(account_id=a.account_id, ok=False, message=a.message, **extra)
+                for a in self._login_failures]
 
     # -------------------------------------------------------------------------
     # Trading / holdings
@@ -351,9 +434,9 @@ class FennelBroker:
                                 accounts=[AccountOutput(account_id="fennel", ok=False, message="Not authenticated.")],
                                 message="Not authenticated")
 
-        accounts_out: List[AccountOutput] = []
+        accounts_out: List[AccountOutput] = self._failed_login_rows()
         any_ok = False
-        any_fail = False
+        any_fail = bool(accounts_out)
 
         log_lines: List[str] = []
         log_lines.append("DRY RUN — NO ORDER SUBMITTED" if dry_run else "LIVE ORDER MODE")
@@ -375,6 +458,13 @@ class FennelBroker:
                     + f"account_id: {acct_id}"
                 )
 
+                # place_order runs several lookups (ISIN, tradability) before
+                # the order POST; _harden_client flips this flag just before
+                # the POST, so an exception can be placed on one side of it.
+                try:
+                    sess.client._rsa_order_attempted = False
+                except Exception:
+                    pass
                 try:
                     resp = sess.client.place_order(
                         account_id=acct_id,
@@ -403,7 +493,19 @@ class FennelBroker:
 
                 except Exception as e:
                     any_fail = True
-                    accounts_out.append(AccountOutput(account_id=account_label, ok=False, message=str(e), order_id=None))
+                    text = str(e)
+                    attempted = getattr(sess.client, "_rsa_order_attempted", False) is True
+                    if not dry_run and attempted and not _order_refused(text):
+                        # The order POST went out (a read timeout, a 5xx, a
+                        # body that wasn't JSON): Fennel may have taken it.
+                        text = ("Fennel raised an error after the order may have been "
+                                f"submitted ({text}) — verify in Fennel before retrying")
+                    elif not attempted:
+                        # The library refused before building the order POST
+                        # (market closed, no ISIN, not tradable, a lookup
+                        # failing): no order request was made.
+                        text = f"{text} — nothing was sent"
+                    accounts_out.append(AccountOutput(account_id=account_label, ok=False, message=text, order_id=None))
                     if dry_run:
                         log_lines.append(f"[{account_label}]")
                         log_lines.append(ticket)
@@ -420,20 +522,36 @@ class FennelBroker:
         return BrokerOutput(broker=BROKER, state=state, accounts=accounts_out, message=msg)
 
     def _interpret_order_response(self, resp: dict) -> Tuple[bool, str, Optional[str]]:
+        """Read the order mutation's reply. It only exists because the order
+        POST went out and came back 200, so anything this cannot read as a
+        plain refusal may be a live order and says to verify."""
         if not isinstance(resp, dict):
-            return False, "Unexpected response type", None
+            return False, ("Fennel sent an unexpected reply after the order may have "
+                           "been submitted — verify in Fennel before retrying"), None
 
         data = resp.get("data") or {}
-        status = data.get("createOrder")
+        status = data.get("createOrder") if isinstance(data, dict) else None
 
         if status == "pending":
             order_id = data.get("orderId") or resp.get("order_id") or None
             return True, "Success (pending)", str(order_id) if order_id else None
 
         if isinstance(status, str) and status:
-            return False, status, None
+            # fennel_invest_api documents only "pending". Any other word came
+            # back from a mutation that ran, so it is not a refusal we can
+            # trust -- calling it one let mirror buy the pick again.
+            return False, (f"Fennel answered '{status[:80]}' — the order may have been "
+                           f"submitted; verify in Fennel before retrying"), None
 
-        return False, "Unknown order response", None
+        errors = resp.get("errors")
+        if isinstance(errors, list) and errors:
+            # GraphQL's own refusal: the mutation did not run.
+            text = "; ".join(str((e or {}).get("message") if isinstance(e, dict) else e)
+                             for e in errors)[:300]
+            return False, f"Fennel refused the order: {text}", None
+
+        return False, ("Fennel's reply did not say what happened to the order, which may "
+                       "have been submitted — verify in Fennel before retrying"), None
 
     def get_holdings(self) -> BrokerOutput:
         if not self._sessions:
@@ -441,9 +559,9 @@ class FennelBroker:
                                 accounts=[AccountOutput(account_id="fennel", ok=False, message="Not authenticated.")],
                                 message="Not authenticated")
 
-        outs: List[AccountOutput] = []
+        outs: List[AccountOutput] = self._failed_login_rows(holdings=[])
         any_ok = False
-        any_fail = False
+        any_fail = bool(outs)
 
         def _f(x) -> Optional[float]:
             try:
@@ -461,9 +579,13 @@ class FennelBroker:
             for acct_name, acct_id in sess.accounts:
                 account_label = f"{sess.label} · {acct_name}"
                 try:
-                    raw = sess.client.get_stock_holdings(acct_id) or []
+                    raw = sess.client.get_stock_holdings(acct_id)
                     if not isinstance(raw, list):
-                        raw = []
+                        # A 200 whose positions list is missing is not an
+                        # empty account: reading it as one tells the exits
+                        # board this login holds nothing.
+                        raise RuntimeError(
+                            f"Fennel holdings reply had no positions list ({type(raw).__name__})")
 
                     rows: List[HoldingRow] = []
                     parsed = 0
@@ -538,7 +660,7 @@ def _get_otp_provider() -> OtpProvider:
     return _otp_provider_terminal()
 
 
-def _ensure_session_like_legacy() -> Tuple[Optional[FennelBroker], str]:
+def _ensure_session_like_legacy() -> Tuple[Optional[FennelBroker], str, List[AccountOutput]]:
     """
     EXACT legacy behavior mapped into RSAMAXXED:
       - ALWAYS call login() (PKL makes it cheap when valid)
@@ -548,7 +670,8 @@ def _ensure_session_like_legacy() -> Tuple[Optional[FennelBroker], str]:
 
     cfg = FennelConfig.from_env()
     if cfg is None:
-        return None, "Missing FENNEL_EMAIL (or FENNEL) in credentials/brokers.env"
+        msg = "Missing FENNEL_EMAIL (or FENNEL) in credentials/brokers.env"
+        return None, msg, [AccountOutput(account_id="fennel", ok=False, message=msg)]
 
     otp_provider = _get_otp_provider()
 
@@ -556,7 +679,7 @@ def _ensure_session_like_legacy() -> Tuple[Optional[FennelBroker], str]:
     out = b.ensure_authenticated()
     if out.state in ("success", "partial") and b._sessions:
         _BROKER = b
-        return _BROKER, "ok"
+        return _BROKER, "ok", []
 
     # Best message
     msg = (out.message or "").strip() or "Auth failed"
@@ -564,7 +687,11 @@ def _ensure_session_like_legacy() -> Tuple[Optional[FennelBroker], str]:
         if not getattr(a, "ok", False) and (a.message or "").strip():
             msg = a.message.strip()
             break
-    return None, msg
+    # Every login's own row, not one "fennel" row: with two logins down, the
+    # second one's failure used to disappear behind the first one's message.
+    rows = [AccountOutput(account_id=a.account_id, ok=False, message=a.message)
+            for a in (out.accounts or []) if not getattr(a, "ok", False)]
+    return None, msg, rows or [AccountOutput(account_id="fennel", ok=False, message=msg)]
 
 
 def bootstrap(*args, **kwargs) -> BrokerOutput:
@@ -580,27 +707,32 @@ def bootstrap(*args, **kwargs) -> BrokerOutput:
     The failure path looked fine only by accident: raising skipped the attribute
     access altogether. Nothing surfaced until Fennel could actually log in again.
     """
-    b, msg = _ensure_session_like_legacy()
+    b, msg, failed = _ensure_session_like_legacy()
     if b is None:
-        return BrokerOutput(
-            broker=BROKER, state="failed",
-            accounts=[AccountOutput(account_id="fennel", ok=False, message=msg)],
-            message=msg)
+        return BrokerOutput(broker=BROKER, state="failed", accounts=failed, message=msg)
 
     accounts = [
         AccountOutput(account_id=f"{sess.label} · {name}", ok=True, message="ready")
         for sess in b._sessions
         for name, _acct_id in sess.accounts
     ]
+    n_ready = len(accounts)
+    # A login that did not sign in keeps its row. State stays "success" while
+    # any login works: the app paints a non-success bootstrap as a red,
+    # disconnected broker, and the working logins can still trade.
+    failed = b._failed_login_rows()
+    accounts += failed
+    note = (f"; {len(failed)} login(s) failed: " + ", ".join(a.account_id for a in failed)
+            if failed else "")
     return BrokerOutput(
         broker=BROKER, state="success", accounts=accounts,
-        message=f"Authenticated ({len(accounts)} accounts)")
+        message=f"Authenticated ({n_ready} accounts){note}")
 
 
 def get_holdings() -> BrokerOutput:
-    b, why = _ensure_session_like_legacy()
+    b, why, failed = _ensure_session_like_legacy()
     if b is None:
-        return BrokerOutput(broker=BROKER, state="failed", accounts=[AccountOutput(account_id="fennel", ok=False, message=why)], message=why)
+        return BrokerOutput(broker=BROKER, state="failed", accounts=failed, message=why)
     return b.get_holdings()
 
 
@@ -609,9 +741,9 @@ def get_accounts() -> BrokerOutput:
 
 
 def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) -> BrokerOutput:
-    b, why = _ensure_session_like_legacy()
+    b, why, failed = _ensure_session_like_legacy()
     if b is None:
-        return BrokerOutput(broker=BROKER, state="failed", accounts=[AccountOutput(account_id="fennel", ok=False, message=why)], message=why)
+        return BrokerOutput(broker=BROKER, state="failed", accounts=failed, message=why)
 
     try:
         q = float(qty)
@@ -655,10 +787,10 @@ def healthcheck() -> BrokerOutput:
     any_fail = False
 
     for idx0, email in enumerate(cfg.emails):
-        label = "Fennel" if len(cfg.emails) == 1 else f"Fennel {idx0 + 1}"
+        label = _login_label(idx0)
         pkl = f"fennel{idx0 + 1}.pkl"
         try:
-            client = Fennel(filename=pkl, path=str(cfg.sessions_dir))
+            client = _open_fennel_client(Fennel, pkl, cfg.sessions_dir)
             # probe by hitting accounts without login
             try:
                 _ = client.get_full_accounts()

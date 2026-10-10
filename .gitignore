@@ -83,3 +83,14 @@ sells_confirmed.json
 # runtime state (per-machine)
 public_late_checked.json
 roundup_radar.json
+
+# Unreadable state files are copied aside before anything can overwrite them
+# (trades.unreadable-<stamp>.json, etf_trades.unreadable-..., cloud_state...),
+# and corrupt archives as <name>.corrupt-<stamp>. Both hold real data.
+*.unreadable-*.json
+*.corrupt-*
+# Single-instance lock (fallback when the Windows mutex is unavailable)
+.rsamaxxed.lock
+
+# Cross-process journal locks (modules/atomic.file_lock).
+*.json.lock

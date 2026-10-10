@@ -120,10 +120,9 @@ def test_only_three_brokers_return_a_fraction():
     assert rsa_feed.returns_fraction("robinhood")
     assert rsa_feed.returns_fraction("Public")
     assert rsa_feed.returns_fraction("sofi")
-    for broker in ("Fidelity", "Schwab", "Chase", "Wells Fargo",
-                   "BBAE", "DSPAC", "Fennel"):
+    for broker in ("Fidelity", "Schwab", "Chase", "Wells Fargo", "Fennel"):
         assert not rsa_feed.returns_fraction(broker), broker
-    # The two sets partition the ten brokers we execute in.
+    # The two sets partition the brokers we execute in.
     assert (set(rsa_feed.FRACTIONAL_BROKERS) | set(rsa_feed.CASH_IN_LIEU_BROKERS)
             == set(rsa_feed.SUPPORTED_BROKERS))
 

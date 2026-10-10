@@ -100,10 +100,6 @@ def _f(name: str, env: str, label: str, **kw) -> Field:
 
 
 SCHEMAS: Dict[str, Schema] = {
-    "bbae": Schema(
-        broker="bbae", display="BBAE", style="keyed",
-        fields=(_f("username", "BBAE_USER", "Email / Username", secret=False),
-                _f("password", "BBAE_PASSWORD", "Password"))),
     "chase": Schema(
         broker="chase", display="Chase", style="keyed",
         # Not an email — see the chase-login-silent-reject note. Saying so on
@@ -111,10 +107,6 @@ SCHEMAS: Dict[str, Schema] = {
         fields=(_f("username", "CHASE_USERNAME", "Username (not your email)",
                    secret=False),
                 _f("password", "CHASE_PASSWORD", "Password"))),
-    "dspac": Schema(
-        broker="dspac", display="DSPAC", style="keyed",
-        fields=(_f("username", "DSPAC_USER", "Email / Username", secret=False),
-                _f("password", "DSPAC_PASSWORD", "Password"))),
     "fennel": Schema(
         broker="fennel", display="Fennel", style="csv", blob="FENNEL_EMAIL",
         fields=(_f("email", "FENNEL_EMAIL", "Email", secret=False),)),
@@ -256,13 +248,35 @@ def _tag(broker: str, idx: int) -> str:
 # Reading
 # ---------------------------------------------------------------------------
 
+def split_fields(item: str, schema: Schema) -> List[str]:
+    """One login's 'user:pass[:totp]' item, split so a ':' in the PASSWORD
+    stays in the password.
+
+    A plain split(':') cut "pa:ss" down to "pa". Usernames and TOTP secrets
+    never contain the separator, so once an item has MORE pieces than the
+    schema has fields, everything between the first piece and the TOTP slot
+    is the password. An item with no extra pieces splits exactly as it
+    always did, so every blob already on disk reads the same; env_updates
+    keeps an empty TOTP slot ("u:pa:ss:") whenever a password holds the
+    separator, which is what makes "u:pa:ss" never ambiguous on the way back.
+    """
+    sep = schema.sep
+    parts = item.split(sep)
+    names = schema.field_names
+    if len(names) < 2 or names[1] != "password" or len(parts) <= len(names):
+        return parts
+    after = len(names) - 2              # fields after the password (the TOTP)
+    cut = len(parts) - after
+    return [parts[0], sep.join(parts[1:cut])] + parts[cut:]
+
+
 def _split_list(raw: str, schema: Schema) -> List[Dict[str, str]]:
     """'user:pass:totp,user2:pass2' -> a values dict per login."""
     out: List[Dict[str, str]] = []
     for item in (p.strip() for p in raw.split(",")):
         if not item:
             continue
-        parts = item.split(schema.sep)
+        parts = split_fields(item, schema)
         values = {}
         for i, f in enumerate(schema.fields):
             values[f.name] = (parts[i].strip() if i < len(parts) else "")
@@ -391,6 +405,12 @@ def env_updates(broker: str, rows: Sequence[Dict[str, str]]) -> Dict[str, str]:
             vals = [str(r.get(f.name, "") or "").strip() for f in schema.fields]
             while vals and not vals[-1]:        # don't write trailing ':'
                 vals.pop()
+            if (len(schema.fields) > 2 and len(vals) == 2
+                    and schema.sep in vals[1]):
+                # A ':' in the password with no TOTP: keep the empty TOTP slot
+                # ("u:pa:ss:"), or reading it back would take "ss" for the TOTP
+                # -- see split_fields.
+                vals.append("")
             parts.append(schema.sep.join(vals))
         updates[schema.blob] = ",".join(parts)
         # The single-login keys would otherwise shadow nothing but confuse the
@@ -489,16 +509,16 @@ def session_suffix(idx: int) -> str:
 # Running a single-login broker module once per login
 # ---------------------------------------------------------------------------
 #
-# Five of these modules — BBAE, Chase, DSPAC, SoFi, Wells Fargo — were written
-# around exactly one set of credentials: module-global clients, one cookie jar,
-# one browser profile, one `bbae.pkl`. Teaching each of them to loop internally
-# means five separate rewrites of five working login flows, and a broker login
+# Three of these modules — Chase, SoFi, Wells Fargo — were written around
+# exactly one set of credentials: module-global clients, one cookie jar, one
+# browser profile. Teaching each of them to loop internally means three
+# separate rewrites of three working login flows, and a broker login
 # is the one thing in this app that cannot be tested without a real account.
 #
 # So none of them are rewritten. Each keeps its single-login body exactly as it
 # is, and this driver runs that body once per login with the environment and
 # the session directory pointed at that login. One mechanism, tested here,
-# instead of five hand-rolled loops.
+# instead of three hand-rolled loops.
 #
 # WHAT MAKES IT SAFE: with one login configured, `fan_out` calls the original
 # function once, with the environment untouched and no label prefix — the same
@@ -527,6 +547,59 @@ def _lock(broker: str) -> threading.Lock:
     return _locks.setdefault(broker, threading.Lock())
 
 
+# ---------------------------------------------------------------------------
+# The env is shared with whoever re-reads .env
+# ---------------------------------------------------------------------------
+#
+# `activated` points the plain env keys at one login for as long as that
+# login's call runs. The app re-reads .env with override=True on other threads
+# (every trade, refresh and bootstrap), and a bare load_dotenv there wrote
+# login 1's password back over login 2's mid-call: login 2's session signed in
+# as login 1. So every env write goes through one lock, and keys an active
+# login holds are kept -- what .env now says for them is what that login's
+# restore puts back afterwards.
+
+_env_lock = threading.RLock()
+#: env key -> the value an active `activated` set it to.
+_pinned: Dict[str, str] = {}
+#: Each active `activated`'s saved snapshot, so a reload can update what it
+#: restores.
+_snapshots: List[Dict[str, Optional[str]]] = []
+
+
+def _defer_pinned(key: str, value: Optional[str]) -> None:
+    """`key` is held by an active login: record `value` as what to restore."""
+    for saved in _snapshots:
+        if key in saved:
+            saved[key] = value
+
+
+def reload_env(path, load=None) -> None:
+    """load_dotenv(path, override=True) that cannot clobber an active login.
+
+    `load` is the loader to use (the app passes its own `load_dotenv`, so a
+    test's patch of it holds); python-dotenv's by default."""
+    if load is None:
+        from dotenv import load_dotenv as load
+    with _env_lock:
+        load(path, override=True, interpolate=False)
+        for key, val in _pinned.items():
+            now = os.environ.get(key)
+            if now != val:
+                _defer_pinned(key, now)
+                os.environ[key] = val
+
+
+def set_env(updates: Dict[str, str]) -> None:
+    """Set env keys (a .env save), deferring any an active login holds."""
+    with _env_lock:
+        for key, val in (updates or {}).items():
+            if key in _pinned:
+                _defer_pinned(key, val)
+            else:
+                os.environ[key] = val
+
+
 @contextmanager
 def activated(login: "Login", module=None):
     """Make one login the one the broker module sees.
@@ -551,20 +624,33 @@ def activated(login: "Login", module=None):
     saved: Dict[str, Optional[str]] = {}
     prev = _active.get(login.broker, 1)
     switch = getattr(module, "_on_login_switch", None) if module else None
+    outer: Dict[str, str] = {}
     try:
-        for f in schema.fields:
-            saved[f.env] = os.environ.get(f.env)
-            os.environ[f.env] = login.get(f.name)
+        with _env_lock:
+            _snapshots.append(saved)
+            for f in schema.fields:
+                saved[f.env] = os.environ.get(f.env)
+                if f.env in _pinned:
+                    outer[f.env] = _pinned[f.env]
+                val = login.get(f.name)
+                os.environ[f.env] = val
+                _pinned[f.env] = val
         _active[login.broker] = login.idx
         if switch:
             switch(login.idx)
         yield login
     finally:
-        for key, val in saved.items():
-            if val is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = val
+        with _env_lock:
+            _snapshots[:] = [s for s in _snapshots if s is not saved]
+            for key, val in saved.items():
+                if key in outer:
+                    _pinned[key] = outer[key]
+                else:
+                    _pinned.pop(key, None)
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
         _active[login.broker] = prev
         if switch:
             switch(prev)
@@ -621,11 +707,36 @@ def _merge(broker: str, parts: List, module) -> object:
                         accounts=accounts, message="; ".join(messages), extra=extra)
 
 
+#: An exception's own words that say no order went out. Anything else raised
+#: out of a live order call may have an order behind it.
+_RAISED_NOTHING_SENT = ("not sent", "nothing sent", "nothing was sent",
+                        "no order was sent", "no order was placed",
+                        "login failed", "auth failed", "could not log in")
+
+
+def _raised_message(exc: BaseException, kwargs: Dict) -> str:
+    """The failed-account message for a login whose call raised.
+
+    For a live order (execute_trade: a `side` and no dry run) the exception
+    can come after the order POST -- and a bare error reads to the app as
+    "nothing sent", which invites a duplicate from Retry, auto-sell and
+    mirror. So unless it positively says nothing went out, it says to verify,
+    in the words the app's may-exist check reads ("submitted" + "verify").
+    """
+    text = str(exc) or type(exc).__name__
+    live_order = bool(kwargs.get("side")) and not kwargs.get("dry_run")
+    low = text.lower()
+    if not live_order or "verify" in low or any(w in low for w in _RAISED_NOTHING_SENT):
+        return text
+    return (f"{text} — raised mid-order; the order may have been submitted, "
+            f"verify at the broker before sending it again")
+
+
 def fan_out(broker: str, module, fn, *args, **kwargs):
     """Call a single-login `fn` once per configured login and merge the results.
 
     With zero or one login this is a straight pass-through — including the
-    zero case, so a module's own "Missing BBAE_USER" error still reaches the
+    zero case, so a module's own "Missing CHASE_USERNAME" error still reaches the
     user in its own words rather than being replaced by a generic one here.
     """
     rows = logins(broker)
@@ -644,10 +755,11 @@ def fan_out(broker: str, module, fn, *args, **kwargs):
                 except Exception as exc:       # noqa: BLE001
                     # One login blowing up must not cost the others. It is
                     # reported as its own failed account rather than swallowed.
+                    msg = _raised_message(exc, kwargs)
                     out = module.BrokerOutput(
                         broker=getattr(module, "BROKER", broker), state="failed",
                         accounts=[module.AccountOutput(
-                            account_id=login.label, ok=False, message=str(exc))],
-                        message=str(exc))
+                            account_id=login.label, ok=False, message=msg)],
+                        message=msg)
             parts.append((login.idx, _prefixed(out, login.label_prefix)))
     return _merge(broker, parts, module)

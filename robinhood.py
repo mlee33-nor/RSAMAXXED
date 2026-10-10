@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import builtins
 import contextlib
+import functools
 import getpass
 import io
 import inspect
@@ -23,6 +24,7 @@ from modules.outputs import BrokerOutput, AccountOutput, HoldingRow
 from modules import _2fa_prompt
 from modules._2fa_prompt import universal_2fa_prompt
 from modules import broker_logging as BLOG
+from modules import http_timeouts
 
 BROKER = "robinhood"
 
@@ -31,8 +33,42 @@ _QUOTE_UNSUPPORTED: set[str] = set()
 
 # [(display_label, account_number, login_pickle_name)]
 _ACCOUNTS: List[Tuple[str, str, str]] = []
+#: (login name, why) for each login whose session came back but whose account
+#: list could not be read in the last _ensure_session. Trades and holdings
+#: report a failed row per entry so the run is partial, not a quiet success.
+_LOGIN_LOAD_FAILURES: List[Tuple[str, str]] = []
 
 _ET = ZoneInfo("America/New_York")
+
+#: robin_stocks keeps ONE requests.Session for the whole process, and a login
+#: works by writing that login's token into its Authorization header. With two
+#: logins, "rehydrate login 2, then read login 1's positions" from two threads
+#: reads (or trades) under the wrong token. Every public entry point holds this
+#: for its whole run, so each login+call pair sees its own token. Always taken
+#: BEFORE _INPUT_PATCH_LOCK, never after, so the two cannot deadlock.
+_SESSION_LOCK = threading.RLock()
+
+
+#: How long a call waits for another Robinhood call to finish. Bounded: a
+#: wedged login (or a stuck read) used to queue every later trade behind it
+#: with no end, and the app's watchdog wrote the whole broker off.
+_SESSION_LOCK_WAIT_S = 900.0
+
+
+def _serialized(fn: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if not _SESSION_LOCK.acquire(timeout=_SESSION_LOCK_WAIT_S):
+            msg = (f"Robinhood is still busy with another request after "
+                   f"{int(_SESSION_LOCK_WAIT_S)}s — nothing was sent")
+            return BrokerOutput(broker=BROKER, state="failed", message=msg,
+                                accounts=[AccountOutput(account_id="Robinhood",
+                                                        ok=False, message=msg)])
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _SESSION_LOCK.release()
+    return wrapper
 
 for _lname in ("robin_stocks", "urllib3", "requests"):
     try:
@@ -399,9 +435,93 @@ def _write_dry_run_log(*, content: str) -> str:
 def _load_rh():
     try:
         import robin_stocks.robinhood as rh  # type: ignore
-        return rh, None
     except Exception as e:
         return None, f"Missing dependency: robin-stocks ({e})"
+    _harden_session(rh)
+    return rh, None
+
+
+#: Login threads _run_login_bounded gave up on. Their next request through
+#: robin_stocks' session raises, which ends the thread instead of leaving it
+#: polling Robinhood (and burning the rate limit) for the rest of the session.
+_ABANDONED_LOGIN_THREADS: set = set()
+
+
+def _harden_session(rh) -> None:
+    """Bound robin_stocks' shared requests.Session.
+
+    request_get passes no timeout at all, so one stalled socket hung a
+    holdings read -- or a login, inside _INPUT_PATCH_LOCK -- indefinitely.
+    Also lets an abandoned login thread be stopped at its next request.
+    Idempotent; never raises.
+    """
+    try:
+        helper = getattr(rh, "helper", None)
+        sess = getattr(helper, "SESSION", None)
+        if sess is None:
+            sess = getattr(getattr(rh, "globals", None), "SESSION", None)
+        if sess is None:
+            return
+        http_timeouts.patch_session(sess)
+        if getattr(sess, "_rsa_login_guard", False):
+            return
+        inner = sess.request
+
+        def request(*args, **kwargs):
+            if threading.get_ident() in _ABANDONED_LOGIN_THREADS:
+                raise RuntimeError("Robinhood login was abandoned (it timed out)")
+            return inner(*args, **kwargs)
+
+        sess.request = request
+        sess._rsa_login_guard = True
+    except Exception:
+        pass
+
+
+#: How long one interactive Robinhood login may take, device approval
+#: included. robin_stocks polls the approval with `while True`, so without a
+#: bound an approval that never comes holds _INPUT_PATCH_LOCK forever.
+_LOGIN_TIMEOUT_S = 600.0
+
+
+#: The login failure for a code prompt the user cancelled or let time out.
+_CODE_NOT_ENTERED = "Robinhood code not entered — login failed, nothing was sent"
+
+
+def _run_login_bounded(login_fn: Callable[..., Any], call_kwargs: Dict[str, Any],
+                       timeout_s: Optional[float] = None) -> Any:
+    """Call robin_stocks' login() in a worker thread and wait at most timeout_s.
+
+    On timeout the thread is marked abandoned (see _harden_session) and this
+    raises, so the caller releases the input patch and reports a failure the
+    user can retry. Nothing here places an order.
+    """
+    limit = float(_LOGIN_TIMEOUT_S if timeout_s is None else timeout_s)
+    box: Dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            box["result"] = login_fn(**call_kwargs)
+        except BaseException as e:      # noqa: BLE001 -- handed to the caller
+            box["exc"] = e
+        finally:
+            # Thread idents are reused once a thread ends.
+            _ABANDONED_LOGIN_THREADS.discard(threading.get_ident())
+
+    t = threading.Thread(target=target, name="robinhood-login", daemon=True)
+    t.start()
+    t.join(limit)
+    if t.is_alive():
+        if t.ident is not None:
+            _ABANDONED_LOGIN_THREADS.add(t.ident)
+            if not t.is_alive():        # ended in between: don't strand the id
+                _ABANDONED_LOGIN_THREADS.discard(t.ident)
+        raise RuntimeError(
+            f"Robinhood login did not finish within {int(limit)}s (the device "
+            f"approval or code never came through) — run the login again")
+    if "exc" in box:
+        raise box["exc"]
+    return box.get("result")
 
 
 def _get_login_callable(rh):
@@ -423,6 +543,9 @@ def _get_login_callable(rh):
 # _is_joint_account below, so this bounds what is left: a fourth funded account
 # appearing on its own is a surprise, and surprises should not be traded
 # automatically. Override with ROBINHOOD_MAX_TRADE_ACCOUNTS (0 = no limit).
+#
+# PER LOGIN. Counted across every login, a household's second login (three
+# more accounts of its own) was cut off entirely as "over the limit".
 _DEFAULT_MAX_TRADE_ACCOUNTS = 3
 
 
@@ -491,52 +614,63 @@ def _safe_load_accounts(rh) -> List[Dict[str, Any]]:
     """
     Legacy used: rh.account.load_account_profile(dataType="results")
     Use that first; fallback if needed.
+
+    RAISES when the read itself failed. It used to swallow the error and
+    return [], so a read timeout on login 2 left that login's accounts out of
+    the run with nothing said, and the trade reported success.
     """
-    try:
-        fn = getattr(getattr(rh, "account", None), "load_account_profile", None)
-        if callable(fn):
+    first_err: Optional[BaseException] = None
+    for mod_name in ("account", "profiles"):
+        fn = getattr(getattr(rh, mod_name, None), "load_account_profile", None)
+        if not callable(fn):
+            continue
+        try:
             with _suppress_console_noise():
                 rows = fn(dataType="results") or []
             return rows if isinstance(rows, list) else []
-    except Exception:
-        pass
-
-    try:
-        fn = getattr(getattr(rh, "profiles", None), "load_account_profile", None)
-        if callable(fn):
-            with _suppress_console_noise():
-                rows = fn(dataType="results") or []
-            return rows if isinstance(rows, list) else []
-    except Exception:
-        pass
-
+        except Exception as e:
+            first_err = first_err or e
+    if first_err is not None:
+        raise RuntimeError(
+            f"could not load the account list ({type(first_err).__name__}: {first_err})"
+        ) from first_err
     return []
 
 
 def _safe_open_positions(rh, *, account_number: str) -> List[Dict[str, Any]]:
+    """The account's open positions. RAISES when the read failed.
+
+    It used to return [] for every failure, and so does robin_stocks:
+    request_get answers an HTTP error with [None], which filter_data turns
+    into [] -- exactly what an account holding nothing returns. A 401 or 429
+    therefore read as "holds no stock", which the exits board and auto-sell
+    take as "already sold". So the positions URL is fetched through the
+    library's own request_get, where the [None] marker is still visible.
+    Library builds without that seam fall back to get_open_stock_positions.
     """
-    Legacy used: obj.get_open_stock_positions(account_number=account)
-    Try common call sites.
-    """
-    try:
-        fn = getattr(getattr(rh, "account", None), "get_open_stock_positions", None)
+    helper = getattr(rh, "helper", None)
+    urls = getattr(rh, "urls", None)
+    req = getattr(helper, "request_get", None)
+    purl = getattr(urls, "positions_url", None)
+    if callable(req) and callable(purl):
+        with _suppress_console_noise():
+            data = req(purl(account_number=account_number), "pagination",
+                       {"nonzero": "true"})
+        if not isinstance(data, list) or data == [None]:
+            raise RuntimeError("Robinhood positions read failed (Robinhood "
+                               "returned an error) — holdings unknown")
+        return [row for row in data if isinstance(row, dict)]
+
+    for owner in (getattr(rh, "account", None), rh):
+        fn = getattr(owner, "get_open_stock_positions", None)
         if callable(fn):
             with _suppress_console_noise():
-                rows = fn(account_number=account_number) or []
-            return rows if isinstance(rows, list) else []
-    except Exception:
-        pass
-
-    try:
-        fn = getattr(rh, "get_open_stock_positions", None)
-        if callable(fn):
-            with _suppress_console_noise():
-                rows = fn(account_number=account_number) or []
-            return rows if isinstance(rows, list) else []
-    except Exception:
-        pass
-
-    return []
+                rows = fn(account_number=account_number)
+            if not isinstance(rows, list):
+                raise RuntimeError("Robinhood positions read failed (no "
+                                   "positions in the reply) — holdings unknown")
+            return rows
+    raise RuntimeError("this robin-stocks build has no positions read")
 
 
 def _symbol_from_instrument(rh, instrument_url: str) -> str:
@@ -711,7 +845,11 @@ def login_with_cache(*, rh, pickle_name: str) -> None:
     try:
         with _block_interactive_prompts(context=f"cache rehydrate ({pickle_name})"):
             with _suppress_console_noise():
-                login_fn(**call_kwargs)
+                result = login_fn(**call_kwargs)
+        if result is None:
+            # robin_stocks reports a failed login by printing "Login failed"
+            # and returning None, never by raising.
+            raise RuntimeError("robin_stocks login() returned no session")
     except Exception as e:
         detail = f"{type(e).__name__}: {e}"
         log_text = "\n".join(
@@ -728,6 +866,20 @@ def login_with_cache(*, rh, pickle_name: str) -> None:
             f"Cached Robinhood session for {pickle_name} is invalid/expired. "
             f"Interactive re-login required.{extra}"
         ) from e
+
+
+def _account_display(profiles: List[Tuple[str, str, str]], pickle_name: str,
+                     base_label: str) -> str:
+    """The account_id an account is traded and journaled under.
+
+    LOGIN 1 NEVER MOVES. It used to gain a "Robinhood 1 | " prefix the moment
+    a second login was added, and trades.json nets buys against sells on this
+    exact string -- so adding a login orphaned every open position at the
+    first. Only logins 2 and up carry the prefix that tells them apart.
+    """
+    if profiles and pickle_name == profiles[0][0]:
+        return base_label
+    return f"{pickle_name} | {base_label}"
 
 
 def _login_profiles() -> List[Tuple[str, str, str]]:
@@ -761,6 +913,7 @@ def _login_profiles() -> List[Tuple[str, str, str]]:
     return []
 
 
+@_serialized
 def bootstrap() -> BrokerOutput:
     """
     Interactive login (OTP) that writes the pickle into sessions/robinhood/creds/
@@ -807,6 +960,8 @@ def bootstrap() -> BrokerOutput:
     except Exception:
         params = {}
 
+    _code_skipped = {"v": False}
+
     def _login_prompt(prompt: str = "") -> str:
         """Answer whatever robin_stocks asks for during the login.
 
@@ -815,12 +970,19 @@ def bootstrap() -> BrokerOutput:
         prompt relabelled by a library upgrade should still reach the user
         rather than being guessed at here.
 
-        Returns "" rather than raising when the user declines. robin_stocks
-        turns an empty code into its own auth error, which is a far better
-        message than a traceback out of a monkey-patched builtin.
+        RAISES when the user cancels or the prompt times out. It used to
+        return "", and robin_stocks does not treat an empty code as an error:
+        its challenge loop re-POSTs it every 5 seconds until its own two-minute
+        window runs out -- two dozen wrong codes, a lockout risk.
         """
         text = str(prompt or "").strip() or universal_2fa_prompt("Robinhood")
-        return _2fa_prompt.request_text("Robinhood", text, 300) or ""
+        answer = _2fa_prompt.request_text("Robinhood", text, 300)
+        if answer is None or not str(answer).strip():
+            # robin_stocks catches this, prints it and returns None; the flag
+            # lets the caller say why instead of "did not accept the sign-in".
+            _code_skipped["v"] = True
+            raise RuntimeError(_CODE_NOT_ENTERED)
+        return str(answer)
 
     # ExitStack rather than a `with` block: the interception has to cover the
     # whole login body, and wrapping it would reindent a hundred lines for no
@@ -833,6 +995,7 @@ def bootstrap() -> BrokerOutput:
         # Build accounts by logging each profile (legacy-style, one pickle per profile)
         merged_accounts: List[Tuple[str, str, str]] = []
         seen_numbers = set()
+        load_failures: List[Tuple[str, str]] = []
 
         for pickle_name, username, password in profiles:
             call_kwargs: Dict[str, Any] = {}
@@ -878,15 +1041,35 @@ def bootstrap() -> BrokerOutput:
             _console = io.StringIO()
             try:
                 with _capture_console(_console, on_text=_device_approval_watcher()):
-                    login_fn(**call_kwargs)
+                    # Bounded: an approval that never comes must not hold
+                    # _INPUT_PATCH_LOCK (taken above) for the whole session.
+                    result = _run_login_bounded(login_fn, call_kwargs)
             finally:
                 _log_login_transcript(pickle_name, _console.getvalue(),
                                       secrets=[username, password])
+            if result is None and _code_skipped["v"]:
+                raise RuntimeError(f"{pickle_name}: {_CODE_NOT_ENTERED}")
+            if result is None:
+                # robin_stocks does not raise on a refused login: it prints
+                # "Login failed" and returns None. Rehydrating anyway reported
+                # the misleading "cached session is invalid" instead, or --
+                # with an older pickle still on disk -- "Login ok".
+                raise RuntimeError(
+                    f"{pickle_name}: Robinhood did not accept the sign-in (wrong "
+                    f"password, a declined approval, or a rate limit) — wait a "
+                    f"few minutes before trying again")
 
             # immediately rehydrate from the cache (exact legacy habit)
             login_with_cache(rh=rh, pickle_name=pickle_name)
 
-            rows = _safe_load_accounts(rh)
+            try:
+                rows = _safe_load_accounts(rh)
+            except Exception as e:
+                # This login signed in but its account list could not be
+                # read: fail THIS login only (as _ensure_session does), not
+                # every login that bootstrapped fine before or after it.
+                load_failures.append((pickle_name, str(e)))
+                continue
             for a in rows:
                 acct = (a.get("account_number") or "").strip()
                 if not acct or acct in seen_numbers:
@@ -896,22 +1079,26 @@ def bootstrap() -> BrokerOutput:
                 acct_type = (a.get("brokerage_account_type") or a.get("type") or "ACCOUNT").strip()
                 base_label = f"{acct_type} (****{acct[-4:]})"
 
-                # If multiple logins, prefix with which one
-                if len(profiles) > 1:
-                    display = f"{pickle_name} | {base_label}"
-                else:
-                    display = base_label
+                display = _account_display(profiles, pickle_name, base_label)
 
                 merged_accounts.append((display, acct, pickle_name))
+
+        if load_failures and not merged_accounts:
+            raise RuntimeError("; ".join(f"{n}: could not read its accounts ({w})"
+                                         for n, w in load_failures))
 
         _RH = rh
         _ACCOUNTS = merged_accounts
 
+        fail_rows = [AccountOutput(account_id=n, ok=False,
+                                   message=f"{n}: signed in, but its accounts could not be read ({w})")
+                     for n, w in load_failures]
         return BrokerOutput(
             broker=BROKER,
-            state="success",
-            accounts=[AccountOutput(account_id="Robinhood", ok=True, message=f"Login ok ({len(_ACCOUNTS)} accounts)")],
-            message="Login ok",
+            state="partial" if fail_rows else "success",
+            accounts=[AccountOutput(account_id="Robinhood", ok=True, message=f"Login ok ({len(_ACCOUNTS)} accounts)")]
+                     + fail_rows,
+            message="Login ok" if not fail_rows else f"Login ok ({len(fail_rows)} login(s) need attention)",
         )
 
     except Exception as e:
@@ -934,8 +1121,9 @@ def _ensure_session() -> Tuple[bool, str]:
       - If pickle exists -> call login_with_cache() -> proceed
       - If not -> require interactive bootstrap to create it
     """
-    global _RH, _ACCOUNTS
+    global _RH, _ACCOUNTS, _LOGIN_LOAD_FAILURES
 
+    _LOGIN_LOAD_FAILURES = []
     rh, err = _load_rh()
     if err:
         return False, err
@@ -957,7 +1145,13 @@ def _ensure_session() -> Tuple[bool, str]:
             # THIS IS THE KEY: rehydrate on every command (legacy)
             login_with_cache(rh=rh, pickle_name=pickle_name)
 
-            rows = _safe_load_accounts(rh)
+            try:
+                rows = _safe_load_accounts(rh)
+            except Exception as e:
+                # This login's accounts are unknown, not absent: report it
+                # (see _login_load_failure_rows) and go on with the others.
+                _LOGIN_LOAD_FAILURES.append((pickle_name, str(e)))
+                continue
             for a in rows:
                 acct = (a.get("account_number") or "").strip()
                 if not acct or acct in seen_numbers:
@@ -967,10 +1161,7 @@ def _ensure_session() -> Tuple[bool, str]:
                 acct_type = (a.get("brokerage_account_type") or a.get("type") or "ACCOUNT").strip()
                 base_label = f"{acct_type} (****{acct[-4:]})"
 
-                if len(profiles) > 1:
-                    display = f"{pickle_name} | {base_label}"
-                else:
-                    display = base_label
+                display = _account_display(profiles, pickle_name, base_label)
 
                 merged_accounts.append((display, acct, pickle_name))
 
@@ -979,13 +1170,16 @@ def _ensure_session() -> Tuple[bool, str]:
 
         if not _ACCOUNTS:
             # If we rehydrated but still got no accounts, treat as auth failure.
-            raise RuntimeError("Rehydrated session but loaded zero accounts (token invalid / expired).")
+            why = "; ".join(f"{n}: {w}" for n, w in _LOGIN_LOAD_FAILURES)
+            raise RuntimeError("Rehydrated session but loaded zero accounts (token invalid / expired)."
+                               + (f" {why}" if why else ""))
 
         return True, "rehydrated"
 
     except Exception as e:
         _RH = None
         _ACCOUNTS = []
+        _LOGIN_LOAD_FAILURES = []
         detail = f"{type(e).__name__}: {e}"
         summary: List[str] = ["Robinhood session rehydrate failed.", f"error={detail}"]
         for pickle_name, _u, _pw in profiles:
@@ -1005,6 +1199,16 @@ def _ensure_session() -> Tuple[bool, str]:
 # Public API
 # =============================================================================
 
+def _login_load_failure_rows(**extra: Any) -> List[AccountOutput]:
+    """One failed row per login whose account list could not be read. Only
+    ever built before any order for that login: nothing was sent for it."""
+    return [AccountOutput(account_id=name, ok=False,
+                          message=f"{name}: {why} — its accounts were not traded, nothing was sent",
+                          **extra)
+            for name, why in (_LOGIN_LOAD_FAILURES or [])]
+
+
+@_serialized
 def get_holdings() -> BrokerOutput:
     ok, why = _ensure_session()
     if not ok:
@@ -1016,7 +1220,7 @@ def get_holdings() -> BrokerOutput:
         )
 
     rh = _RH
-    outs: List[AccountOutput] = []
+    outs: List[AccountOutput] = _login_load_failure_rows(holdings=[])
 
     broker_extra: Dict[str, Any] = {
         "profiles_count": int(len(_login_profiles())),
@@ -1146,13 +1350,28 @@ def get_accounts() -> BrokerOutput:
     return get_holdings()
 
 
+def _accepts(fn, names) -> bool:
+    """True when `fn` takes every keyword in `names` (or **kwargs)."""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return all(n in params for n in names)
+
+
+@_serialized
 def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) -> BrokerOutput:
     ok, why = _ensure_session()
     if not ok:
+        # No session: no order request was made.
+        row = why if "nothing was sent" in (why or "").lower() else f"{why} — nothing was sent"
         return BrokerOutput(
             broker=BROKER,
             state="failed",
-            accounts=[AccountOutput(account_id="Robinhood", ok=False, message=why)],
+            accounts=[AccountOutput(account_id="Robinhood", ok=False, message=row)],
             message=why,
         )
 
@@ -1187,7 +1406,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
     fractional = abs(q_f - round(q_f)) > 1e-9
     q = q_f if fractional else int(round(q_f))
 
-    outs: List[AccountOutput] = []
+    outs: List[AccountOutput] = _login_load_failure_rows()
 
     log_lines: List[str] = []
     if dry_run:
@@ -1227,11 +1446,19 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
             continue
         tradable.append(entry)
 
+    # The cap applies to each login separately (entry[2] is its pickle name).
     _cap = _max_trade_accounts()
-    if _cap and len(tradable) > _cap:
-        for entry in tradable[_cap:]:
-            skipped.append((entry[0], f"over the {_cap}-account limit"))
-        tradable = tradable[:_cap]
+    if _cap:
+        per_login: Dict[str, int] = {}
+        kept: List[Tuple[str, str, str]] = []
+        for entry in tradable:
+            n = per_login.get(entry[2], 0)
+            if n >= _cap:
+                skipped.append((entry[0], f"over the {_cap}-account limit"))
+                continue
+            per_login[entry[2]] = n + 1
+            kept.append(entry)
+        tradable = kept
 
     skip_note = ""
     if skipped:
@@ -1242,8 +1469,12 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
             log_lines.append("")
 
     if not tradable:
+        # A row, not accounts=[]: with no rows the app counted no failure and
+        # the run read as a quiet success. Nothing was sent.
         msg = "No tradable Robinhood accounts" + (f" — {skip_note}" if skip_note else "")
-        return BrokerOutput(broker=BROKER, state="failed", accounts=[], message=msg)
+        return BrokerOutput(broker=BROKER, state="failed", message=msg,
+                            accounts=[AccountOutput(account_id="Robinhood", ok=False,
+                                                    message=msg)])
 
     for _acct_i, (display_label, acct_num, pickle_name) in enumerate(tradable):
         if _acct_i > 0:
@@ -1292,27 +1523,39 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
                 # swallows timeouts, 5xx and non-JSON bodies and returns None
                 # even when Robinhood took the order, so retrying through the
                 # market helper there could place it twice.
-                use_market = not callable(order_fn)
+                # Which call shape this robin-stocks build takes is decided
+                # BEFORE anything is sent, from its signature. Catching a
+                # TypeError from the call itself and falling through to the
+                # market helper was a duplicate-order path: a TypeError raised
+                # inside the library after its POST would have sent a second
+                # order through the helper.
+                use_market = not (callable(order_fn) and _accepts(
+                    order_fn, ("symbol", "quantity", "side", "account_number",
+                               "timeInForce")))
                 if not use_market:
-                    # Legacy order call shape
-                    try:
-                        resp = order_fn(
-                            symbol=sym,
-                            quantity=q,
-                            side=side_norm,
-                            account_number=acct_num,
-                            timeInForce="gfd",
-                        )
-                    except TypeError:
-                        # Some versions differ; fall through to market helpers
-                        use_market = True
-
-                if use_market:
-                    # Fallback: market helpers
+                    resp = order_fn(
+                        symbol=sym,
+                        quantity=q,
+                        side=side_norm,
+                        account_number=acct_num,
+                        timeInForce="gfd",
+                    )
+                else:
+                    # Fallback: market helpers. Their timeInForce defaults to
+                    # "gtc"; every order this app sends is a day order, which
+                    # is what the auto-sell order holds assume.
                     fn = _rh_fn(f"order_{side_norm}_market")
                     if fn is None:
-                        raise RuntimeError("Robinhood market order function not available")
-                    resp = fn(sym, q, account_number=acct_num)
+                        raise RuntimeError("Robinhood market order function not "
+                                           "available — nothing was sent")
+                    if not _accepts(fn, ("timeInForce",)):
+                        # Without timeInForce robin_stocks sends "gtc": an order
+                        # that outlives the day, which the auto-sell holds
+                        # (AUTOSELL_DAY_ORDER_BROKERS) assume never happens.
+                        # Refuse before anything is sent; the except below adds
+                        # "— nothing was sent".
+                        raise RuntimeError("Robinhood helper can't send a day order")
+                    resp = fn(sym, q, account_number=acct_num, timeInForce="gfd")
 
             if resp is None:
                 # Every order path above has actually been called by now, so
@@ -1327,6 +1570,16 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
 
             # Check what came back. robin_stocks returns a rejection instead of
             # raising one, so "no exception" is not evidence an order exists.
+            if resp is not None and not isinstance(resp, dict):
+                # Something came back from the order POST that we can't read.
+                # Not proof of a refusal: treat like a lost response.
+                outs.append(AccountOutput(
+                    account_id=display_label, ok=False,
+                    message=("Robinhood's reply could not be read — the order may have "
+                             "been submitted; verify in Robinhood before retrying"),
+                ))
+                continue
+
             rejection = _order_rejection(resp)
             if rejection:
                 outs.append(AccountOutput(account_id=display_label, ok=False,
@@ -1340,7 +1593,14 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
             outs.append(AccountOutput(account_id=display_label, ok=True, message="order placed", order_id=oid))
 
         except Exception as e:
-            outs.append(AccountOutput(account_id=display_label, ok=False, message=str(e)))
+            # Every order path above goes through robin_stocks' request_post,
+            # which catches everything and returns None (handled above as
+            # "may have been submitted"). So an exception reaching here was
+            # raised before the order POST -- the session reload, the quote
+            # lookup inside order() (IndexError on no quote), a missing
+            # helper: nothing was sent.
+            outs.append(AccountOutput(account_id=display_label, ok=False,
+                                      message=f"{e} — nothing was sent"))
 
             if dry_run:
                 log_lines.append(f"[{display_label}] ERROR: {e}")
@@ -1360,6 +1620,7 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False) ->
     return BrokerOutput(broker=BROKER, state=state, accounts=outs, message=msg)
 
 
+@_serialized
 def healthcheck() -> BrokerOutput:
     """
     Non-interactive probe:
@@ -1407,10 +1668,7 @@ def healthcheck() -> BrokerOutput:
                 acct_type = (a.get("brokerage_account_type") or a.get("type") or "ACCOUNT").strip()
                 base_label = f"{acct_type} (****{acct[-4:]})"
 
-                if len(profiles) > 1:
-                    display = f"{pickle_name} | {base_label}"
-                else:
-                    display = base_label
+                display = _account_display(profiles, pickle_name, base_label)
 
                 merged_accounts.append((display, acct, pickle_name))
 

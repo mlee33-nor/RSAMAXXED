@@ -53,16 +53,14 @@ __all__ = [
 # The brokers the terminal can actually execute in. Anything else still parses —
 # it is real information about the play — it just can't be automated here.
 SUPPORTED_BROKERS = (
-    "BBAE", "Chase", "DSPAC", "Fennel", "Fidelity", "IBKR",
+    "Chase", "Fennel", "Fidelity", "IBKR",
     "Public", "Robinhood", "Schwab", "SoFi", "Wells Fargo",
 )
 
 # Written aliases seen in the channel, lowercased. The fuzzy pass below catches
 # the typos ('Swchab'); this table catches the deliberate shorthand ('wells').
 _BROKER_ALIASES = {
-    "bbae": "BBAE",
     "chase": "Chase", "jpmorgan": "Chase", "jpm": "Chase",
-    "dspac": "DSPAC",
     "fennel": "Fennel",
     "fidelity": "Fidelity", "fid": "Fidelity",
     "ibkr": "IBKR", "ib": "IBKR", "interactive brokers": "IBKR",
@@ -75,6 +73,7 @@ _BROKER_ALIASES = {
     "wf": "Wells Fargo",
     # Named in the feed, not automated by this tool.
     "webull": "Webull", "wb": "Webull",
+    "bbae": "BBAE", "dspac": "DSPAC",
     "tradier": "Tradier", "firstrade": "Firstrade", "tastytrade": "Tastytrade",
     "vanguard": "Vanguard", "etrade": "E*TRADE", "e*trade": "E*TRADE",
     "merrill": "Merrill", "ally": "Ally", "tornado": "Tornado",
@@ -82,7 +81,7 @@ _BROKER_ALIASES = {
 
 
 def normalize_broker(raw: str) -> str:
-    """'Swchab' -> 'Schwab', 'wells' -> 'Wells Fargo', 'dSPAC' -> 'DSPAC'.
+    """'Swchab' -> 'Schwab', 'wells' -> 'Wells Fargo', 'rh' -> 'Robinhood'.
 
     Falls back to a title-cased version of whatever was written rather than
     dropping the leg: an unknown broker is still a real fill we should show.
@@ -106,6 +105,20 @@ def normalize_broker(raw: str) -> str:
 
 BUY_KINDS = ("standard", "otc", "conditional")
 
+# A buy that came from loose chat rather than an RSA Alert (the embed, or the
+# same alert typed out under an "RSA Alert" title). "Market opens 9:30 (ET)"
+# and "(ABCD) cancelled its split - do NOT buy" both used to parse as standard
+# plays the mirror would buy. Kept so the operator can see it; never acted on,
+# never published to the cloud feed. Not in BUY_KINDS on purpose.
+UNVERIFIED_KIND = "unverified"
+
+# An RSA Alert whose type line is none of the three we know -- blank, or a word
+# the bot has never used before. It used to fall through to "standard", which
+# mirror auto-buys: a new type the bot starts sending ("CANCELLED", "UPDATE")
+# would have bought at every account. Fail closed: shown, logged, never acted
+# on, never published. Not in BUY_KINDS on purpose.
+UNKNOWN_KIND = "unknown"
+
 # Deliberately not \d{1,5}: a bare number is never a ticker, and 'x10' below
 # must not be mistaken for one.
 _TICKER = r"[A-Z]{1,6}(?:\.[A-Z])?"
@@ -113,7 +126,8 @@ _TICKER = r"[A-Z]{1,6}(?:\.[A-Z])?"
 
 def parse_rsa_date(value: str, *, today: date | None = None) -> str | None:
     """'6/18/26 (Thu)' -> '2026-06-18'. Returns None if there's no date in there."""
-    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", value or "")
+    # Year is exactly 2 or 4 digits: '6/18/202' is a typo, not the year 202.
+    m = re.search(r"(?<!\d)(\d{1,2})/(\d{1,2})/(\d{4}|\d{2})(?!\d)", value or "")
     if not m:
         return None
     mo, da, yr = (int(x) for x in m.groups())
@@ -187,7 +201,8 @@ class BuyAlert:
     @property
     def is_actionable(self) -> bool:
         """Conditional alerts are watch-only: the split may not be declared yet,
-        so the terminal must not fire on them."""
+        so the terminal must not fire on them. Unverified (loose-chat) buys
+        never are."""
         return self.kind in ("standard", "otc")
 
     def days_left(self, today: date | None = None) -> int | None:
@@ -291,8 +306,13 @@ class FeedBatch:
 
     def to_json(self) -> dict[str, list[dict[str, Any]]]:
         """Wire format for the cloud ingest endpoint."""
+        # Unverified and unknown-type buys stay local. The ingest endpoint now
+        # files an unknown kind as watch-only "unknown" (it once coerced it to
+        # "standard"), but loose chat or a type we can't read is still not a
+        # cloud play, and older servers may still be running.
         return {
-            "buys": [asdict(b) for b in self.buys],
+            "buys": [asdict(b) for b in self.buys
+                     if b.kind not in (UNVERIFIED_KIND, UNKNOWN_KIND)],
             "sells": [_sell_json(s) for s in self.sells],
             "roundups": [asdict(r) for r in self.roundups],
         }
@@ -308,11 +328,45 @@ def _sell_json(s: SellAlert) -> dict[str, Any]:
 
 def _kind_from(desc: str, title: str) -> str:
     blob = f"{desc or ''} {title or ''}".lower()
-    if "otc" in blob:
-        return "otc"
+    if UNVERIFIED_KIND in blob:
+        return UNVERIFIED_KIND
+    # Conditional first: "CONDITIONAL - OTC" is still watch-only.
     if "conditional" in blob:
         return "conditional"
-    return "standard"
+    if "otc" in blob:
+        return "otc"
+    # Only an explicit STANDARD is buyable. See UNKNOWN_KIND.
+    if re.search(r"\bstandard\b", blob):
+        return "standard"
+    return UNKNOWN_KIND
+
+
+# Exchange prefixes the ticker field is sometimes written with: 'NASDAQ: ABCD'.
+_EXCHANGE_PREFIX = re.compile(
+    r"^(?:NASDAQ|NYSE(?:\s*AMERICAN)?|AMEX|OTC(?:MKTS|QB|QX|PK)?|CBOE|ARCA)\s*[:\-]\s*",
+    re.I)
+# What the field holds when there is no ticker yet. Never a symbol.
+_NO_TICKER = {"N/A", "NA", "TBD", "TBA", "NONE", "NULL", "PENDING", "UNKNOWN"}
+
+
+def _ticker_from_field(raw: str) -> str | None:
+    """The symbol in an embed's Ticker field, or None when there isn't one.
+
+    'NASDAQ: ABCD' -> ABCD, 'BRK.B' -> BRK.B, '$SBFM' -> SBFM. 'N/A' / 'TBD' /
+    blank -> None. A token longer than any real ticker is rejected, never
+    truncated to its first six letters.
+    """
+    value = re.sub(r"[*_`]", "", raw or "").strip()
+    value = _EXCHANGE_PREFIX.sub("", value).lstrip("$").strip()
+    if not value or value.upper() in _NO_TICKER:
+        return None
+    m = re.match(r"([A-Za-z]+(?:\.[A-Za-z]+)?)(?=$|[\s(\[,;|])", value)
+    if not m or m.group(1).upper() in _NO_TICKER:
+        return None
+    sym = m.group(1).upper()
+    if not re.fullmatch(_TICKER, sym):
+        return None
+    return sym
 
 
 def _field_map(embed: dict) -> dict[str, str]:
@@ -371,7 +425,9 @@ def parse_buy_message(msg: dict) -> list[BuyAlert]:
     """Every RSA Alert embed in one BUY-channel message.
 
     Falls back to plain text — a `(TICKER)` or `$CASHTAG` — so a channel that
-    is not driven by the bot still produces plays.
+    is not driven by the bot is still visible, but those come back with kind
+    "unverified": loose chat ("opens 9:30 (ET)", "(ABCD) cancelled - do NOT
+    buy", a "$NVDA" link preview) is never an actionable play.
     """
     mid = str(msg.get("id") or "")
     posted = _iso(msg.get("timestamp"))
@@ -399,8 +455,8 @@ def parse_buy_message(msg: dict) -> list[BuyAlert]:
         fields = _field_map(embed)
 
         raw_ticker = _pick_field(fields, "ticker")
-        tm = re.search(r"[A-Za-z]{1,6}", raw_ticker)
-        if not tm:
+        symbol = _ticker_from_field(raw_ticker)
+        if not symbol:
             continue
 
         ratio_raw = _pick_field(fields, "ratio")
@@ -409,7 +465,7 @@ def parse_buy_message(msg: dict) -> list[BuyAlert]:
 
         out.append(BuyAlert(
             source_id=f"{mid}:{i}" if mid else f"{raw_ticker}:{default_date}",
-            symbol=tm.group(0).upper(),
+            symbol=symbol,
             kind=_kind_from(desc, title),
             alert_date=parse_rsa_date(_pick_field(fields, "alert date", "date")) or default_date,
             ratio=ratio_raw,
@@ -428,7 +484,8 @@ def parse_buy_message(msg: dict) -> list[BuyAlert]:
 
 
 def _buys_from_text(text: str, mid: str, day: str, posted: str) -> list[BuyAlert]:
-    """Non-embed channels: '(TICKER)' first, then '$CASHTAG'."""
+    """Non-embed channels: '(TICKER)' first, then '$CASHTAG'. Always
+    UNVERIFIED_KIND -- only an RSA Alert makes an actionable pick."""
     seen: set[str] = set()
     out: list[BuyAlert] = []
     symbols = re.findall(rf"\(({_TICKER})\)", text or "")
@@ -441,7 +498,7 @@ def _buys_from_text(text: str, mid: str, day: str, posted: str) -> list[BuyAlert
         seen.add(sym)
         out.append(BuyAlert(
             source_id=f"{mid}:{sym}" if mid else f"{sym}:{day}",
-            symbol=sym, alert_date=day, posted_at=posted,
+            symbol=sym, kind=UNVERIFIED_KIND, alert_date=day, posted_at=posted,
         ))
     return out
 
@@ -701,7 +758,7 @@ FRACTIONAL_STATUSES = frozenset({"fractional"})
 # nothing left in the account to sell.
 #
 # This is the routing rule for fractional auto-sell, and getting it wrong is
-# expensive in both directions: fan out to all ten and seven of them reject an
+# expensive in both directions: fan out to all nine and six of them reject an
 # order for shares that were never there, every single time. Skip these three
 # and the fraction sits unsold.
 #
@@ -953,23 +1010,71 @@ def _oldest_first(messages: Iterable[dict]) -> list[dict]:
 
 # ------------------------------------------------------------- legacy bridging
 
-_PICK_NOTES = {"standard": "Reg Alert", "otc": "OTC", "conditional": "conditional"}
+# "unverified" must stay OUT of app.py's MIRROR_NOTES so the mirror never buys it.
+_PICK_NOTES = {"standard": "Reg Alert", "otc": "OTC", "conditional": "conditional",
+               UNVERIFIED_KIND: "unverified", UNKNOWN_KIND: "unknown alert type"}
 
 
 def to_pick(buy: BuyAlert) -> dict[str, str]:
     """The three-key shape picks.json has always held, so the existing mirror
-    queue and watchlist keep working untouched."""
-    return {
+    queue and watchlist keep working untouched.
+
+    A kind with no note is never called a Reg Alert: that note is what mirror
+    buys, so an unrecognised kind maps to the non-actionable unknown note.
+
+    `last_buy` rides along only when the alert named its last day to buy;
+    mirror's age gate honours it (see app._pick_fresh_trading)."""
+    pick = {
         "symbol": buy.symbol,
-        "note": _PICK_NOTES.get(buy.kind, "Reg Alert"),
+        "note": _PICK_NOTES.get(buy.kind, _PICK_NOTES[UNKNOWN_KIND]),
         "date": buy.alert_date,
     }
+    if buy.last_buy_date:
+        pick["last_buy"] = buy.last_buy_date
+    # Display-only extras for the Command Center row (ratio, price, the feed's
+    # estimate, round-up history). Optional: every reader keys on (date,
+    # symbol) and must tolerate a pick without them.
+    if buy.ratio:
+        pick["ratio"] = str(buy.ratio)[:24]
+    if isinstance(buy.entry_price, (int, float)):
+        pick["entry_price"] = buy.entry_price
+    if isinstance(buy.est_profit, (int, float)):
+        pick["est_profit"] = buy.est_profit
+    if buy.roundup_history:
+        pick["roundup_history"] = str(buy.roundup_history)[:200]
+    if buy.posted_at:
+        pick["posted_at"] = str(buy.posted_at)
+    return pick
+
+
+def _opt_float(value: Any) -> float | None:
+    """A stored number back from JSON, or None for anything that isn't one."""
+    if isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and abs(f) != float("inf") else None
+
+
+def _opt_iso(value: Any) -> str:
+    """An ISO timestamp kept only if it parses; the ingest endpoint rejects
+    anything else and would drop the whole batch with it."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return text
 
 
 def from_pick(pick: dict[str, str]) -> BuyAlert | None:
     """The inverse of `to_pick`: a stored three-key row back into an alert.
 
-    Lossy by nature — a pick never carried the ratio or the entry price — but
+    Lossy by nature — an older pick carries no ratio or entry price — but
     enough to publish a hand-entered play to the cloud feed. The source_id
     matches the one `playsfeed.import_picks_file` mints for the same row, so a
     pick that arrives by both routes is inserted once, not twice.
@@ -980,11 +1085,25 @@ def from_pick(pick: dict[str, str]) -> BuyAlert | None:
     if not symbol:
         return None
     day = str(pick.get("date") or "").strip()[:10]
+    note = str(pick.get("note") or "")
+    # Our own notes map straight back ("Reg Alert" never says "standard");
+    # anything else is read like an alert's type line, failing closed.
+    kind = next((k for k, n in _PICK_NOTES.items() if n.lower() == note.strip().lower()),
+                None) or _kind_from(note, "")
+    ratio = str(pick.get("ratio") or "").strip()[:24]
+    rm = re.search(r"1\s*(?::|-?\s*for\s*-?|/)\s*(\d+)", ratio, re.I)
     return BuyAlert(
         source_id=f"picks:{symbol}:{day}",
         symbol=symbol,
-        kind=_kind_from(str(pick.get("note") or ""), ""),
+        kind=kind,
         alert_date=day,
+        ratio=ratio,
+        ratio_n=int(rm.group(1)) if rm else None,
+        entry_price=_opt_float(pick.get("entry_price")),
+        est_profit=_opt_float(pick.get("est_profit")),
+        last_buy_date=str(pick.get("last_buy") or "")[:10] or None,
+        roundup_history=str(pick.get("roundup_history") or "").strip()[:200],
+        posted_at=_opt_iso(pick.get("posted_at")),
     )
 
 

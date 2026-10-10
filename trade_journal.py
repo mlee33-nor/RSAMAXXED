@@ -9,19 +9,33 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from modules import atomic
 
 _FILE = Path(__file__).resolve().parent / "trades.json"
 _lock = threading.Lock()
+
+
+@contextmanager
+def _writing() -> Iterator[None]:
+    """Hold the journal for one read-modify-write: this process's threads AND
+    every other process (reconcile.py, backfill_basis.py, runner.py, a second
+    GUI). Without the cross-process half, two writers that both read N rows
+    each save N+1 and one fill is gone. See atomic.file_lock.
+    """
+    with _lock:
+        with atomic.file_lock(_FILE):
+            yield
 
 
 _log = logging.getLogger(__name__)
@@ -41,6 +55,10 @@ class JournalUnreadable(RuntimeError):
 # that out; a genuinely corrupt file costs well under a second before we give up.
 _READ_ATTEMPTS = 4
 _READ_DELAY = 0.05
+#: How long a READ that recovered from the .bak waits for the cross-process
+#: journal lock before giving up on writing the recovery back. Short: it is a
+#: reader, and a writer holding the lock will leave a good file behind it.
+_RECOVER_LOCK_SECONDS = 1.0
 
 #: Why the last read failed, or None. For a UI that wants to say so.
 _last_error: Optional[str] = None
@@ -49,6 +67,17 @@ _last_error: Optional[str] = None
 def last_error() -> Optional[str]:
     """The reason the journal could not be read on the last attempt, or None."""
     return _last_error
+
+
+#: Set when a corrupt trades.json was rebuilt from its .bak and the good copy
+#: written back. Informational: the journal is readable again, so this is NOT
+#: an error (last_error() is None) and must not hold mirror.
+_last_recovery: Optional[str] = None
+
+
+def last_recovery() -> Optional[str]:
+    """What the last .bak recovery did, or None if there has not been one."""
+    return _last_recovery
 
 
 def _read_file(path: Path) -> List[Dict[str, Any]]:
@@ -76,17 +105,77 @@ def _read_file(path: Path) -> List[Dict[str, Any]]:
 
 def _quarantine(path: Path) -> Optional[Path]:
     """Keep a copy of an unreadable journal before anything can overwrite it."""
-    stamp = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
-    dest = path.with_name(f"{path.stem}.unreadable-{stamp}{path.suffix}")
-    n = 1
-    while dest.exists():
-        dest = path.with_name(f"{path.stem}.unreadable-{stamp}-{n}{path.suffix}")
-        n += 1
+    return atomic.quarantine(path)
+
+
+def _bak_path() -> Path:
+    return _FILE.with_suffix(".bak")
+
+
+def _stat_key(path: Path) -> Optional[tuple]:
     try:
-        shutil.copy2(path, dest)
-        return dest
+        st = path.stat()
     except OSError:
         return None
+    return (str(path), st.st_mtime_ns, st.st_size)
+
+
+#: How many rows the .bak holds, keyed on its (path, mtime_ns, size).
+#:
+#: Every save used to parse BOTH trades.json and trades.bak just to compare
+#: their lengths for the shrink guard -- two extra 2MB parses per row recorded,
+#: all inside the writer lock. The .bak only changes when we write it, and we
+#: know the count when we do, so it is parsed only when something else touched
+#: it.
+_bak_meta: Dict[str, Any] = {"key": None, "rows": None}
+
+
+def _bak_count() -> Optional[int]:
+    """Rows in the .bak, or None when there is no usable one."""
+    bak = _bak_path()
+    key = _stat_key(bak)
+    if key is None:
+        return None
+    if _bak_meta.get("key") == key:
+        return _bak_meta.get("rows")
+    try:
+        n: Optional[int] = len(_read_file(bak))
+    except (OSError, ValueError):
+        n = None
+    _bak_meta["key"], _bak_meta["rows"] = key, n
+    return n
+
+
+def _check_not_shrunk(rows: List[Dict[str, Any]]) -> None:
+    """Refuse a journal that is FAR smaller than its own backup.
+
+    A valid `[]` (or a file cut down to a handful of rows) parses perfectly
+    well, so nothing else here would notice -- and every save after it would
+    build on the truncated history. The .bak is refreshed after each good save
+    so it normally matches trades.json exactly, and an in-app delete leaves it
+    one row ahead. A journal at half its backup or less, two or more rows
+    short, was not made by this app: raise (setting last_error) rather than
+    journal on top of it. The byte-size test keeps this to a stat() unless the
+    .bak is markedly bigger than the journal.
+    """
+    global _last_error
+    bkey = _stat_key(_bak_path())
+    if bkey is None:
+        return
+    main = _stat_key(_FILE)
+    main_size = main[2] if main else 0
+    if main_size >= bkey[2] * 0.75:
+        return
+    n = _bak_count()
+    if not n or len(rows) >= n - 1 or len(rows) > n // 2:
+        return
+    bak = _bak_path().name
+    _last_error = (f"trades.json holds {len(rows)} trades but its backup {bak} "
+                   f"holds {n}, so it looks truncated. Nothing will be written "
+                   f"until it is repaired: copy {bak} over trades.json, or "
+                   f"delete {bak} if those trades were removed on purpose.")
+    _log.error("JOURNAL SHRUNK: %s", _last_error)
+    raise JournalUnreadable(_last_error)
 
 
 def _load() -> List[Dict[str, Any]]:
@@ -98,15 +187,18 @@ def _load() -> List[Dict[str, Any]]:
 
     The .bak is used only when trades.json was read but did not PARSE. A file
     that cannot even be opened (a lock that outlasted the retries) is most
-    likely fine underneath, and the .bak is one save behind it, so writing
-    `.bak + new row` back would drop a real trade; that case raises.
+    likely fine underneath, and the .bak can be behind it (a failed backup
+    refresh, a delete), so writing `.bak + new row` back could drop a real
+    trade; that case raises.
+
+    A journal that parses but is FAR smaller than its .bak raises too -- see
+    _check_not_shrunk.
     """
     global _last_error
     try:
         rows = _read_file(_FILE)
-        _last_error = None
-        return rows
     except FileNotFoundError:
+        _check_not_shrunk([])
         _last_error = None
         return []
     except ValueError as e:
@@ -115,8 +207,12 @@ def _load() -> List[Dict[str, Any]]:
         _last_error = f"trades.json could not be opened: {e}"
         _log.error("JOURNAL UNREADABLE: %s", _last_error)
         raise JournalUnreadable(_last_error) from e
+    else:
+        _check_not_shrunk(rows)
+        _last_error = None
+        return rows
 
-    bak = _FILE.with_suffix(".bak")
+    bak = _bak_path()
     try:
         rows = _read_file(bak)
     except (OSError, ValueError) as e:
@@ -127,10 +223,46 @@ def _load() -> List[Dict[str, Any]]:
         raise JournalUnreadable(_last_error) from primary
 
     kept = _quarantine(_FILE)
-    _last_error = (f"trades.json is corrupt ({primary}); recovered {len(rows)} "
-                   f"trades from {bak.name}. The damaged file was kept as "
-                   f"{kept.name if kept else '(copy failed)'}.")
-    _log.warning("JOURNAL RECOVERED FROM BACKUP: %s", _last_error)
+    msg = (f"trades.json is corrupt ({primary}); recovered {len(rows)} "
+           f"trades from {bak.name}. The damaged file was kept as "
+           f"{kept.name if kept else '(copy failed)'}.")
+    # A successful recovery is not an error: the .bak is refreshed after every
+    # save, so it IS the last saved journal, and holding mirror over it only
+    # paused buying until a restart. Say what happened via last_recovery().
+    global _last_recovery
+    _last_error = None
+    _last_recovery = msg
+    # Write the recovered rows back so the file on disk is good again. Only
+    # once the damaged file is safely kept (it is the one record of anything
+    # it held beyond the .bak), and only under the writer lock with the file
+    # re-checked: a reader racing a record_trade must never put the .bak back
+    # over a row that was just saved. A writer already holding the lock (this
+    # read IS its read-modify-write) saves rows+new itself a moment later.
+    #
+    # The in-process lock alone was not enough: another PROCESS (reconcile.py,
+    # runner.py, a second GUI) can be mid record_trade under the file lock,
+    # having just replaced the damaged file with a good one that holds a row
+    # the .bak does not. So the cross-process lock is taken too, briefly --
+    # a reader must not stall behind a writer, and if the lock is busy the
+    # writer holding it is about to leave a good file anyway.
+    if kept is not None and _lock.acquire(blocking=False):
+        try:
+            with atomic.file_lock(_FILE, timeout=_RECOVER_LOCK_SECONDS):
+                try:
+                    _read_file(_FILE)
+                    still_bad = False
+                except FileNotFoundError:
+                    still_bad = False
+                except (OSError, ValueError):
+                    still_bad = True
+                if still_bad:
+                    atomic.write_text(_FILE, json.dumps(rows, indent=2))
+                    _last_recovery = f"{msg} trades.json was rewritten from the backup."
+        except Exception as e:                  # noqa: BLE001 — incl. LockTimeout
+            _log.warning("recovered journal could not be written back: %s", e)
+        finally:
+            _lock.release()
+    _log.warning("JOURNAL RECOVERED FROM BACKUP: %s", _last_recovery)
     return rows
 
 
@@ -147,6 +279,14 @@ def _load() -> List[Dict[str, Any]]:
 #: trusts for its page cache — so an external writer (reconcile.py, a restore
 #: from backup) is picked up on the next call rather than being served stale.
 _cache: Dict[str, Any] = {"key": None, "rows": []}
+#: Guards _cache only, and only for a dict lookup or store. It is NOT the
+#: writer lock: a reader used to queue behind `_lock` while record_trade
+#: re-parsed the 2MB journal several times, which froze the Tk thread for
+#: seconds during a fan-out. Readers now never wait on a writer.
+_cache_lock = threading.Lock()
+#: Bumped by every save, so a reader that parsed the file BEFORE a save cannot
+#: overwrite the newer rows that save put in the cache.
+_cache_gen = 0
 
 
 def _load_shared() -> List[Dict[str, Any]]:
@@ -154,49 +294,78 @@ def _load_shared() -> List[Dict[str, Any]]:
 
     Returns the SHARED list — callers must not mutate it. `get_trades` hands
     out a copy; the read-modify-write paths deliberately use `_load` instead.
+
+    Lock-free with respect to writers: a save swaps the file in with an atomic
+    rename, so a parse that races it reads either the old journal or the new
+    one, never a fragment, and a stale result is keyed to the old fingerprint
+    and re-read on the next call.
     """
+    global _last_error
     key = version()
-    if _cache.get("key") != key:
-        try:
-            rows = _load()
-        except JournalUnreadable:
-            # Read-only callers (every page of the GUI) must not crash on this.
-            # Serve the last rows we did read, or nothing, and leave the key
-            # alone so the next call tries the file again. _load logged it.
+    with _cache_lock:
+        if _cache.get("key") == key and "rows" in _cache:
+            return _cache["rows"]
+        gen = _cache_gen
+    try:
+        rows = _load()
+    except JournalUnreadable:
+        # Read-only callers (every page of the GUI) must not crash on this.
+        # Serve the last rows we did read, or nothing, and leave the key
+        # alone so the next call tries the file again. _load logged it and set
+        # last_error, which is what tells a caller this is not the real
+        # history.
+        if not _last_error:
+            _last_error = "trades.json could not be read"
+        with _cache_lock:
             return _cache.get("rows") or []
-        _cache["rows"] = rows
-        _cache["key"] = key
-    return _cache["rows"]
+    with _cache_lock:
+        if _cache_gen == gen:
+            _cache["rows"] = rows
+            _cache["key"] = key
+    return rows
 
 
 def _refresh_backup(shrink_ok: bool = False) -> None:
-    """Copy the on-disk journal to .bak — but only if it is worth keeping.
+    """Copy the ON-DISK journal to .bak. Used before an intentional delete.
 
-    Two rules, both so one bad state on disk can never reach the backup too:
-
-    * it must PARSE. When trades.json is corrupt and _load recovered from the
-      .bak, copying the corrupt file over it would destroy the one good copy.
-    * it must not have FEWER rows than the .bak already holds, unless the
-      shrink is an intentional delete (`shrink_ok`). Something that truncated
-      trades.json to `[]` would otherwise take the backup with it on the very
-      next save. The cost of the rule: after a delete_trade, the .bak keeps the
-      deleted row until the journal grows back past it — harmless in a backup.
+    It must PARSE: when trades.json is corrupt and _load recovered from the
+    .bak, copying the corrupt file over it would destroy the one good copy.
+    And it must not have FEWER rows than the .bak already holds unless the
+    shrink is intentional (`shrink_ok`).
     """
     if not _FILE.exists():
         return
     current = _read_file(_FILE)          # raises -> no backup this time
-    bak = _FILE.with_suffix(".bak")
-    if not shrink_ok and bak.exists():
-        try:
-            backed_up = len(_read_file(bak))
-        except (OSError, ValueError):
-            backed_up = -1               # an unusable .bak is always replaced
-        if len(current) < backed_up:
+    if not shrink_ok:
+        backed_up = _bak_count()
+        if backed_up is not None and len(current) < backed_up:
             _log.warning("trades.json has %d rows but %s has %d; keeping the "
                          "backup rather than shrinking it", len(current),
-                         bak.name, backed_up)
+                         _bak_path().name, backed_up)
             return
+    bak = _bak_path()
     shutil.copy2(_FILE, bak)
+    _bak_meta["key"], _bak_meta["rows"] = _stat_key(bak), len(current)
+
+
+def _backup_saved(payload: str, n_rows: int) -> None:
+    """Make the .bak a copy of what was JUST saved -- after the replace.
+
+    It used to be refreshed BEFORE the replace, i.e. to the previous version,
+    so the backup always lagged one save: a torn trades.json recovered from it
+    silently lost the newest fill. Written from the payload already in memory
+    (no re-read, no re-parse), atomically, and never to fewer rows than the
+    .bak already holds -- a truncated journal must not take its backup with it.
+    """
+    backed_up = _bak_count()
+    if backed_up is not None and n_rows < backed_up:
+        _log.warning("trades.json has %d rows but %s has %d; keeping the "
+                     "backup rather than shrinking it", n_rows,
+                     _bak_path().name, backed_up)
+        return
+    bak = _bak_path()
+    atomic.write_text(bak, payload)
+    _bak_meta["key"], _bak_meta["rows"] = _stat_key(bak), n_rows
 
 
 def _save(trades: List[Dict[str, Any]], shrink_ok: bool = False) -> None:
@@ -209,36 +378,39 @@ def _save(trades: List[Dict[str, Any]], shrink_ok: bool = False) -> None:
     carries plays, not your fills.
 
     It used to be written with a plain `write_text`, which truncates the file
-    and then writes. Pull the plug, force-quit the GUI, or hit a full disk in
-    the middle of that and the journal is gone or half-written; the app would
-    then open on an empty portfolio and every open position would look closed.
-    etf_journal has written atomically since the day it was added, with a
-    docstring pointing at this function as the one that had not been fixed.
+    and then writes; a crash in between cost the whole history. Now: temp file
+    in the same directory (so `replace` is a rename inside one filesystem,
+    which is atomic), fsync before the rename, and then the .bak refreshed to
+    the SAME contents. An intentional delete (`shrink_ok`) instead keeps the
+    pre-delete journal as the backup, so a mistaken delete can be undone.
 
-    Temp file in the same directory (so `replace` is a rename inside one
-    filesystem, which is atomic), fsync before the rename so the bytes are
-    really on disk, and the previous good copy kept as `.bak` — the cheapest
-    possible insurance on the one file with no other source.
+    Raises if the journal itself could not be written; a failed backup never
+    fails the save.
     """
-    tmp = _FILE.with_suffix(".tmp")
+    global _cache_gen, _last_error
     payload = json.dumps(trades, indent=2)
-    with tmp.open("w", encoding="utf-8") as fh:
-        fh.write(payload)
-        fh.flush()
-        os.fsync(fh.fileno())
-    try:
-        _refresh_backup(shrink_ok)
-    except Exception:
-        # A missing backup is worth a save; a failed save is not worth a
-        # backup. Never let this stop the write below.
-        pass
-    # atomic.replace, not os.replace: Google Drive syncs this folder and holds
-    # the journal open mid-upload, which a bare rename reports as WinError 5.
-    atomic.replace(tmp, _FILE)
+    if shrink_ok:
+        try:
+            _refresh_backup(shrink_ok=True)
+        except Exception:
+            pass
+    # atomic.write_text: unique temp + fsync + atomic.replace, which retries
+    # the WinError 5 Google Drive causes by holding the journal mid-upload.
+    atomic.write_text(_FILE, payload)
+    # A good journal is on disk now: whatever made the last read fail is over.
+    _last_error = None
     # Refresh rather than merely invalidate: we already hold the rows, and the
     # very next thing a writer does is re-render off them.
-    _cache["rows"] = list(trades)
-    _cache["key"] = version()
+    with _cache_lock:
+        _cache_gen += 1
+        _cache["rows"] = list(trades)
+        _cache["key"] = version()
+    if not shrink_ok:
+        try:
+            _backup_saved(payload, len(trades))
+        except Exception:
+            _log.warning("trades.json saved but its backup could not be "
+                         "refreshed", exc_info=True)
 
 
 #: What `fill_price` on a row actually is.
@@ -330,7 +502,7 @@ def record_trade(
         "order_id": order_id or None,
         "price_source": price_source or PRICE_QUOTE,
     }
-    with _lock:
+    with _writing():
         trades = _load()
         trades.append(entry)
         _save(trades)
@@ -367,11 +539,41 @@ def record_close(
         "close_reason": reason,
         "note": note,
     }
-    with _lock:
+    with _writing():
         trades = _load()
         trades.append(entry)
         _save(trades)
     return entry
+
+
+def set_fill_prices(ids: List[str], fill_price: Optional[float],
+                    price_source: str = PRICE_QUOTE) -> int:
+    """Price rows that were journaled before their price was known.
+
+    The trade worker writes each fill the moment the broker confirms it, with
+    whatever price it already has (none, for a buy), and only THEN goes looking
+    for a quote -- a get_holdings() round trip that can take minutes. A crash
+    in that window used to cost the fills themselves; now it costs only their
+    price, and an unpriced row is reported as such everywhere, never booked
+    at $0.
+
+    Touches only the rows named, and only to set the price: a None price is a
+    no-op (the row already says "unknown"). Returns how many rows changed.
+    """
+    if fill_price is None or not ids:
+        return 0
+    want = {str(i) for i in ids if i}
+    with _writing():
+        trades = _load()
+        n = 0
+        for i, t in enumerate(trades):
+            if t.get("id") in want:
+                trades[i] = dict(t, fill_price=fill_price,
+                                 price_source=price_source or PRICE_QUOTE)
+                n += 1
+        if n:
+            _save(trades)
+    return n
 
 
 def unaccounted(trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -380,14 +582,17 @@ def unaccounted(trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]
     Reported, never folded in. Cash in lieu DID pay something, so this money is
     not lost -- it is unknown, and a figure the app calls realized must not
     pretend either way.
+
+    Basis is the average over PRICED buys only: an unpriced buy counted at $0
+    would understate every close's basis.
     """
     rows = get_trades() if trades is None else list(trades)
     cost: Dict[str, Dict[str, float]] = {}
     for t in rows:
-        if t.get("side") == "buy":
+        if t.get("side") == "buy" and t.get("fill_price") is not None:
             b = cost.setdefault(t["symbol"], {"qty": 0.0, "cost": 0.0})
             b["qty"] += float(t.get("qty") or 0)
-            b["cost"] += (t.get("fill_price") or 0) * float(t.get("qty") or 0)
+            b["cost"] += float(t["fill_price"]) * float(t.get("qty") or 0)
 
     total = 0.0
     by_reason: Dict[str, float] = {}
@@ -421,6 +626,119 @@ def version() -> tuple:
         return (0, 0)
 
 
+#: Login 1's account labels at these brokers once carried a login prefix that
+#: was dropped (login 1 must match its single-login form). An install that had
+#: several logins then has rows under BOTH spellings of the same account, and
+#: positions net on the exact string -- so the old buy never met the new sell.
+#: (broker, old prefix, current prefix). Login 1 only, these three only.
+_LOGIN1_ALIASES = (
+    ("robinhood", "Robinhood 1 | ", ""),
+    ("schwab", "Schwab 1 (", "Schwab ("),
+    ("fennel", "Fennel 1 · ", "Fennel · "),
+)
+
+
+def canonical_account(broker: Any, account_id: Any) -> str:
+    """account_id with an old login-1 prefix mapped to today's bare form."""
+    acct = str(account_id or "")
+    b = str(broker or "").lower()
+    for ab, old, new in _LOGIN1_ALIASES:
+        if b == ab and acct.startswith(old):
+            return new + acct[len(old):]
+    return acct
+
+
+def _canonical_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The rows with login-1 aliases normalised. Copies only the rows it
+    changes; the shared cached dicts are never mutated. The file on disk keeps
+    whatever was journaled."""
+    out: Optional[List[Dict[str, Any]]] = None
+    for i, t in enumerate(rows):
+        acct = t.get("account_id")
+        if not isinstance(acct, str):
+            continue
+        canon = canonical_account(t.get("broker"), acct)
+        if canon != acct:
+            if out is None:
+                out = list(rows)
+            out[i] = dict(t, account_id=canon)
+    return out if out is not None else rows
+
+
+#: The account number in a label: the LAST parenthesised group, when it holds
+#: a digit. "(manual entry)" is not a number -- SoFi gives four different
+#: accounts exactly that suffix -- so it does not count.
+_ACCT_NUM_RE = re.compile(r"\(([^)]*\d[^)]*)\)\s*$")
+
+
+def account_key(label: Any) -> str:
+    """A stable identity for one account, for NETTING per account.
+
+    The human label drifts while the account stays the same: Fidelity renames
+    ('Fidelity 1 · Individual (Z…)' became 'Fidelity 1 · FinTec (Z…)'),
+    encoding damage, Public gluing ' = $61.32' onto it. The trailing
+    "(number)" does not drift, so that is the key; a label with no number is
+    keyed on itself. Same rule as app._account_key, minus its one flaw: a
+    parenthesis with no digit in it ('(manual entry)') is not a number and
+    must not merge different accounts. Compare keys only within one broker.
+
+    The LOGIN is part of it. Two logins at one broker can hold accounts with
+    the same trailing number -- 'Public 1 BROKERAGE (0043)' and 'Public 2
+    BROKERAGE (0043)' are two accounts -- so a numbered login above 1 ('Public
+    2 ', 'Robinhood 2 · ') prefixes the key. Login 1, numbered or bare, keys as
+    the number alone, so every key an existing single-login install produced
+    is unchanged.
+    """
+    text = str(label or "").split(" = ")[0].strip()
+    m = _ACCT_NUM_RE.search(text)
+    if m:
+        key = "".join(c for c in m.group(1) if c.isalnum()).upper()
+        if key:
+            idx = login_index(text[:m.start()])
+            return f"L{idx}:{key}" if idx > 1 else key
+    return text.casefold()
+
+
+#: A label's login prefix: a broker-ish name, then the login number, then
+#: anything that is not a digit ('Public 2 BROKERAGE', 'Fidelity 1 · ...',
+#: 'Robinhood 1 | ...'). Anchored at the start, so an account NAME that ends in
+#: a digit ('... Etf 2 (Z1)') never reads as a login.
+_LOGIN_RE = re.compile(r"^\s*[A-Za-z][A-Za-z .&'-]*?\s+(\d{1,2})(?=\D|$)")
+
+
+def login_index(label: Any) -> int:
+    """The login number a label starts with, 1 when it carries none."""
+    m = _LOGIN_RE.match(str(label or ""))
+    try:
+        n = int(m.group(1)) if m else 1
+    except ValueError:
+        n = 1
+    return n if n > 0 else 1
+
+
+def fold_renames(rows: List[Dict[str, Any]],
+                 renames: Optional[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Rows with every renamed ticker filed under ONE name.
+
+    `renames` is CURRENT ticker -> the one we bought under (the app's
+    `_symbol_renames`). We bought AGAE and sold AIFA: without this, AGAE reads
+    as an open position forever (inflating DEPLOYED) and AIFA as a sale with
+    no buy (dropped from realized). Rows are copied only where they change,
+    and keep the ticker that actually traded as `executed_symbol`.
+    """
+    m = {str(k).upper(): str(v).upper()
+         for k, v in (renames or {}).items() if k and v}
+    if not m:
+        return rows
+    out: List[Dict[str, Any]] = []
+    for t in rows:
+        sym = str(t.get("symbol") or "").upper()
+        old = m.get(sym)
+        out.append(dict(t, symbol=old, executed_symbol=t.get("symbol"))
+                   if old and old != sym else t)
+    return out
+
+
 def get_trades(broker: Optional[str] = None) -> List[Dict[str, Any]]:
     """Return all recorded trades, optionally filtered by broker.
 
@@ -428,11 +746,12 @@ def get_trades(broker: Optional[str] = None) -> List[Dict[str, Any]]:
     row dicts inside are shared with the cache and must be treated as read-only
     (nothing mutates them today — split_adjusted copies every row it restates).
     """
-    with _lock:
-        trades = _load_shared()
-        if broker:
-            return [t for t in trades if t["broker"] == broker.lower()]
-        return list(trades)
+    # No `_lock`: readers use the version-keyed cache and never queue behind
+    # a writer (see _cache_lock).
+    trades = _canonical_rows(_load_shared())
+    if broker:
+        return [t for t in trades if t["broker"] == broker.lower()]
+    return list(trades)
 
 
 def split_adjusted(trades: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
@@ -489,7 +808,14 @@ def split_adjusted(trades: Optional[List[Dict[str, Any]]] = None) -> List[Dict[s
     out: List[Dict[str, Any]] = []
     for t in rows:
         row = dict(t)
-        key = (row.get("broker"), row.get("account_id"), row.get("symbol"))
+        # Keyed on the stable account number, not the label: a buy journaled
+        # under 'Fidelity 1 · Individual (Z1)' and its remnant sold under
+        # 'Fidelity 1 · FinTec (Z1)' are one account, and keyed on the label
+        # the remnant would meet no holding and never be restated.
+        key = (row.get("broker"),
+               account_key(canonical_account(row.get("broker"),
+                                             row.get("account_id"))),
+               row.get("symbol"))
         try:
             qty = float(row.get("qty") or 0.0)
         except (TypeError, ValueError):
@@ -538,29 +864,36 @@ def get_portfolio() -> Dict[tuple, Dict[str, Any]]:
     positions: Dict[tuple, Dict[str, Any]] = {}
     for t in split_adjusted():
         key = (t["broker"], t["symbol"])
-        pos = positions.setdefault(key, {"qty": 0.0, "avg_cost": 0.0, "total_cost": 0.0})
-        price = t["fill_price"] if t["fill_price"] is not None else 0.0
+        pos = positions.setdefault(key, {"qty": 0.0, "avg_cost": 0.0, "total_cost": 0.0,
+                                         "_pq": 0.0, "_pc": 0.0})
         if t["side"] == "buy":
-            pos["total_cost"] += price * t["qty"]
             pos["qty"] += t["qty"]
-            pos["avg_cost"] = pos["total_cost"] / pos["qty"] if pos["qty"] else 0.0
+            # Average over PRICED buys only. An unpriced buy counted at $0
+            # dragged avg_cost down and showed market value as fake profit.
+            if t["fill_price"] is not None:
+                pos["_pq"] += t["qty"]
+                pos["_pc"] += t["fill_price"] * t["qty"]
+            pos["avg_cost"] = pos["_pc"] / pos["_pq"] if pos["_pq"] else 0.0
+            pos["total_cost"] = pos["avg_cost"] * pos["qty"]
         elif t["side"] in ("sell", SIDE_CLOSE):
             if pos["qty"] > 0:
                 # reduce position, keep avg_cost the same
                 sold_qty = min(t["qty"], pos["qty"])
+                keep = (pos["qty"] - sold_qty) / pos["qty"]
+                pos["_pq"] *= keep
+                pos["_pc"] *= keep
                 pos["total_cost"] -= pos["avg_cost"] * sold_qty
                 pos["qty"] -= sold_qty
                 if pos["qty"] <= 0:
-                    pos["qty"] = 0.0
-                    pos["total_cost"] = 0.0
-                    pos["avg_cost"] = 0.0
+                    pos.update(qty=0.0, total_cost=0.0, avg_cost=0.0, _pq=0.0, _pc=0.0)
     # filter out zero-quantity positions
-    return {k: v for k, v in positions.items() if v["qty"] > 0}
+    return {k: {f: v[f] for f in ("qty", "avg_cost", "total_cost")}
+            for k, v in positions.items() if v["qty"] > 0}
 
 
 def delete_trade(trade_id: str) -> bool:
     """Remove a trade entry by ID. Returns True if found and deleted."""
-    with _lock:
+    with _writing():
         trades = _load()
         before = len(trades)
         trades = [t for t in trades if t["id"] != trade_id]

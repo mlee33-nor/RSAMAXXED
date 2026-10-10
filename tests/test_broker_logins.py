@@ -113,9 +113,9 @@ def test_fennels_comma_separated_emails(monkeypatch):
 
 
 def test_a_blank_login_is_not_a_login(monkeypatch):
-    monkeypatch.setenv("BBAE_USER", "")
-    monkeypatch.setenv("BBAE_PASSWORD", "")
-    assert BL.logins("bbae") == []
+    monkeypatch.setenv("CHASE_USERNAME", "")
+    monkeypatch.setenv("CHASE_PASSWORD", "")
+    assert BL.logins("chase") == []
 
 
 def test_a_gap_keeps_the_numbers_either_side_of_it(monkeypatch):
@@ -192,12 +192,12 @@ def test_filtering_by_tag_spans_brokers(monkeypatch):
     monkeypatch.setenv("PUBLIC_TAG_1", "mine")
     monkeypatch.setenv("PUBLIC_SECRET_TOKEN_2", "b")
     monkeypatch.setenv("PUBLIC_TAG_2", "someone else")
-    monkeypatch.setenv("BBAE_USER", "u")
-    monkeypatch.setenv("BBAE_PASSWORD", "p")
-    monkeypatch.setenv("BBAE_TAG_1", "MINE")           # case is not identity
+    monkeypatch.setenv("CHASE_USERNAME", "u")
+    monkeypatch.setenv("CHASE_PASSWORD", "p")
+    monkeypatch.setenv("CHASE_TAG_1", "MINE")           # case is not identity
 
     hit = BL.logins_tagged("mine")
-    assert sorted(hit) == ["bbae", "public"]
+    assert sorted(hit) == ["chase", "public"]
     assert [l.idx for l in hit["public"]] == [1]
 
 

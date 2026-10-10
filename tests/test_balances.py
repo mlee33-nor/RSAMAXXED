@@ -50,7 +50,7 @@ def test_public_prefers_settled_cash_over_buying_power():
 def test_a_broker_with_no_cash_key_reports_none_not_zero():
     assert balances.cash_from_extra("wellsfargo", {"balance": 500.0}) is None
     assert balances.cash_from_extra("fennel", {"positions_parsed": 3}) is None
-    assert balances.cash_from_extra("bbae", {}) is None
+    assert balances.cash_from_extra("fennel", {}) is None
     assert balances.cash_from_extra("public", None) is None
 
 

@@ -46,7 +46,40 @@ _hook_lock = threading.Lock()
 # One prompt on screen at a time. Brokers bootstrap in parallel and each has
 # its own thread, so without this two logins can both be waiting on the same
 # modal and the second code is typed into the first broker's box.
+#
+# Acquired with a timeout, never bare. An unattended run with a prompt nobody
+# answers used to hold this forever, and every other broker that needed a
+# code queued behind it for the life of the process.
 _ask_lock = threading.Lock()
+
+#: Used when a caller passes no usable timeout. Five minutes is longer than
+#: any texted code stays valid.
+DEFAULT_TIMEOUT_S = 300
+
+
+def _timeout(timeout_s) -> float:
+    try:
+        t = float(timeout_s)
+    except (TypeError, ValueError):
+        return float(DEFAULT_TIMEOUT_S)
+    return t if t > 0 else float(DEFAULT_TIMEOUT_S)
+
+
+def run_exclusive(fn: Callable[[], Optional[str]], timeout_s=DEFAULT_TIMEOUT_S,
+                  ) -> Optional[str]:
+    """Run one ask under the one-prompt-at-a-time lock, bounded.
+
+    For an asker that is not a broker module calling request_text -- the GUI's
+    builtins.input patch, which robin_stocks calls -- so it takes turns with
+    the broker prompts instead of stacking a second dialog over the first.
+    Returns None, without calling `fn`, if the lock is not free in time.
+    """
+    if not _ask_lock.acquire(timeout=_timeout(timeout_s)):
+        return None
+    try:
+        return fn()
+    finally:
+        _ask_lock.release()
 
 
 def universal_2fa_prompt(broker: str, extra: str = "") -> str:
@@ -88,14 +121,22 @@ def request_text(broker: str, prompt: str, timeout_s: int = 300) -> Optional[str
     NEVER raises. A broker login that is already holding a live browser session
     on a 2FA page must not be killed by the prompt itself failing -- the caller
     needs to be able to report "no code entered" and close down cleanly.
+
+    NEVER blocks past `timeout_s` waiting for its turn: another broker's prompt
+    left unanswered is "no answer" here too, not a hang. The hook is handed
+    the timeout and must honour it (the GUI's does); the terminal fallback
+    cannot be bounded and is only ever used by runner.py, interactively.
     """
+    timeout = _timeout(timeout_s)
     with _hook_lock:
         fn = _hook
 
-    with _ask_lock:
+    if not _ask_lock.acquire(timeout=timeout):
+        return None
+    try:
         if fn is not None:
             try:
-                answer = fn(broker, prompt, timeout_s)
+                answer = fn(broker, prompt, int(timeout))
             except Exception:
                 return None
         else:
@@ -106,6 +147,8 @@ def request_text(broker: str, prompt: str, timeout_s: int = 300) -> Optional[str
                 # stray third-party patch of builtins.input. All mean "no
                 # answer" -- and none of them should kill the login.
                 return None
+    finally:
+        _ask_lock.release()
     answer = str(answer or "").strip()
     return answer or None
 

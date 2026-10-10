@@ -1,7 +1,7 @@
 """Every broker really is multi-login — checked against the modules, not the plan.
 
-The feature is only true if all ten agree, and the five that were converted
-(BBAE, Chase, DSPAC, SoFi, Wells Fargo) were converted by a script. A wiring
+The feature is only true if every broker agrees, and the three that were
+converted (Chase, SoFi, Wells Fargo) were converted by a script. A wiring
 test is what stops "I patched five files" from quietly meaning four: each
 assertion here reads the real module, so an eleventh broker added later, or a
 refactor that drops a wrapper, fails this file rather than failing a customer's
@@ -25,11 +25,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import broker_logins as BL
 
 #: Every broker the app can load.
-ALL = ["bbae", "chase", "dspac", "fennel", "fidelity", "ibkr", "public",
+ALL = ["chase", "fennel", "fidelity", "ibkr", "public",
        "robinhood", "schwab", "sofi", "wellsfargo"]
 
 #: The five that could hold exactly one login and now run through fan_out.
-CONVERTED = ["bbae", "chase", "dspac", "sofi", "wellsfargo"]
+CONVERTED = ["chase", "sofi", "wellsfargo"]
 
 #: The four that already parsed several logins out of one variable. They were
 #: deliberately NOT touched — rewriting a working multi-login flow to prove a
@@ -94,8 +94,7 @@ def test_two_logins_do_not_share_a_session_directory(broker, monkeypatch, tmp_pa
 
 @pytest.mark.parametrize("broker", CONVERTED)
 def test_a_module_that_caches_a_session_can_swap_it(broker):
-    """Chase and SoFi hold cookies in module globals; BBAE and DSPAC hold a
-    signed-in client. Wells Fargo holds nothing between calls — its session
+    """Chase and SoFi hold cookies in module globals. Wells Fargo holds nothing between calls — its session
     lives entirely in the browser profile on disk, which _sessions_dir already
     separates, so it needs no hook."""
     mod = load(broker)

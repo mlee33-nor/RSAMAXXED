@@ -68,36 +68,18 @@ def cleanup_orphaned_chrome(profile_dir: Path) -> int:
     """Kill Chrome processes using a specific profile directory.
 
     Returns the number of processes killed.
+
+    Each process is verified through a handle that pins it -- image must be
+    chrome.exe/msedge.exe and its command line must name exactly this profile
+    dir (not a ZenFidelity_10 when cleaning ZenFidelity_1) -- before it is
+    terminated, so a stale or recycled pid can never take down something else.
+    The old route (a PowerShell pid list, then ``os.kill(pid, 9)``) killed by
+    pid after the fact and flashed a console. See modules/proc.py.
     """
-    from modules import quiet
+    from modules import proc
     killed = 0
-    profile_str = str(profile_dir.resolve()).replace("/", "\\").lower()
     try:
-        # Use PowerShell (always available on Windows 11) since wmic is deprecated
-        ps_cmd = (
-            "Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | "
-            "Select-Object ProcessId, CommandLine | "
-            "ForEach-Object { $_.ProcessId.ToString() + '|' + $_.CommandLine }"
-        )
-        # quiet.run, not subprocess.run: the GUI runs under pythonw with no
-        # console, so a plain subprocess of a console program (powershell) makes
-        # Windows allocate a new one -- a black window flashing on the user's
-        # desktop for every single browser start.
-        result = quiet.run(
-            ["powershell", "-NoProfile", "-Command", ps_cmd],
-            capture_output=True, text=True, timeout=15
-        )
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line or "|" not in line:
-                continue
-            pid_str, cmd = line.split("|", 1)
-            if profile_str in cmd.lower():
-                try:
-                    os.kill(int(pid_str.strip()), 9)
-                    killed += 1
-                except (OSError, ProcessLookupError, ValueError):
-                    pass
+        killed = proc.terminate_browsers_on(profile_dir)
     except Exception:
         pass
     # Also clean singleton files

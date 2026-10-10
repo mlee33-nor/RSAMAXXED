@@ -74,6 +74,7 @@ class Mirror:
     # cancels its own pending tick before scheduling the next one.
     _cancel_timer = A.App._cancel_timer
     _release_broker = A.App._release_broker
+    _mirror_startup_hold = A.App._mirror_startup_hold
     # Static on App: re-wrapping keeps them static here too, otherwise the stub
     # would hand them `self` as the pick.
     _mirror_key = staticmethod(A.App._mirror_key)
@@ -164,8 +165,20 @@ class Mirror:
         self._live_batches = [b for b in self._live_batches if not b.get("finished")]
 
 
+# The age gate counts NYSE trading days in New York time, so "today" is pinned
+# (a Friday) and a pick's age is counted back in sessions — the same numbers on
+# whatever day the suite runs.
+TODAY = date(2026, 10, 9)
+
+
 def pick(symbol, days_old=0, note="Reg Alert"):
-    d = date.today() - timedelta(days=days_old)
+    """A pick `days_old` TRADING days before TODAY."""
+    d = TODAY
+    n = 0
+    while n < days_old:
+        d -= timedelta(days=1)
+        if A.market_calendar.is_trading_day(d):
+            n += 1
     return {"symbol": symbol, "date": d.strftime("%Y-%m-%d"), "note": note}
 
 
@@ -177,6 +190,11 @@ def no_journal(monkeypatch):
     monkeypatch.setattr(A.mirror_journal, "start_run", lambda **kw: "run-1")
     monkeypatch.setattr(A, "winsound", types.SimpleNamespace(
         MessageBeep=lambda *_a: None, MB_ICONEXCLAMATION=0))
+    # Pacing is tested here; the clock, the market and the journal's health
+    # have their own tests (test_mirror_fixes_2026_10).
+    monkeypatch.setattr(A, "_mirror_today", lambda: TODAY)
+    monkeypatch.setattr(A, "_mirror_market_gate", lambda: (True, ""))
+    monkeypatch.setattr(A, "_mirror_journal_problem", lambda: None)
 
 
 # ------------------------------------------------------------------ pacing
@@ -247,17 +265,23 @@ def test_mirror_waits_for_a_broker_the_desk_is_already_using(monkeypatch):
 
 def test_a_batch_that_never_reports_does_not_wedge_the_queue(monkeypatch):
     monkeypatch.setattr(A, "MIRROR_PICK_GAP_MS", 0)
-    m = Mirror(brokers=("fidelity",))
+    m = Mirror(brokers=("fidelity", "public"))
     Mirror._mirror_execute(m, [pick("AAA"), pick("BBB")], "10:45", "schedule")
 
-    # AAA's broker thread never comes back.
-    m.batches[0]["started"] = datetime.now() - timedelta(
+    # AAA's Public leg landed; its Fidelity thread never comes back, so
+    # Fidelity stays claimed on the in-flight guard.
+    aaa = m.batches[0]
+    aaa["pending"].discard("public")
+    m._brokers_in_flight.discard("public")
+    aaa["started"] = datetime.now() - timedelta(
         milliseconds=A.MIRROR_QUEUE_STALL_MS + 1000)
-    m._brokers_in_flight.clear()
     Mirror._mirror_drain(m)
 
     assert [b["symbol"] for b in m.batches] == ["AAA", "BBB"]
     assert any("moving on" in line for line in m.logs)
+    # ...but never a second order on the broker that may still be mid-order.
+    assert ("fidelity", "BBB") not in m.launched
+    assert ("public", "BBB") in m.launched
 
 
 def test_a_queued_pick_is_not_marked_executed_until_it_goes_out():
@@ -331,7 +355,7 @@ def test_the_limit_is_the_users_not_the_feeds():
     assert A.PICK_MAX_AGE_DAYS == 4
     m = Mirror(max_age=2)
     three_day_old = pick("VMAR", 3)
-    assert A._pick_is_fresh(three_day_old) is True      # still in the feed
+    assert A._pick_fresh_trading(three_day_old, A.PICK_MAX_AGE_DAYS, TODAY)  # still in the feed
     assert Mirror._mirror_pick_age_ok(m, three_day_old) is False   # but not bought
 
 

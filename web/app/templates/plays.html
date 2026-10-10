@@ -25,7 +25,8 @@
 {% macro kindtag(kind) -%}
   {%- if kind == 'otc' -%}<span class="ptag otc">OTC</span>
   {%- elif kind == 'conditional' -%}<span class="ptag cond">Conditional</span>
-  {%- else -%}<span class="ptag std">Standard</span>{%- endif -%}
+  {%- elif kind == 'standard' -%}<span class="ptag std">Standard</span>
+  {%- else -%}<span class="ptag cond">Unknown type</span>{%- endif -%}
 {%- endmacro %}
 
 {% macro statuslabel(status, label) -%}
@@ -96,7 +97,11 @@
       {% endif %}
       {% if l.confirmed_date %}<span class="muted">· round-up confirmed {{ l.confirmed_date }}</span>{% endif %}
       {% if not p.is_actionable %}
+        {% if p.kind == 'conditional' %}
         <span class="warn-note">watch only — the split isn't declared yet</span>
+        {% else %}
+        <span class="warn-note">watch only — the alert's type couldn't be read</span>
+        {% endif %}
       {% endif %}
     </div>
   </li>

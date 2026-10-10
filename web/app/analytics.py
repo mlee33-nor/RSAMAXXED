@@ -7,10 +7,23 @@ Why realized-only: this is reverse-split round-up arbitrage. Live prices tell
 you nothing about whether a name rounded up, and many OTC picks have no real
 quote. The only true profit is a recorded buy matched with a confirmed sell.
 
-Per-symbol basis, all-time:
-    avg_buy  = total buy cost  / total buy qty
-    avg_sell = total sell rev  / total sell qty
-    profit   = (avg_sell - avg_buy) * total sell qty
+Per-symbol basis, all-time, over PRICED rows only (fill_price not None):
+    avg_buy  = priced buy cost / priced buy qty
+    avg_sell = priced sell rev / priced sell qty
+    profit   = (avg_sell - avg_buy) * priced sell qty
+
+An unpriced row still moves the open position, but never the money. Counting
+it at $0 made an unpriced buy a fake profit and an unpriced sell a fake loss of
+its whole basis; a symbol with no priced buy at all has no basis and is left
+out of realized (and listed in `zero_basis_symbols`).
+
+Split-adjusted first, like the desktop (trade_journal.split_adjusted): a sell
+of a FRACTION of a share is a reverse-split remnant, and is restated into the
+pre-split shares it came from (same proceeds, the whole position's quantity).
+Without that, a 0.1-share remnant sold at $10 is charged a tenth of what was
+paid for it -- the website reported ~$836 more realized profit than the app on
+the real journal. `split_adjust` below is a port of that lens and the two must
+stay in step.
 
 Attribution note: because `profit` telescopes, we can attribute each individual
 sell as (sell_price - avg_buy) * qty and the per-broker, per-month, and
@@ -19,8 +32,9 @@ covered by tests in web/tests/test_analytics.py.
 """
 from __future__ import annotations
 
+import re
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Iterable, Sequence
 
@@ -58,6 +72,64 @@ def to_tradelike(rows: Iterable[Any]) -> list[TradeLike]:
     return out
 
 
+_ACCT_NUM_RE = re.compile(r"\(([^)]*\d[^)]*)\)\s*$")
+# The salted token cloud_sync.mask_account_id puts where the number was.
+_MASK_TOKEN_RE = re.compile(r"#([a-z]{6})\s*$")
+_LOGIN_RE = re.compile(r"^\s*[A-Za-z][A-Za-z .&'-]*?\s+(\d{1,2})(?=\D|$)")
+
+
+def account_key(label: str) -> str:
+    """Port of trade_journal.account_key: the trailing "(number)" when there
+    is one (the label drifts, the number does not), else the label itself.
+
+    A MASKED label ("Fidelity 1 · FinTec #kqzvbm") keys on its token: since
+    mask version 2 the desktop hashes the account itself, so the token is the
+    number's stand-in and survives the label drifting around it. Login 2+
+    prefixes the key exactly as the desktop does ('Public 2 ...').
+    """
+    text = str(label or "").split(" = ")[0].strip()
+    t = _MASK_TOKEN_RE.search(text)
+    if t:
+        return "#" + t.group(1)
+    m = _ACCT_NUM_RE.search(text)
+    if m:
+        key = "".join(c for c in m.group(1) if c.isalnum()).upper()
+        if key:
+            lm = _LOGIN_RE.match(text[:m.start()])
+            idx = int(lm.group(1)) if lm else 1
+            return f"L{idx}:{key}" if idx > 1 else key
+    return text.casefold()
+
+
+def split_adjust(trades: Sequence[TradeLike]) -> list[TradeLike]:
+    """Port of trade_journal.split_adjusted, for P/L. Idempotent.
+
+    Walks rows in the order given (the dashboard loads them by timestamp). A
+    sell of a fraction of a share, smaller than the account's holding, is
+    restated as selling the whole holding for the same proceeds. Whole-share
+    sells and closes are left alone; an unpriced remnant stays unpriced.
+    """
+    held: dict[tuple, float] = {}
+    out: list[TradeLike] = []
+    for t in trades:
+        key = (t.broker, account_key(t.account_id), t.symbol)
+        qty = float(t.qty or 0)
+        if t.side == "buy":
+            held[key] = held.get(key, 0.0) + qty
+        elif t.side == "close":
+            held[key] = max(0.0, held.get(key, 0.0) - qty)
+        elif t.side == "sell":
+            have = held.get(key, 0.0)
+            if abs(qty - round(qty)) > 1e-9 and 0 < qty < have:
+                price = t.fill_price
+                t = replace(t, qty=have,
+                            fill_price=(price * qty / have) if price is not None else None)
+                qty = have
+            held[key] = max(0.0, have - qty)
+        out.append(t)
+    return out
+
+
 @dataclass
 class Summary:
     realized: float = 0.0
@@ -70,8 +142,8 @@ class Summary:
     trade_count: int = 0
     broker_count: int = 0
     account_count: int = 0
-    # Data quality: buys recorded without a fill price get a 0 cost basis,
-    # which inflates realized profit for that symbol. Surface it, never hide it.
+    # Data quality: symbols that were SOLD but have no priced buy, so they have
+    # no cost basis and are left out of realized. Surface it, never hide it.
     zero_basis_symbols: list[str] = field(default_factory=list)
 
     @property
@@ -84,6 +156,7 @@ class Summary:
 
 
 def summarize(trades: Sequence[TradeLike]) -> Summary:
+    trades = split_adjust(trades)
     buys: dict[str, dict[str, float]] = {}
     sells: dict[str, dict[str, float]] = {}
     open_qty: dict[tuple, float] = {}
@@ -95,11 +168,12 @@ def summarize(trades: Sequence[TradeLike]) -> Summary:
         price = t.fill_price
         key = (t.broker, sym)
         if t.side == "buy":
+            b = buys.setdefault(sym, {"qty": 0.0, "cost": 0.0})
             if price is None:
                 missing_price.add(sym)
-            b = buys.setdefault(sym, {"qty": 0.0, "cost": 0.0})
-            b["qty"] += qty
-            b["cost"] += (price or 0) * qty
+            else:
+                b["qty"] += qty
+                b["cost"] += price * qty
             open_qty[key] = open_qty.get(key, 0.0) + qty
         elif t.side == "close":
             # A position a corporate action dissolved. It closes the holding and
@@ -107,8 +181,9 @@ def summarize(trades: Sequence[TradeLike]) -> Summary:
             open_qty[key] = open_qty.get(key, 0.0) - qty
         elif t.side == "sell":
             s = sells.setdefault(sym, {"qty": 0.0, "rev": 0.0})
-            s["qty"] += qty
-            s["rev"] += (price or 0) * qty
+            if price is not None:
+                s["qty"] += qty
+                s["rev"] += price * qty
             open_qty[key] = open_qty.get(key, 0.0) - qty
 
     realized = 0.0
@@ -142,11 +217,11 @@ def summarize(trades: Sequence[TradeLike]) -> Summary:
         key=lambda d: -d["qty"],
     )
 
-    # A symbol only distorts realized P/L if it was sold on a zero basis.
+    # Sold, but no priced buy: no basis, so left out of realized above.
     sold = set(sells)
     zero_basis = sorted(
         s for s in missing_price
-        if s in sold and buys.get(s, {}).get("cost", 0) == 0
+        if s in sold and not buys.get(s, {}).get("qty", 0)
     )
 
     return Summary(
@@ -159,30 +234,32 @@ def summarize(trades: Sequence[TradeLike]) -> Summary:
         deployed=deployed,
         trade_count=len(trades),
         broker_count=len({t.broker for t in trades}),
-        account_count=len({(t.broker, t.account_id) for t in trades}),
+        account_count=len({(t.broker, account_key(t.account_id)) for t in trades}),
         zero_basis_symbols=zero_basis,
     )
 
 
 def _avg_buy_by_symbol(trades: Sequence[TradeLike]) -> dict[str, float]:
+    """Average PRICED buy per symbol; a symbol with no priced buy is absent."""
     buys: dict[str, dict[str, float]] = {}
     for t in trades:
-        if t.side != "buy":
+        if t.side != "buy" or t.fill_price is None:
             continue
         b = buys.setdefault(t.symbol, {"qty": 0.0, "cost": 0.0})
         b["qty"] += float(t.qty or 0)
-        b["cost"] += (t.fill_price or 0) * float(t.qty or 0)
+        b["cost"] += t.fill_price * float(t.qty or 0)
     return {s: (v["cost"] / v["qty"]) for s, v in buys.items() if v["qty"]}
 
 
 def _sell_profits(trades: Sequence[TradeLike]) -> list[tuple[TradeLike, float]]:
     """Attribute realized profit to each individual sell. Sums to `realized`."""
+    trades = split_adjust(trades)
     avg_buy = _avg_buy_by_symbol(trades)
     out = []
     for t in trades:
-        if t.side != "sell" or t.symbol not in avg_buy:
+        if t.side != "sell" or t.fill_price is None or t.symbol not in avg_buy:
             continue
-        profit = ((t.fill_price or 0) - avg_buy[t.symbol]) * float(t.qty or 0)
+        profit = (t.fill_price - avg_buy[t.symbol]) * float(t.qty or 0)
         out.append((t, profit))
     out.sort(key=lambda p: p[0].timestamp)
     return out

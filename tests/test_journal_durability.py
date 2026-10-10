@@ -74,16 +74,42 @@ def test_a_failed_write_leaves_the_previous_journal_intact(journal, monkeypatch)
     assert json.loads(journal.read_text(encoding="utf-8"))    # still valid JSON
 
 
-def test_the_previous_version_is_kept_as_a_backup(journal):
-    """Cheapest possible insurance on the one file with no other source."""
+def test_the_saved_version_is_kept_as_a_backup(journal):
+    """Cheapest possible insurance on the one file with no other source.
+
+    The .bak is refreshed AFTER the save, to the same contents. It used to be
+    the state before the save, so it always lagged one row and a torn journal
+    recovered from it lost the newest fill."""
     trade_journal._cache.clear()
     trade_journal.record_trade(broker="public", account_id="Public 1 (1234)",
                                side="sell", symbol="SMTK", qty=1, fill_price=4.75)
 
     backup = journal.with_suffix(".bak")
     assert backup.exists()
-    # The backup is the state BEFORE the sell — one trade, not two.
-    assert len(json.loads(backup.read_text(encoding="utf-8"))) == 1
+    assert json.loads(backup.read_text(encoding="utf-8")) ==         json.loads(journal.read_text(encoding="utf-8"))
+    assert len(json.loads(journal.read_text(encoding="utf-8"))) == 2
+
+
+def test_a_torn_journal_recovers_every_row_from_the_backup(journal):
+    """L7: the newest fill must survive a torn trades.json."""
+    trade_journal._cache.clear()
+    trade_journal.record_trade(broker="public", account_id="Public 1 (1234)",
+                               side="sell", symbol="SMTK", qty=1, fill_price=4.75)
+    journal.write_text('[{"id": "x", "sym', encoding="utf-8")      # torn
+    trade_journal._cache.clear()
+    rows = trade_journal._load()
+    assert [r["side"] for r in rows] == ["buy", "sell"]
+    assert "recovered" in (trade_journal.last_recovery() or "")
+    assert trade_journal.last_error() is None
+
+
+def test_a_failed_backup_after_the_save_still_saves(journal, monkeypatch):
+    def die(*a, **k):
+        raise OSError("bak locked")
+
+    monkeypatch.setattr(trade_journal, "_backup_saved", die)
+    trade_journal.record_trade(broker="public", account_id="Public 1 (1234)",
+                               side="sell", symbol="SMTK", qty=1, fill_price=4.75)
     assert len(json.loads(journal.read_text(encoding="utf-8"))) == 2
 
 

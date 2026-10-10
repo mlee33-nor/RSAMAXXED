@@ -88,7 +88,8 @@ def _on_login_switch(idx: int) -> None:
     if idx == _CUR_LOGIN:
         return
     _SESSION_BY_LOGIN[_CUR_LOGIN] = (_COOKIES,)
-    _COOKIES = _SESSION_BY_LOGIN.get(idx, (None,))
+    # Unpack: a bare assignment would leave _COOKIES as the 1-tuple itself.
+    (_COOKIES,) = _SESSION_BY_LOGIN.get(idx, (None,))
     _CUR_LOGIN = idx
 
 
@@ -208,6 +209,39 @@ def _safe_last4(v: Any) -> str:
     if len(digits) >= 4:
         return digits[-4:]
     return (s[-4:] if len(s) >= 4 else s) or "----"
+
+
+def _position_symbol(pos: Any) -> str:
+    """symbolSecurityIdentifier of a Chase position line, or ""."""
+    comp0 = _first_dict_in_list(pos.get("positionComponents")) if isinstance(pos, dict) else None
+    sid0 = _first_dict_in_list(comp0.get("securityIdDetail")) if isinstance(comp0, dict) else None
+    if not isinstance(sid0, dict):
+        return ""
+    return str(sid0.get("symbolSecurityIdentifier") or "").strip().upper()
+
+
+#: Type-like fields on a position line that can label it as cash.
+#: NEEDS LIVE VERIFICATION: Chase's exact field names for the asset type.
+_CASH_TYPE_KEYS = ("assetClassCode", "assetClassName", "instrumentTypeCode",
+                   "securityTypeCode", "assetTypeCode", "productTypeCode",
+                   "positionTypeCode", "instrumentTypeName")
+
+
+def _is_cash_position(pos: Any) -> bool:
+    """True when a position line is the account's cash, not a security.
+
+    The legacy test was the name alone ("Cash" in instrumentLongName), which
+    drops a real stock whose name contains "Cash" from the holdings -- and
+    auto-sell then never sees the shares. Decide by an explicit cash type when
+    Chase sends one, else by the line carrying no tradable symbol.
+    """
+    if not isinstance(pos, dict):
+        return False
+    for k in _CASH_TYPE_KEYS:
+        v = str(pos.get(k) or "").strip().upper()
+        if v and ("CASH" in v or "SWEEP" in v):
+            return True
+    return _position_symbol(pos) in ("", "UNKNOWN", "CASH", "USD")
 
 
 def _is_cancelled(kwargs: Dict[str, Any]) -> bool:
@@ -456,6 +490,25 @@ def _extract_accounts_map(resp_json: Dict[str, Any]) -> List[Tuple[str, str, Opt
                 fval = None
             if acc_id and mask:
                 out.append((mask, acc_id, fval))
+    return out
+
+
+def _unmasked_account_ids(resp_json: Dict[str, Any]) -> List[str]:
+    """Account ids Chase listed without a mask. _extract_accounts_map leaves
+    them out (the mask is the account's label everywhere), so a trade reports
+    each one as skipped instead of dropping it without a word."""
+    out: List[str] = []
+    for item in (resp_json.get("cache", []) if isinstance(resp_json, dict) else []) or []:
+        response = item.get("response") if isinstance(item, dict) else None
+        inv = response.get("investmentAccountOverviews") if isinstance(response, dict) else None
+        if not isinstance(inv, list) or not inv or not isinstance(inv[0], dict):
+            continue
+        for acct in inv[0].get("investmentAccountDetails", []) or []:
+            if not isinstance(acct, dict):
+                continue
+            acc_id = str(acct.get("accountId") or "").strip()
+            if acc_id and not str(acct.get("mask") or "").strip():
+                out.append(acc_id)
     return out
 
 
@@ -1184,9 +1237,30 @@ def _get_holdings_one(*args, **kwargs) -> BrokerOutput:
                 data = r.json() or {}
                 rows: List[HoldingRow] = []
 
-                raw_positions = data.get("positions") or []
-                if not isinstance(raw_positions, list):
+                # A 200 without a positions list is not "holds nothing": an
+                # empty ok=True row lets auto-sell skip shares that are there.
+                # NEEDS LIVE VERIFICATION: that an empty account still sends
+                # "positions": [] rather than omitting the key.
+                raw_positions = data.get("positions") if isinstance(data, dict) else None
+                if raw_positions is None and isinstance(data, dict) and "positions" in data:
                     raw_positions = []
+                if not isinstance(raw_positions, list):
+                    keys = sorted(str(k) for k in data.keys())[:20] if isinstance(data, dict) else []
+                    outs.append(
+                        AccountOutput(
+                            account_id=acct_line,
+                            ok=False,
+                            message=("Chase answered without a positions list — holdings "
+                                     f"could not be read (keys: {keys})"),
+                            holdings=[],
+                            extra={
+                                "account_mask": str(mask),
+                                "account_value_reported": float(acc_val) if acc_val is not None else None,
+                                "positions_http_status": int(r.status_code),
+                            },
+                        )
+                    )
+                    continue
 
                 cash_skipped = 0
                 cash_value = 0.0
@@ -1196,9 +1270,13 @@ def _get_holdings_one(*args, **kwargs) -> BrokerOutput:
                     if not isinstance(pos, dict):
                         continue
 
-                    # skip “Cash” positions (legacy behavior)
+                    # skip “Cash” positions (legacy behavior) -- but a line is
+                    # cash only by its type or by having no tradable symbol. A
+                    # real security whose NAME says "Cash" keeps its row.
                     long_name = str(pos.get("instrumentLongName") or "")
-                    if "Cash" in long_name:
+                    if "Cash" in long_name and not _is_cash_position(pos):
+                        pass  # a security named "...Cash..." -- a holding
+                    elif "Cash" in long_name:
                         cash_skipped += 1
                         # Counted but discarded, which is right for a holdings
                         # list and wrong for anything that wants to know what
@@ -1330,12 +1408,32 @@ def _get_holdings_one(*args, **kwargs) -> BrokerOutput:
     return chase_normalize(out1)
 
 
+def _not_sent(msg: str) -> str:
+    """`msg` worded for the app's positive nothing-sent rule. Only for a
+    failure that provably came before any execute POST."""
+    msg = (msg or "").strip() or "Chase failed"
+    return msg if "nothing was sent" in msg.lower() else f"{msg} — nothing was sent"
+
+
+def _boot_not_sent(boot: BrokerOutput) -> BrokerOutput:
+    """A failed sign-in, as a trade result: every row says nothing was sent."""
+    accts = [AccountOutput(account_id=a.account_id, ok=a.ok,
+                           message=a.message if a.ok else _not_sent(a.message),
+                           order_id=a.order_id)
+             for a in (boot.accounts or [])]
+    if not accts:
+        accts = [AccountOutput(account_id="Chase", ok=False,
+                               message=_not_sent(boot.message or "Chase login failed"))]
+    return BrokerOutput(broker=boot.broker, state=boot.state, accounts=accts,
+                        message=boot.message)
+
+
 def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = False, **kwargs) -> BrokerOutput:
     if _is_cancelled(kwargs):
         return BrokerOutput(
             broker=BROKER,
             state="failed",
-            accounts=[AccountOutput(account_id="Chase", ok=False, message="Cancelled before start")],
+            accounts=[AccountOutput(account_id="Chase", ok=False, message=_not_sent("Cancelled before start"))],
             message="Cancelled",
         )
 
@@ -1343,7 +1441,8 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
     # Legacy-style: rehydrate + prime trade context before trading
     boot = ensure_session(prime_trade=True, **kwargs)
     if boot.state not in ("success", "partial"):
-        return boot
+        # Never got in: no order request was made for any account.
+        return _boot_not_sent(boot)
 
     def _parse_qty_int(qty_raw: Any) -> Optional[int]:
         try:
@@ -1524,7 +1623,18 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
             message="Invalid qty",
         )
 
-    def _attempt_trade() -> BrokerOutput:
+    # Filled by _attempt_trade so the unauthorized retry below knows exactly
+    # which accounts it may run again:
+    #   loop:       True once the per-account loop has started
+    #   unauth_pre: acc_id -> label, for accounts that failed as unauthorized
+    #               BEFORE their execute POST (nothing was sent for them)
+    #   rows:       acc_id -> that account's result in the latest attempt
+    track: Dict[str, Any] = {}
+
+    def _attempt_trade(only_ids: Optional[set] = None) -> BrokerOutput:
+        track["loop"] = False
+        track["unauth_pre"] = {}
+        track["rows"] = {}
         cookies, err = _require_session()
         if err:
             return err
@@ -1556,7 +1666,8 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
             return BrokerOutput(
                 broker=BROKER,
                 state="failed",
-                accounts=[AccountOutput(account_id="Chase", ok=False, message=str(e))],
+                accounts=[AccountOutput(account_id="Chase", ok=False,
+                                        message=_not_sent(str(e)))],
                 message=str(e),
             )
 
@@ -1592,7 +1703,8 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
             return BrokerOutput(
                 broker=BROKER,
                 state="failed",
-                accounts=[AccountOutput(account_id="Chase", ok=False, message=str(e))],
+                accounts=[AccountOutput(account_id="Chase", ok=False,
+                                        message=_not_sent(str(e)))],
                 message=str(e),
             )
 
@@ -1605,13 +1717,28 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
         BAD_STATUSES = {"REJECTED", "CANCELLED", "CANCELED", "FAILED", "ERROR", "EXPIRED", "VOID"}
 
         outs: List[AccountOutput] = []
+        if only_ids is None:
+            for _uid in _unmasked_account_ids(resp):
+                outs.append(AccountOutput(
+                    account_id=f"Chase account ...{_uid[-4:]}", ok=False,
+                    message=("Skipped: Chase listed this account without its number "
+                             "mask — nothing was sent")))
+        track["loop"] = True
+        _first = True
 
         for _acct_i, (mask, acc_id, _acc_val) in enumerate(accounts):
+            if only_ids is not None and str(acc_id) not in only_ids:
+                continue
             if _is_cancelled(kwargs):
                 break
-            if _acct_i > 0:
+            if not _first:
                 time.sleep(random.uniform(1.0, 3.0))
+            _first = False
             acct_label = str(mask)
+            n_before = len(outs)
+            # Set immediately before the execute POST: from then on an error
+            # or an unreadable answer may mean the order is live at Chase.
+            exec_sent = False
 
             try:
                 if side_norm == "buy":
@@ -1714,6 +1841,7 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
                 payload_execute = dict(payload_validate)
                 payload_execute["financialInformationExchangeSystemOrderIdentifier"] = exchange_id
 
+                exec_sent = True
                 rx = req.post(
                     url_execute,
                     headers=_base_headers(),
@@ -1722,53 +1850,97 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
                     impersonate="chrome",
                     timeout=60,
                 )
+                if rx.status_code >= 500 or rx.status_code == 408:
+                    # A server error / gateway timeout on the execute POST is
+                    # not a refusal: Chase may have taken the order.
+                    outs.append(AccountOutput(account_id=acct_label, ok=False, message=(
+                        f"Order submitted but Chase answered HTTP {rx.status_code} — verify in "
+                        f"Chase before retrying ({rx.text[:200]})")))
+                    continue
+                # From here on the execute POST has gone out. Nothing in its
+                # answer is a "Rejected": a refusal Chase never acted on looks
+                # exactly like a status field we don't know, and calling it
+                # rejected told mirror it was safe to buy again. Only the
+                # validate phase above may say Rejected.
                 if rx.status_code != 200:
-                    outs.append(AccountOutput(account_id=acct_label, ok=False, message=f"Rejected — Execution HTTP {rx.status_code}: {rx.text[:200]}"))
+                    outs.append(AccountOutput(account_id=acct_label, ok=False, message=(
+                        f"Order submitted but Chase answered HTTP {rx.status_code} — verify in "
+                        f"Chase before retrying ({rx.text[:200]})")))
                     continue
 
                 try:
                     exec_data = rx.json() or {}
                 except Exception:
-                    outs.append(AccountOutput(account_id=acct_label, ok=False, message=f"Rejected — Execution returned non-JSON: {rx.text[:200]}"))
-                    continue
-
-                exec_errors = _extract_error_messages(exec_data)
-                if exec_errors:
-                    outs.append(AccountOutput(account_id=acct_label, ok=False, message=f"Rejected — {_join(exec_errors, 'Execution failed')}"))
+                    # HTTP 200 to the execute POST but an unreadable body: the
+                    # order may be live.
+                    outs.append(AccountOutput(account_id=acct_label, ok=False, message=(
+                        "Order submitted but Chase's response could not be read — verify in "
+                        f"Chase before retrying ({rx.text[:200]})")))
                     continue
 
                 oid = _parse_order_id(exec_data)
                 status = _parse_order_status(exec_data).strip().upper()
+                # A status field holding an accepted/filled state is not an
+                # error, nor is a "code" that says so (ORDER_ACCEPTED).
+                exec_errors = [m for m in _extract_error_messages(exec_data)
+                               if m.upper() not in (f"STATUS={status}", f"CODE={status}")
+                               or status not in (OK_STATUSES | FILLED_STATUSES)]
+                # The error keys proper, without the free-text "messages" list
+                # ("Your order has been placed" rides along with an accepted
+                # order).
+                hard_errors = (_extract_error_messages(
+                    {k: v for k, v in exec_data.items() if k not in ("messages", "status", "code")})
+                    if isinstance(exec_data, dict) else [])
+                if oid and status in (OK_STATUSES | FILLED_STATUSES) and not hard_errors:
+                    # An order id with an accepted state is a placed order;
+                    # any messages alongside it are Chase's notes, not errors.
+                    word = "Filled" if status in FILLED_STATUSES else "Submitted"
+                    outs.append(AccountOutput(account_id=acct_label, ok=True,
+                                              message=f"{word} (order_id={oid})", order_id=str(oid)))
+                    continue
 
-                if not oid:
+                if oid and not status and not exec_errors:
                     warns = _extract_warnings(exec_data)
-                    outs.append(AccountOutput(account_id=acct_label, ok=False, message=f"Unknown result — {_join(warns, 'No orderIdentifier returned')}; check Chase UI"))
+                    extra = _join(warns, "")
+                    msg = f"Submitted (status unavailable) (order_id={oid})"
+                    if extra:
+                        msg += f" — Warnings: {extra}"
+                    outs.append(AccountOutput(account_id=acct_label, ok=True, message=msg, order_id=str(oid)))
                     continue
 
-                if status in BAD_STATUSES:
-                    outs.append(AccountOutput(account_id=acct_label, ok=False, message=f"Rejected — {status.lower()} (order_id={oid})", order_id=str(oid)))
-                    continue
-
-                if status in FILLED_STATUSES:
-                    outs.append(AccountOutput(account_id=acct_label, ok=True, message=f"Filled (order_id={oid})", order_id=str(oid)))
-                    continue
-
-                if status in OK_STATUSES:
-                    outs.append(AccountOutput(account_id=acct_label, ok=True, message=f"Submitted (order_id={oid})", order_id=str(oid)))
+                if oid:
+                    detail = _join(exec_errors, status.lower() or "no status")
+                    outs.append(AccountOutput(account_id=acct_label, ok=False, message=(
+                        f"Order submitted (order_id={oid}) but Chase answered '{detail}' — "
+                        f"verify in Chase before retrying"), order_id=str(oid)))
                     continue
 
                 warns = _extract_warnings(exec_data)
-                extra = _join(warns, "")
-                msg = f"Submitted (status unavailable) (order_id={oid})"
-                if extra:
-                    msg += f" — Warnings: {extra}"
-                outs.append(AccountOutput(account_id=acct_label, ok=True, message=msg, order_id=str(oid)))
+                detail = _join(exec_errors + warns, "No orderIdentifier returned")
+                outs.append(AccountOutput(account_id=acct_label, ok=False, message=(
+                    "Order submitted but Chase returned no order id — verify in Chase "
+                    f"before retrying ({detail})")))
 
             except Exception as e:
-                outs.append(AccountOutput(account_id=acct_label, ok=False, message=f"Unknown result — {e}"))
+                if exec_sent:
+                    # The execute POST went out; its answer was lost.
+                    detail = f"{type(e).__name__}: {e}".strip().rstrip(":")
+                    msg = ("Order submitted but Chase's response was lost — verify in "
+                           f"Chase before retrying ({detail})")
+                else:
+                    msg = f"Not sent — {e}"
+                outs.append(AccountOutput(account_id=acct_label, ok=False, message=msg))
                 if dry_run:
                     log_lines.append(f"[{acct_label}] ERROR: {e}")
                     log_lines.append("")
+
+            finally:
+                # In a finally because every branch above ends in `continue`.
+                if len(outs) > n_before:
+                    row = outs[-1]
+                    track["rows"][str(acc_id)] = row
+                    if not exec_sent and not row.ok and _looks_unauthorized_text(row.message):
+                        track["unauth_pre"][str(acc_id)] = acct_label
 
         if _is_cancelled(kwargs):
             state = "partial" if any(a.ok for a in outs) else "failed"
@@ -1792,13 +1964,41 @@ def _execute_trade_one(*, side: str, qty: str, symbol: str, dry_run: bool = Fals
     if out1.state != "failed":
         return chase_normalize(out1)
 
-    if _looks_unauthorized_text(out1.message) or any(_looks_unauthorized_text(a.message) for a in (out1.accounts or [])):
-        boot2 = ensure_session(prime_trade=True, **kwargs)
-        if boot2.state not in ("success", "partial"):
-            return boot2
-        return chase_normalize(_attempt_trade())
+    if not track.get("loop"):
+        # Failed before any account was tried (session / account list /
+        # quote): nothing was sent, so the whole trade may run again.
+        if _looks_unauthorized_text(out1.message) or any(_looks_unauthorized_text(a.message) for a in (out1.accounts or [])):
+            boot2 = ensure_session(prime_trade=True, **kwargs)
+            if boot2.state not in ("success", "partial"):
+                return _boot_not_sent(boot2)
+            return chase_normalize(_attempt_trade())
+        return chase_normalize(out1)
 
-    return chase_normalize(out1)
+    # The loop ran. Only accounts that failed as unauthorized before their
+    # execute POST may run again; every other account keeps its result (an
+    # order may exist for it).
+    retry = dict(track.get("unauth_pre") or {})
+    if not retry or _is_cancelled(kwargs):
+        return chase_normalize(out1)
+    first_rows = dict(track.get("rows") or {})
+
+    boot2 = ensure_session(prime_trade=True, **kwargs)
+    if boot2.state not in ("success", "partial"):
+        return chase_normalize(out1)
+    out2 = _attempt_trade(only_ids=set(retry))
+    second_rows = dict(track.get("rows") or {}) if track.get("loop") else {}
+
+    merged: List[AccountOutput] = []
+    for a in (out1.accounts or []):
+        acc_id = next((k for k, r in first_rows.items() if r is a), None)
+        if acc_id is not None and acc_id in retry and acc_id in second_rows:
+            merged.append(second_rows[acc_id])
+        else:
+            merged.append(a)
+    ok_ct = sum(1 for a in merged if a.ok)
+    state = "success" if ok_ct == len(merged) and merged else ("partial" if ok_ct > 0 else "failed")
+    return chase_normalize(BrokerOutput(broker=BROKER, state=state, accounts=merged,
+                                        message=out2.message or out1.message))
 
 
 # ---------------------------------------------------------------------------

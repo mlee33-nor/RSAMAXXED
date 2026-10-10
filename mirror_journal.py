@@ -41,6 +41,7 @@ vanishing.
 from __future__ import annotations
 
 import atexit
+import copy
 import json
 import sys
 import threading
@@ -106,13 +107,44 @@ def _stat() -> Optional[tuple]:
         return None
 
 
+#: Why the file could not be READ (opened), or None. While set, nothing is
+#: written: the file is most likely fine underneath a lock, and saving this
+#: session's view over it would erase the history mirror's repair relies on.
+_read_error: Optional[str] = None
+
+_READ_ATTEMPTS = 3
+_READ_DELAY = 0.05
+
+
+def read_error() -> Optional[str]:
+    """Why the journal file could not be read on the last attempt, or None."""
+    return _read_error
+
+
 def _read_file() -> Dict[str, Any]:
-    """Never raises. A corrupt journal costs history, not the automation."""
+    """The parsed journal. A CORRUPT file reads as empty (it costs history, not
+    the automation). A file that exists but cannot be OPENED raises OSError
+    after a few short retries — it is not the same thing as an empty journal.
+    """
     if not _FILE.exists():
         return _empty()
+    text: Optional[str] = None
+    err: Optional[OSError] = None
+    for attempt in range(_READ_ATTEMPTS):
+        if attempt:
+            time.sleep(_READ_DELAY * attempt)
+        try:
+            text = _FILE.read_text(encoding="utf-8")
+            break
+        except FileNotFoundError:
+            return _empty()
+        except OSError as e:
+            err = e
+    if text is None:
+        raise err or OSError(f"could not read {_FILE.name}")
     try:
-        data = json.loads(_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(text)
+    except ValueError:                  # JSON + Unicode errors
         return _empty()
     if not isinstance(data, dict):
         return _empty()
@@ -130,18 +162,37 @@ def _load() -> Dict[str, Any]:
     the app, a restore by hand) — and never reloaded while our own write is
     still queued, because then the memory copy is the newer one.
     """
-    global _cache, _cache_stat
+    global _cache, _cache_stat, _read_error
     if _cache is not None and (_dirty or _inflight or _stat() == _cache_stat):
         return _cache
     st = _stat()
-    _cache = _read_file()
+    try:
+        data = _read_file()
+    except OSError as e:
+        # Not cached, so the next call reads again; writes are refused until
+        # one succeeds (see _save). Callers get a private copy of what we last
+        # read, so a recorder appending to it cannot leak into the cache.
+        _read_error = f"{_FILE.name} could not be read ({e})"
+        return copy.deepcopy(_cache) if _cache is not None else _empty()
+    _read_error = None
+    _cache = data
     _cache_stat = st
     return _cache
 
 
 def _save(data: Dict[str, Any]) -> None:
-    """Commit `data` as the journal: in memory now, on disk shortly."""
+    """Commit `data` as the journal: in memory now, on disk shortly.
+
+    Refused while the file is unreadable: `data` was built on an empty (or
+    stale) view, and writing it would replace the real history.
+    """
     global _cache, _dirty
+    if _read_error is not None:
+        try:
+            print(f"mirror_journal: not saving -- {_read_error}", file=sys.stderr)
+        except Exception:
+            pass                        # pyw: no stderr at all
+        return
     data["runs"] = data["runs"][-MAX_RUNS:]
     data["scans"] = data["scans"][-MAX_SCANS:]
     _cache = data
