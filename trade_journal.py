@@ -7,6 +7,7 @@ EXE packaging: pip install pyinstaller && pyinstaller --onefile --windowed app.p
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
@@ -626,6 +627,13 @@ def version() -> tuple:
         return (0, 0)
 
 
+def revision() -> tuple:
+    """version() plus this process's write count: changes on every save made
+    here even if the file's (mtime, size) happened not to. For callers that
+    cache something DERIVED from the journal."""
+    return (version(), _cache_gen)
+
+
 #: Login 1's account labels at these brokers once carried a login prefix that
 #: was dropped (login 1 must match its single-login form). An install that had
 #: several logins then has rows under BOTH spellings of the same account, and
@@ -689,7 +697,15 @@ def account_key(label: Any) -> str:
     the number alone, so every key an existing single-login install produced
     is unchanged.
     """
-    text = str(label or "").split(" = ")[0].strip()
+    return _account_key_text(str(label or ""))
+
+
+@functools.lru_cache(maxsize=8192)
+def _account_key_text(label: str) -> str:
+    """account_key for one label string. Cached: a pure function of the text,
+    called once per journal row every time the sell side restates the journal
+    (tens of thousands of calls per Exits render before it was)."""
+    text = label.split(" = ")[0].strip()
     m = _ACCT_NUM_RE.search(text)
     if m:
         key = "".join(c for c in m.group(1) if c.isalnum()).upper()

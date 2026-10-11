@@ -72,7 +72,7 @@ except Exception:  # missing module, missing requests, anything at all
 
 # The release a customer is running — shown in the sidebar footer and stamped
 # on every crash-log START line, so a support report says which build it is.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 # The main window's title. The single-instance guard finds a running copy's
 # window by it (FindWindowW), so it is defined once here and used by both.
@@ -2434,6 +2434,26 @@ def _known_renames(extra: Optional[Dict[str, str]] = None,
     return {k: v for k, v in m.items() if k != v}
 
 
+#: _sell_side_rows results by (journal revision, rename map). Restating the
+#: whole journal costs ~200ms on a real one, and one Exits render asked for it
+#: eight times -- the page took half a second to switch to, every visit, and
+#: the old page showed through while it did. The rows are shared and
+#: read-only, the same contract trade_journal.get_trades has.
+_SELL_ROWS_CACHE: Dict[tuple, List[Dict[str, Any]]] = {}
+_SELL_ROWS_LOCK = threading.Lock()
+_SELL_ROWS_MAX = 32
+#: The journal functions the cache is valid for. The key only sees the FILE
+#: (revision), so anything that swaps one of these for another source of rows
+#: -- a test's fake journal -- must bypass it rather than read a stale entry.
+_SELL_ROWS_SOURCES = (trade_journal.get_trades, trade_journal.split_adjusted,
+                      trade_journal.fold_renames)
+
+
+def _sell_rows_cacheable() -> bool:
+    return (trade_journal.get_trades, trade_journal.split_adjusted,
+            trade_journal.fold_renames) == _SELL_ROWS_SOURCES
+
+
 def _sell_side_rows(renames: Optional[Dict[str, str]] = None,
                     names: Any = ()) -> List[Dict[str, Any]]:
     """The journal as the sell side nets it: renames folded, THEN split-adjusted.
@@ -2445,8 +2465,27 @@ def _sell_side_rows(renames: Optional[Dict[str, str]] = None,
     phantom open share that auto-sell queued for sale. Each folded row keeps
     the ticker it was journaled under as `executed_symbol`.
     """
-    return trade_journal.split_adjusted(trade_journal.fold_renames(
-        trade_journal.get_trades(), _known_renames(renames, names)))
+    m = _known_renames(renames, names)
+    if not _sell_rows_cacheable():
+        return trade_journal.split_adjusted(trade_journal.fold_renames(
+            trade_journal.get_trades(), m))
+    key = (trade_journal.revision(), tuple(sorted(m.items())))
+    with _SELL_ROWS_LOCK:
+        hit = _SELL_ROWS_CACHE.get(key)
+    if hit is not None:
+        return list(hit)
+    rows = trade_journal.split_adjusted(trade_journal.fold_renames(
+        trade_journal.get_trades(), m))
+    if trade_journal.last_error():
+        return rows             # stale fallback rows: never remember those
+    with _SELL_ROWS_LOCK:
+        stale = [k for k in _SELL_ROWS_CACHE if key[0] not in k[:2]]
+        for k in stale:
+            del _SELL_ROWS_CACHE[k]
+        if len(_SELL_ROWS_CACHE) >= _SELL_ROWS_MAX:
+            _SELL_ROWS_CACHE.pop(next(iter(_SELL_ROWS_CACHE)))
+        _SELL_ROWS_CACHE[key] = rows
+    return list(rows)
 
 
 def _journaled_symbol(t: Dict[str, Any]) -> str:
@@ -2463,8 +2502,23 @@ def _sell_share_ledger(renames: Optional[Dict[str, str]] = None) -> Dict[tuple, 
     the arithmetic looked complete. Split-adjusted for the same reason every
     other position figure is -- after folding renames, see _sell_side_rows.
     Keyed by the ticker each row was journaled under.
+
+    Cached like _sell_side_rows (an Exits render asks nine times); every call
+    gets its own copy, so a caller adding to a [bought, sold] pair cannot
+    change what the next one reads.
     """
     out: Dict[tuple, List[float]] = {}
+    try:
+        key = (("ledger", trade_journal.revision(),
+                tuple(sorted(_known_renames(renames).items())))
+               if _sell_rows_cacheable() else None)
+    except Exception:
+        key = None
+    if key is not None:
+        with _SELL_ROWS_LOCK:
+            hit = _SELL_ROWS_CACHE.get(key)
+        if hit is not None:
+            return {k: list(v) for k, v in hit.items()}
     try:
         rows = _sell_side_rows(renames)
     except Exception:
@@ -2481,6 +2535,11 @@ def _sell_share_ledger(renames: Optional[Dict[str, str]] = None) -> Dict[tuple, 
             continue
         rec = out.setdefault((str(t.get("broker") or ""), sym), [0.0, 0.0])
         rec[0 if t.get("side") == "buy" else 1] += qty
+    if key is not None and not trade_journal.last_error():
+        with _SELL_ROWS_LOCK:
+            if len(_SELL_ROWS_CACHE) >= _SELL_ROWS_MAX:
+                _SELL_ROWS_CACHE.pop(next(iter(_SELL_ROWS_CACHE)))
+            _SELL_ROWS_CACHE[key] = {k: list(v) for k, v in out.items()}
     return out
 
 
@@ -14610,6 +14669,16 @@ class App(ctk.CTk):
         for w in self._cov_lines.winfo_children():
             w.destroy()
 
+        # Buys per symbol, [unpriced, total], in one pass over the journal --
+        # counting per sold symbol rescanned every trade for each one.
+        buy_counts: Dict[str, List[int]] = {}
+        for t in all_trades:
+            if t["side"] == "buy":
+                c = buy_counts.setdefault(t["symbol"], [0, 0])
+                c[1] += 1
+                if t.get("fill_price") is None:
+                    c[0] += 1
+
         no_buy, no_price, partial = {}, {}, {}
         for sym in sold_syms:
             ab = alltime_buy.get(sym)
@@ -14619,12 +14688,8 @@ class App(ctk.CTk):
             elif not ab["priced_qty"]:
                 no_price[sym] = rev
             else:
-                nulls = sum(1 for t in all_trades
-                            if t["symbol"] == sym and t["side"] == "buy"
-                            and t.get("fill_price") is None)
+                nulls, total = buy_counts.get(sym, (0, 0))
                 if nulls:
-                    total = sum(1 for t in all_trades
-                                if t["symbol"] == sym and t["side"] == "buy")
                     partial[sym] = (nulls, total)
 
         estimated = sum(1 for t in all_trades if trade_journal.is_estimated(t))
