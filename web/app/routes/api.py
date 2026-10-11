@@ -573,7 +573,20 @@ def ingest_plays(body: FeedIn, db: Session = Depends(get_db)) -> dict[str, Any]:
         select(Play).where(Play.source_id.in_([b.source_id for b in body.buys])))
     } if body.buys else {}
     seen = set(stored_buys)
+    # A picks:SYM:DATE copy of an alert a message already published is not a
+    # second play (see playsfeed.drop_shadowed_picks) -- the same (symbol,
+    # date) guard import_picks_file has always applied.
+    copies = [b for b in body.buys if playsfeed.is_picks_copy(b.source_id)]
+    published = {(sym, d) for sym, d, sid in db.execute(
+        select(Play.symbol, Play.alert_date, Play.source_id).where(
+            Play.symbol.in_([b.symbol for b in copies]))
+    ).all() if not playsfeed.is_picks_copy(sid)} if copies else set()
+    published |= {(b.symbol, b.alert_date) for b in body.buys
+                  if not playsfeed.is_picks_copy(b.source_id)}
     for b in body.buys:
+        if (b.source_id not in stored_buys and playsfeed.is_picks_copy(b.source_id)
+                and (b.symbol, b.alert_date) in published):
+            continue
         row = stored_buys.get(b.source_id)
         if row is not None and row.kind != b.kind and (
                 b.kind not in _BUY_KINDS or _recent_alert(row.alert_date)):

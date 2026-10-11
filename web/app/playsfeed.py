@@ -898,6 +898,29 @@ def _newest(rows: Iterable, *attrs: str) -> datetime | None:
     return max(stamps) if stamps else None
 
 
+def is_picks_copy(source_id: str | None) -> bool:
+    """A "picks:SYM:DATE" row: the desktop's picks.json republished, not an
+    upstream message."""
+    return (source_id or "").startswith("picks:")
+
+
+def drop_shadowed_picks(plays: list[Play]) -> list[Play]:
+    """Drop every picks: row whose (symbol, alert_date) a message row also has.
+
+    The operator's terminal republishes its whole picks.json through ingest
+    (app._push_picks_remote -> rsa_feed.from_pick), and ingest keys on
+    source_id, so each alert the publisher already sent landed a second time
+    as a bare copy -- 130 of 407 plays shown twice on the board. The copy
+    carries nothing the message row lacks; a picks: row with no message twin
+    is a real hand-entered play and stays.
+    """
+    real = {((p.symbol or "").upper(), p.alert_date or "")
+            for p in plays if not is_picks_copy(p.source_id)}
+    return [p for p in plays
+            if not (is_picks_copy(p.source_id)
+                    and ((p.symbol or "").upper(), p.alert_date or "") in real)]
+
+
 def load_board(db: Session, *, today: date | None = None,
                history_limit: int = HISTORY_LIMIT) -> Board:
     """The whole page in one call: four queries, joined in memory.
@@ -919,6 +942,7 @@ def load_board(db: Session, *, today: date | None = None,
     board_truncated = len(plays) > history_limit
     if board_truncated:
         plays = plays[:history_limit]
+    plays = drop_shadowed_picks(plays)
 
     exits = list(db.scalars(
         select(PlayExit).order_by(PlayExit.sell_date.desc(), PlayExit.id.desc())
