@@ -211,7 +211,7 @@ class Play(Base):
     source_id: Mapped[str] = mapped_column(String(80))
 
     symbol: Mapped[str] = mapped_column(String(24))
-    kind: Mapped[str] = mapped_column(String(16), default="standard")  # standard|otc|conditional
+    kind: Mapped[str] = mapped_column(String(16), default=UNKNOWN_KIND)  # standard|otc|conditional|unknown
     alert_date: Mapped[str] = mapped_column(String(10), default="")     # YYYY-MM-DD
     ratio: Mapped[str] = mapped_column(String(24), default="")          # '1:15', as written
     ratio_n: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 15

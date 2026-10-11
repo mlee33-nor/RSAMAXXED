@@ -49,6 +49,7 @@ out of the identifiers.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import threading
@@ -270,10 +271,57 @@ def split_fields(item: str, schema: Schema) -> List[str]:
     return [parts[0], sep.join(parts[1:cut])] + parts[cut:]
 
 
+#: Marks a list blob whose logins are each base64-encoded. Written only when a
+#: plain blob would be ambiguous -- see blob_items.
+_B64 = "b64:"
+
+
+def blob_items(raw: str) -> List[str]:
+    """A list-style blob ('user:pass:totp,user2:pass2') cut into one item per
+    login, in order.
+
+    A plain blob splits on ',', so a ',' inside a password used to cut that
+    login in two: "pa,ss" became login 1 with password "pa" and a bogus login
+    2 called "ss". Escaping the comma would change how some password that is
+    already on disk reads, so a blob that needs it is instead written as
+    "b64:" plus each login base64-encoded (urlsafe: no ',' and no ':' in it).
+    Nothing already on disk starts with "b64:", so every existing blob reads
+    exactly as it always did. Every reader of a list blob -- the broker
+    modules too -- goes through here.
+    """
+    raw = (raw or "").strip()
+    if not raw.startswith(_B64):
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    out: List[str] = []
+    for p in (q.strip() for q in raw[len(_B64):].split(",")):
+        if not p:
+            continue
+        try:
+            out.append(base64.urlsafe_b64decode(p.encode("ascii")).decode("utf-8"))
+        except (ValueError, UnicodeError):
+            # Kept in its slot so the logins after it keep their numbers;
+            # with no ':' in it it reads as a login with no password.
+            out.append(p)
+    return out
+
+
+def _encode_blob(items: Sequence[str]) -> str:
+    """The inverse of blob_items: plain unless plain would read back wrong."""
+    plain = ",".join(items)
+    if (not any("," in it for it in items) and not plain.endswith("\\")
+            and not plain.startswith(_B64)):
+        return plain
+    # Also for a trailing backslash: .env can only hold one bare, and bare
+    # is refused for a value with a space in it (see app._env_quote).
+    return _B64 + ",".join(
+        base64.urlsafe_b64encode(it.encode("utf-8")).decode("ascii")
+        for it in items)
+
+
 def _split_list(raw: str, schema: Schema) -> List[Dict[str, str]]:
     """'user:pass:totp,user2:pass2' -> a values dict per login."""
     out: List[Dict[str, str]] = []
-    for item in (p.strip() for p in raw.split(",")):
+    for item in blob_items(raw):
         if not item:
             continue
         parts = split_fields(item, schema)
@@ -412,7 +460,7 @@ def env_updates(broker: str, rows: Sequence[Dict[str, str]]) -> Dict[str, str]:
                 # -- see split_fields.
                 vals.append("")
             parts.append(schema.sep.join(vals))
-        updates[schema.blob] = ",".join(parts)
+        updates[schema.blob] = _encode_blob(parts)
         # The single-login keys would otherwise shadow nothing but confuse the
         # next reader — the blob wins, so leave them exactly as they are.
     elif schema.style == "csv":

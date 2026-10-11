@@ -259,3 +259,60 @@ def test_the_desktop_publisher_payload_ingests_with_its_detail(client):
         ("Reg Alert", "1:20", "N/A", _soon(1))
     assert p["entry_price"] == 0.5 and p["est_profit"] == 9.5
     assert p["posted_at"].startswith("2026-10-09T22:00:00")
+
+
+def test_a_republish_corrects_a_kind_the_old_promotion_stored(client):
+    """Blank used to be stored as "standard" (served as Reg Alert, auto-bought)
+    and insert-only kept it that way. A republish of the same message is the
+    authority on its kind, both down and up, and nothing else about the row
+    moves."""
+    with SessionLocal() as db:
+        db.add(Play(source_id="fc:promoted", symbol="FCPROMO", kind="standard",
+                    alert_date=_today(), ratio="1:20", entry_price=0.31))
+        db.commit()
+    assert _picks(client)["FCPROMO"]["note"] == "Reg Alert"
+
+    r = client.post("/api/v1/plays/ingest", headers=KEY, json={"buys": [
+        {"source_id": "fc:promoted", "symbol": "FCPROMO", "kind": "",
+         "alert_date": _today(), "ratio": "1:99", "entry_price": 9.0}]})
+    assert r.status_code == 200, r.text
+    assert r.json()["inserted"]["kinds"] == 1
+    assert r.json()["inserted"]["buys"] == 0
+    assert _picks(client)["FCPROMO"]["note"] == "unknown alert type"
+    with SessionLocal() as db:
+        row = db.query(Play).filter_by(source_id="fc:promoted").one()
+        assert (row.ratio, row.entry_price) == ("1:20", 0.31)   # facts unchanged
+
+    r = client.post("/api/v1/plays/ingest", headers=KEY, json={"buys": [
+        {"source_id": "fc:promoted", "symbol": "FCPROMO", "kind": "otc",
+         "alert_date": _today()}]})
+    assert r.json()["inserted"]["kinds"] == 1
+    assert _picks(client)["FCPROMO"]["note"] == "OTC"
+    # Same kind again: nothing to correct.
+    r = client.post("/api/v1/plays/ingest", headers=KEY, json={"buys": [
+        {"source_id": "fc:promoted", "symbol": "FCPROMO", "kind": "otc",
+         "alert_date": _today()}]})
+    assert r.json()["inserted"]["kinds"] == 0
+
+
+def test_a_play_stored_without_a_kind_defaults_to_unknown():
+    with SessionLocal() as db:
+        db.add(Play(source_id="fc:nokind", symbol="FCNOKIND", alert_date=_today()))
+        db.commit()
+        assert db.query(Play).filter_by(source_id="fc:nokind").one().kind == "unknown"
+
+
+def test_an_old_play_is_never_promoted_to_a_buy_on_republish(client):
+    old = (date.today() - timedelta(days=30)).isoformat()
+    with SessionLocal() as db:
+        db.add(Play(source_id="fc:oldunk", symbol="FCOLDU", kind="unknown", alert_date=old))
+        db.add(Play(source_id="fc:oldstd", symbol="FCOLDS", kind="standard", alert_date=old))
+        db.commit()
+    r = client.post("/api/v1/plays/ingest", headers=KEY, json={"buys": [
+        {"source_id": "fc:oldunk", "symbol": "FCOLDU", "kind": "standard", "alert_date": old},
+        {"source_id": "fc:oldstd", "symbol": "FCOLDS", "kind": "", "alert_date": old}]})
+    assert r.json()["inserted"]["kinds"] == 1          # only the demotion
+    with SessionLocal() as db:
+        kinds = {p.source_id: p.kind for p in db.query(Play).filter(
+            Play.source_id.in_(["fc:oldunk", "fc:oldstd"]))}
+    assert kinds == {"fc:oldunk": "unknown", "fc:oldstd": "unknown"}

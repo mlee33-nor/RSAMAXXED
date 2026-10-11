@@ -342,7 +342,7 @@ CONTENTS
 │  Also: Ctrl+K opens a quick search (jump to a page, look up or trade a
 │  ticker), Ctrl+1 ... Ctrl+9 jump between pages, Ctrl+R refreshes. The
 │  bell in the top bar collects notifications. The app version is shown
-│  at the bottom of the left sidebar (for example v1.0.1).
+│  at the bottom of the left sidebar (for example v1.1.0).
 │
 └──────────────────────────────────────────────────────────────────────────────
 
@@ -475,7 +475,7 @@ CONTENTS
 │  Check the version at the bottom of the left sidebar, and compare it
 │  with the latest release on GitHub:
 │     https://github.com/mlee33-nor/RSAMAXXED/releases
-│  The current version is v1.0.1. Close RSAMAXXED before updating.
+│  The current version is v1.1.0. Close RSAMAXXED before updating.
 │
 │  IF YOU INSTALLED WITH GIT
 │     1.  In the app folder run:   git pull
@@ -496,7 +496,7 @@ CONTENTS
 │                                    overwritten
 │            the sessions folder     saved broker sign-ins
 │            the logs folder         trade results the app reads back
-│                                    (logs	rade_results.log) and your
+│                                    (logs\trade_results.log) and your
 │                                    activity history -- keep it
 │     3.  Double-click INSTALL.bat in the NEW folder. It is quick when
 │         nothing changed, updates anything that did, and points the

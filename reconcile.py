@@ -5,7 +5,7 @@ WHY
 
 The journal only learns about trades this tool executes. A reverse split that
 settles to CASH IN LIEU dissolves the position with no trade to record, and
-seven of the ten brokers do exactly that — they do not hold fractions at all.
+most of the brokers do exactly that — they do not hold fractions at all.
 So every such split since day one has quietly left its cost basis on the books.
 
 The visible symptom is a DEPLOYED figure of $428.48 across 90 symbols, of which

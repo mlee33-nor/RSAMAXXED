@@ -236,7 +236,7 @@ def _parse_accounts_from_env() -> List[Tuple[str, str, Optional[str]]]:
     out: List[Tuple[str, str, Optional[str]]] = []
 
     if blob:
-        parts = [p.strip() for p in blob.split(",") if p.strip()]
+        parts = broker_logins.blob_items(blob)
         for p in parts:
             # A ':' inside the password stays in the password (a plain
             # split(":") truncated it and sent the tail as the TOTP secret).

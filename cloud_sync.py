@@ -89,6 +89,12 @@ _TRADES_FILE = _ROOT / "trades.json"
 
 _TIMEOUT = 20            # seconds per HTTP call
 _CHUNK = 400             # trades per request; server caps at 500
+
+#: One push at a time per PROCESS, not per CloudSync: the app builds a fresh
+#: client for every push on its own thread. Two overlapping pushes could each
+#: overwrite the other's synced_sig, and one whose journal snapshot predates a
+#: trade the other just uploaded would read that trade as deleted.
+_PUSH_LOCK = threading.Lock()
 _POLL_INTERVAL = 3.0     # seconds between pairing polls
 _FEED_CHUNK = 300        # play rows per ingest request; server caps at 500
 
@@ -346,7 +352,7 @@ class CloudSync:
         self.base_url = (base_url
                          or os.environ.get("RSAMAXXED_CLOUD_URL")
                          or DEFAULT_BASE_URL).rstrip("/")
-        self._lock = threading.Lock()
+        self._lock = _PUSH_LOCK
 
     # ------------------------------------------------------------- plumbing
 
@@ -499,15 +505,30 @@ class CloudSync:
         backfilled after a push raced the worker's quote lookup
         (set_fill_prices, backfill_basis.py), a rename learnt since -- goes
         again; the server updates fill_price, symbol and account_id on a uuid
-        it already holds. A DELETED row is still not removed from the server.
+        it already holds.
+
+        DELETES ARE SENT. A uuid this device synced (it is in synced_sig) that
+        is no longer in the journal was deleted on purpose -- trade_journal
+        refuses to shrink the file any other way -- so it is removed from the
+        server too. Never from a journal that could not be read, never when the
+        journal reads empty, and never a mass drop (see _deletions): those look
+        like a broken file far more than like a user, and a wrong delete takes
+        trades off the website that nothing here would ever send back.
 
         Symbols go up RENAME-FOLDED (`renames`, default the stored board's):
         the web has no board, and a buy under AGAE with its sell under AIFA
         otherwise read there as an open position plus a sale with no basis.
         """
         with self._lock:
+            # Deletes are judged only against the whole journal read here; a
+            # list a caller passed in may be any subset of it.
+            journal_ok = False
             if trades is None:
-                trades = self._load_trades()
+                journal_ok = True
+                trades = self._load_trades_strict()
+                if trades is None:
+                    journal_ok = False
+                    trades = self._load_trades()
             trades = _fold_for_upload(list(trades), renames)
 
             salt = _account_salt()
@@ -519,9 +540,17 @@ class CloudSync:
             # once, so the server replaces the raw labels it holds with the
             # masked ones (and one account keeps one label).
             remask = state.get("account_mask") != _MASK_VERSION
-            sigs: dict[str, str] = ({} if (force or remask)
-                                    else dict(state.get("synced_sig") or {}))
+            synced = dict(state.get("synced_sig") or {})
+            sigs: dict[str, str] = {} if (force or remask) else dict(synced)
             cleaned = {t["id"]: _clean(t, salt) for t in trades if t.get("id")}
+            deleted = held = 0
+            gone = _deletions(synced, cleaned) if journal_ok else []
+            if gone is None:
+                held = sum(1 for cid in synced if cid not in cleaned)
+            elif gone:
+                deleted, forgotten = self._push_deletions(gone)
+                # Only what the server confirmed; the rest stays to retry.
+                sigs = {k: v for k, v in sigs.items() if k not in forgotten}
             want = {cid: _upload_sig(row) for cid, row in cleaned.items()}
             # A row synced before fingerprints existed has no sig and is sent
             # once more; after that only a real change re-sends it.
@@ -529,7 +558,9 @@ class CloudSync:
             if not queue:
                 if remask:
                     _update_state(lambda st: st.__setitem__("account_mask", _MASK_VERSION))
-                return {"sent": 0, "inserted": 0, "updated": 0, "total": len(trades)}
+                return {"sent": 0, "inserted": 0, "updated": 0,
+                        "deleted": deleted, "delete_held": held,
+                        "total": len(trades)}
 
             sent = inserted = updated = 0
             for i in range(0, len(queue), _CHUNK):
@@ -556,7 +587,34 @@ class CloudSync:
                 _update_state(mark)
 
             return {"sent": sent, "inserted": inserted, "updated": updated,
+                    "deleted": deleted, "delete_held": held,
                     "total": len(trades)}
+
+    def _push_deletions(self, gone: list[str]) -> tuple[int, set[str]]:
+        """Remove `gone` from the server and forget them locally. Returns how
+        many rows the server removed and the uuids forgotten (every one the
+        server answered for). Anything unanswered stays in synced_sig,
+        so the next push tries again (an older server without the endpoint
+        just leaves them there)."""
+        removed = 0
+        forgotten: set[str] = set()
+        for i in range(0, len(gone), _CHUNK):
+            batch = gone[i:i + _CHUNK]
+            try:
+                result = self._post("/sync/trades/delete", {"ids": batch}, auth=True)
+            except CloudError:
+                break
+            removed += int(result.get("deleted", 0) or 0)
+
+            def forget(st: dict[str, Any], batch: list = batch) -> None:
+                sig = dict(st.get("synced_sig") or {})
+                for cid in batch:
+                    sig.pop(cid, None)
+                st["synced_sig"] = dict(sorted(sig.items()))
+
+            _update_state(forget)
+            forgotten.update(batch)
+        return removed, forgotten
 
     def push_holdings(self, accounts: Iterable[Any]) -> dict:
         """Upload one snapshot. `accounts` is whatever get_holdings() returned:
@@ -789,6 +847,31 @@ class CloudSync:
     # ------------------------------------------------------------- internal
 
     @staticmethod
+    def _load_trades_strict() -> list[dict] | None:
+        """The journal, or None when it is missing, cannot be read, or is
+        shorter than its own backup by more than one row -- the cases where
+        a missing row says nothing about a delete.
+
+        The backup check is trade_journal's shrink guard, tightened: an
+        in-app delete leaves trades.bak exactly one row ahead, so a bigger gap
+        is a file rolled back or cut short underneath us (a sync client
+        restoring an older copy), and its "missing" rows were never deleted.
+        """
+        try:
+            rows = json.loads(_TRADES_FILE.read_text("utf-8-sig"))
+        except (json.JSONDecodeError, OSError, ValueError):
+            return None
+        if not isinstance(rows, list):
+            return None
+        try:
+            bak = json.loads(_TRADES_FILE.with_suffix(".bak").read_text("utf-8-sig"))
+        except (json.JSONDecodeError, OSError, ValueError):
+            bak = None
+        if isinstance(bak, list) and len(bak) - len(rows) > 1:
+            return None
+        return rows
+
+    @staticmethod
     def _load_trades() -> list[dict]:
         if not _TRADES_FILE.exists():
             return []
@@ -796,6 +879,25 @@ class CloudSync:
             return json.loads(_TRADES_FILE.read_text("utf-8-sig"))
         except (json.JSONDecodeError, OSError):
             return []
+
+
+#: A push that would delete more than this many rows AND more than half of
+#: what this device has synced is held back instead: that is a truncated or
+#: swapped trades.json, not someone tidying up their history.
+_MASS_DELETE = 20
+
+
+def _deletions(synced: dict[str, str], current: dict[str, Any]) -> list[str] | None:
+    """The synced uuids no longer in the journal, sorted -- or None when
+    sending them would more likely be a broken journal than a delete."""
+    gone = sorted(cid for cid in synced if cid not in current)
+    if not gone:
+        return []
+    if not current:
+        return None
+    if len(gone) > _MASS_DELETE and len(gone) * 2 > len(synced):
+        return None
+    return gone
 
 
 def _chunk_batch(buys: list, sells: list, roundups: list, lifecycle: list, size: int):

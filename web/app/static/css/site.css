@@ -575,7 +575,7 @@
   #fire.firing::before{content:"Executing…";position:absolute;inset:0;display:grid;place-items:center}
   #fire.again .lg::after{content:" — again"}
 
-  .brokers{display:grid;grid-template-columns:repeat(10,1fr);gap:8px}
+  .brokers{display:grid;grid-template-columns:repeat(9,1fr);gap:8px}
 
   .bnode{
     position:relative;padding:11px 5px;border-radius:11px;text-align:center;
@@ -616,7 +616,7 @@
     #fire .lg{display:none}
     #fire .sm{display:inline}
 
-    /* 44px gutter: the ten strands run down it at x = 8..34. The top padding
+    /* 44px gutter: the nine strands run down it at x = 8..34. The top padding
        is headroom for them to fan out before the first chip. */
     .fan-wrap{padding-top:82px;padding-left:44px}
     .brokers{grid-template-columns:1fr;gap:7px}

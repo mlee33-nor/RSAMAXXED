@@ -824,7 +824,7 @@ def _load_creds() -> List[_LoginCred]:
     out: List[_LoginCred] = []
 
     if raw:
-        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        parts = broker_logins.blob_items(raw)
         for i, item in enumerate(parts, 1):
             # Same split the login editor writes with: a ':' inside the
             # password stays in the password (a plain split cut it short).

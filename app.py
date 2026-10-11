@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Desktop GUI for broker automation — RSAMAXXED.
 
-Manages all 10 brokers: credentials, bootstrap, holdings, trades, P/L.
+Manages all 9 brokers: credentials, bootstrap, holdings, trades, P/L.
 Uses only tkinter (ships with Python) — no extra dependencies.
 
 EXE packaging:
@@ -72,7 +72,7 @@ except Exception:  # missing module, missing requests, anything at all
 
 # The release a customer is running — shown in the sidebar footer and stamped
 # on every crash-log START line, so a support report says which build it is.
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 
 # The main window's title. The single-instance guard finds a running copy's
 # window by it (FindWindowW), so it is defined once here and used by both.
@@ -15356,6 +15356,15 @@ class App(ctk.CTk):
         if result.get("inserted"):
             self.after(0, lambda: self._log(
                 f"Cloud sync: uploaded {_plural(result['inserted'], 'new trade')}"))
+        if result.get("deleted"):
+            self.after(0, lambda: self._log(
+                f"Cloud sync: removed {_plural(result['deleted'], 'deleted trade')} "
+                "from the website"))
+        if result.get("delete_held"):
+            self.after(0, lambda: self._log(
+                f"Cloud sync: {_plural(result['delete_held'], 'trade')} missing from "
+                "trades.json still show on the website. That many at once looks "
+                "like a damaged journal, so nothing was removed there."))
         self.after(0, self._cloud_refresh_ui)
 
     def _cloud_push_async(self, force: bool = False) -> None:

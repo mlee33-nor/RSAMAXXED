@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hmac
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -90,6 +90,17 @@ class TradeIn(BaseModel):
 
 class TradesIn(BaseModel):
     trades: list[TradeIn]
+
+
+class TradeIdsIn(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+
+    @field_validator("ids")
+    @classmethod
+    def _ids(cls, v: list[str]) -> list[str]:
+        if any(not i or len(i) > 64 for i in v):
+            raise ValueError("each id must be 1-64 characters")
+        return v
 
 
 class HoldingIn(BaseModel):
@@ -247,6 +258,37 @@ def sync_trades(
     )
     return {"inserted": inserted, "updated": updated,
             "skipped": len(incoming) - inserted - updated, "total": total}
+
+
+@router.post("/sync/trades/delete")
+def sync_trades_delete(
+    body: TradeIdsIn,
+    device: Device = Depends(require_device),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Remove trades the desktop deleted from its journal.
+
+    Scoped to the device's own user: a uuid belonging to anyone else simply
+    matches nothing. An id that is already gone is not an error, so a retry
+    after a dropped response is harmless.
+    """
+    if len(body.ids) > config.MAX_TRADES_PER_REQUEST:
+        raise HTTPException(
+            status_code=413,
+            detail=f"send at most {config.MAX_TRADES_PER_REQUEST} ids per request",
+        )
+    ids = sorted(set(body.ids))
+    deleted = 0
+    if ids:
+        deleted = db.execute(
+            delete(Trade).where(Trade.user_id == device.user_id,
+                                Trade.client_id.in_(ids))
+        ).rowcount or 0
+        db.commit()
+    total = db.scalar(
+        select(func.count()).select_from(Trade).where(Trade.user_id == device.user_id)
+    )
+    return {"deleted": deleted, "total": total}
 
 
 @router.post("/sync/holdings")
@@ -474,6 +516,19 @@ def require_feed_reader(
     return user
 
 
+#: Kinds /plays/picks serves as something a mirror buys.
+_BUY_KINDS = {"standard", "otc"}
+#: How old an alert may be and still be promoted to a buy kind on republish.
+KIND_PROMOTE_DAYS = 7
+
+
+def _recent_alert(alert_date: str | None) -> bool:
+    day = playsfeed.iso_day(alert_date)
+    if not day:
+        return False
+    return date.fromisoformat(day) >= utcnow().date() - timedelta(days=KIND_PROMOTE_DAYS)
+
+
 @router.post("/plays/ingest", dependencies=[Depends(require_ingest_key)])
 def ingest_plays(body: FeedIn, db: Session = Depends(get_db)) -> dict[str, Any]:
     """Publish a parsed pull. Idempotent on `source_id`, so re-sending the same
@@ -495,15 +550,35 @@ def ingest_plays(body: FeedIn, db: Session = Depends(get_db)) -> dict[str, Any]:
     # is reported separately from `sells` because nothing was published; a
     # caption this parser previously got wrong was repaired.
     counts = {"buys": 0, "sells": 0, "roundups": 0, "lifecycle": 0,
-              "notes": 0, "migrated": 0}
+              "notes": 0, "migrated": 0, "kinds": 0}
 
     def _fresh(model, ids: list[str]) -> set[str]:
         if not ids:
             return set()
         return set(db.scalars(select(model.source_id).where(model.source_id.in_(ids))))
 
-    seen = _fresh(Play, [b.source_id for b in body.buys])
+    # A buy's KIND may be corrected in place, the way an exit's note is below.
+    # Blank used to be promoted to "standard" on the way in -- the kind served
+    # as "Reg Alert", which every customer's mirror auto-buys -- and insert-only
+    # kept those rows standard after the promotion was removed. The kind is
+    # the publisher's reading of the alert, so a republish of the same message
+    # is the authority: a blank one now lands as unknown (never bought), an
+    # explicit one as what it says. Nothing else about a stored buy changes.
+    #
+    # Asymmetric on purpose. Taking a buy signal away (to conditional or
+    # unknown) is always allowed: the worst case is a play nobody buys. Making
+    # one (standard / otc) is allowed only while the alert is recent, so a
+    # re-read of an old message can never turn a stale play into a mirror buy.
+    stored_buys = {row.source_id: row for row in db.scalars(
+        select(Play).where(Play.source_id.in_([b.source_id for b in body.buys])))
+    } if body.buys else {}
+    seen = set(stored_buys)
     for b in body.buys:
+        row = stored_buys.get(b.source_id)
+        if row is not None and row.kind != b.kind and (
+                b.kind not in _BUY_KINDS or _recent_alert(row.alert_date)):
+            row.kind = b.kind
+            counts["kinds"] += 1
         if b.source_id in seen:
             continue
         seen.add(b.source_id)          # dedupe within the batch too

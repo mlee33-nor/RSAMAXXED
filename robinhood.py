@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+import broker_logins
 from modules.outputs import BrokerOutput, AccountOutput, HoldingRow
 from modules import _2fa_prompt
 from modules._2fa_prompt import universal_2fa_prompt
@@ -892,7 +893,7 @@ def _login_profiles() -> List[Tuple[str, str, str]]:
     legacy = _env("ROBINHOOD")
     if legacy:
         out: List[Tuple[str, str, str]] = []
-        parts = [p.strip() for p in legacy.split(",") if p.strip()]
+        parts = broker_logins.blob_items(legacy)
         for i, entry in enumerate(parts, start=1):
             if ":" not in entry:
                 continue

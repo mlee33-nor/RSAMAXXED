@@ -438,3 +438,134 @@ def test_a_close_row_does_not_fail_the_batch(wired):
             _row(2, 3, "Fidelity 1 (0003)", "close", "DDDD", 1, None)]
     cloud_sync._TRADES_FILE.write_text(json.dumps(rows), encoding="utf-8")
     assert sync.push_trades(renames={})["inserted"] == 2
+
+
+# ------------------------------------------------------------- deletions
+
+def _journal(rows):
+    cloud_sync._TRADES_FILE.write_text(json.dumps(rows), encoding="utf-8")
+
+
+def test_a_trade_deleted_on_the_desktop_leaves_the_website(wired):
+    sync, _ = wired
+    _link(sync, "delete@example.com")
+    rows = [_row(i, i, "Fidelity 1 (0007)", "buy", "EEEE", 1, 1.0) for i in range(1, 4)]
+    _journal(rows)
+    assert sync.push_trades(renames={})["inserted"] == 3
+
+    _journal(rows[:2])                                   # trade_journal.delete_trade
+    out = sync.push_trades(renames={})
+    assert out["deleted"] == 1 and out["sent"] == 0
+    assert {r["client_id"] for r in _server_rows("delete@example.com")} == {"f4-1", "f4-2"}
+    state = json.loads(cloud_sync._STATE_FILE.read_text("utf-8"))
+    assert "f4-3" not in state["synced_sig"]
+    assert sync.push_trades(renames={})["deleted"] == 0  # nothing left to send
+
+
+def test_an_unreadable_or_empty_journal_deletes_nothing(wired):
+    sync, _ = wired
+    _link(sync, "nodelete@example.com")
+    rows = [_row(i, i, "Fidelity 1 (0008)", "buy", "FFFF", 1, 1.0) for i in range(1, 4)]
+    _journal(rows)
+    sync.push_trades(renames={})
+
+    cloud_sync._TRADES_FILE.write_text("{ torn write", encoding="utf-8")
+    assert sync.push_trades(renames={})["deleted"] == 0
+    _journal([])
+    out = sync.push_trades(renames={})
+    assert out["deleted"] == 0 and out["delete_held"] == 3
+    cloud_sync._TRADES_FILE.unlink()
+    assert sync.push_trades(renames={})["deleted"] == 0
+    assert len(_server_rows("nodelete@example.com")) == 3
+
+    _journal(rows)                                       # file restored
+    assert sync.push_trades(renames={})["deleted"] == 0
+    assert len(_server_rows("nodelete@example.com")) == 3
+
+
+def test_a_mass_drop_is_held_back_not_deleted(wired):
+    sync, _ = wired
+    _link(sync, "massdrop@example.com")
+    rows = [_row(i, (i % 28) + 1, "Fidelity 1 (0009)", "buy", "GGGG", 1, 1.0)
+            for i in range(1, 41)]
+    _journal(rows)
+    sync.push_trades(renames={})
+    _journal(rows[:5])                                   # 35 of 40 gone at once
+    out = sync.push_trades(renames={})
+    assert out["deleted"] == 0 and out["delete_held"] == 35
+    assert len(_server_rows("massdrop@example.com")) == 40
+
+
+def test_a_server_without_the_endpoint_keeps_the_delete_pending(wired, monkeypatch):
+    sync, _ = wired
+    _link(sync, "olddelete@example.com")
+    rows = [_row(i, i, "Fidelity 1 (0010)", "buy", "HHHH", 1, 1.0) for i in range(1, 4)]
+    _journal(rows)
+    sync.push_trades(renames={})
+    _journal(rows[:2])
+    real = sync._post
+
+    def no_endpoint(path, payload, auth=False, extra_headers=None):
+        if path == "/sync/trades/delete":
+            raise cloud_sync.CloudError("RSAMAXXED Cloud returned 404: Not Found")
+        return real(path, payload, auth=auth, extra_headers=extra_headers)
+
+    monkeypatch.setattr(sync, "_post", no_endpoint)
+    assert sync.push_trades(renames={})["deleted"] == 0
+    assert "f4-3" in json.loads(cloud_sync._STATE_FILE.read_text("utf-8"))["synced_sig"]
+    monkeypatch.setattr(sync, "_post", real)
+    assert sync.push_trades(renames={})["deleted"] == 1
+    assert len(_server_rows("olddelete@example.com")) == 2
+
+
+def test_a_device_cannot_delete_another_users_trades(wired):
+    sync, client = wired
+    _link(sync, "victim@example.com")
+    rows = [_row(1, 1, "Fidelity 1 (0011)", "buy", "IIII", 1, 1.0)]
+    _journal(rows)
+    sync.push_trades(renames={})
+
+    _link(sync, "attacker@example.com")
+    token = json.loads(cloud_sync._STATE_FILE.read_text("utf-8"))["device_token"]
+    r = client.post("/api/v1/sync/trades/delete", json={"ids": ["f4-1"]},
+                    headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200 and r.json()["deleted"] == 0
+    assert len(_server_rows("victim@example.com")) == 1
+    r = client.post("/api/v1/sync/trades/delete", json={"ids": ["f4-1"]})
+    assert r.status_code == 401
+
+
+def test_a_journal_rolled_back_behind_its_backup_deletes_nothing(wired):
+    """A sync client restoring an older trades.json: it parses, it is not
+    empty, it is not a mass drop -- but trades.bak is more than one row ahead,
+    which no in-app delete leaves."""
+    sync, _ = wired
+    _link(sync, "rollback@example.com")
+    rows = [_row(i, i, "Fidelity 1 (0012)", "buy", "JJJJ", 1, 1.0) for i in range(1, 7)]
+    _journal(rows)
+    sync.push_trades(renames={})
+    bak = cloud_sync._TRADES_FILE.with_suffix(".bak")
+    bak.write_text(json.dumps(rows), encoding="utf-8")
+    _journal(rows[:3])
+    assert sync.push_trades(renames={})["deleted"] == 0
+    assert len(_server_rows("rollback@example.com")) == 6
+
+    # One in-app delete: the .bak is exactly one row ahead, and it goes.
+    bak.write_text(json.dumps(rows), encoding="utf-8")
+    _journal(rows[:5])
+    assert sync.push_trades(renames={})["deleted"] == 1
+
+
+def test_a_caller_supplied_list_never_deletes(wired):
+    sync, _ = wired
+    _link(sync, "subset@example.com")
+    rows = [_row(i, i, "Fidelity 1 (0013)", "buy", "KKKK", 1, 1.0) for i in range(1, 4)]
+    _journal(rows)
+    sync.push_trades(renames={})
+    out = sync.push_trades(trades=rows[:1], renames={})
+    assert out["deleted"] == 0
+    assert len(_server_rows("subset@example.com")) == 3
+
+
+def test_every_client_shares_one_push_lock():
+    assert cloud_sync.CloudSync()._lock is cloud_sync.CloudSync()._lock

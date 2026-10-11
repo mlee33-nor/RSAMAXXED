@@ -74,8 +74,9 @@ def test_roundup_engine_is_present(home):
 
 def test_mirror_fanout_is_present(home):
     assert 'id="fanout"' in home and 'id="fire"' in home
-    # One broker node per broker on the plays board.
-    assert home.count('class="bnode"') == 8
+    # One node per broker the desktop app trades -- the nine pricing promises
+    # (IBKR included, though the plays board has no IBKR column).
+    assert home.count('class="bnode"') == 9
 
 
 def test_static_assets_are_served_and_self_hosted(home):

@@ -410,13 +410,13 @@ function initRoundupEngine() {
 }
 
 /* ======================================================================== */
-/* MIRROR FAN-OUT — one order, ten brokers, money landing one by one         */
+/* MIRROR FAN-OUT — one order, nine brokers, money landing one by one        */
 /* ------------------------------------------------------------------------ */
 /* The wires used to be display:none under 980px, so the whole point of the  */
-/* section — a single order splitting ten ways — simply vanished on a phone   */
+/* section — a single order splitting nine ways — simply vanished on a phone   */
 /* and the chips lit up for no visible reason. Now the SVG overlays the       */
 /* stage at every width and the geometry adapts: chips in a row get wires     */
-/* dropped onto their top edge; chips in a stack get a ribbon of ten strands  */
+/* dropped onto their top edge; chips in a stack get a ribbon of nine strands */
 /* running down a left-hand gutter, each peeling off into its own row.        */
 /* ======================================================================== */
 function initFanout() {
@@ -467,7 +467,7 @@ function initFanout() {
         // its row's left edge.
         const x = nb.left - box.left;
         const y = nb.top - box.top + nb.height / 2;
-        const lane = 8 + i * (26 / last);        // 8 -> 34px, ten parallel strands
+        const lane = 8 + i * (26 / last);        // 8 -> 34px, nine parallel strands
         d = `M${ox},${oy} C${ox},${oy + (trunk - oy) * .45} ${lane},${trunk - 12} ${lane},${trunk} `
           + `L${lane},${y} L${x},${y}`;
       } else {
