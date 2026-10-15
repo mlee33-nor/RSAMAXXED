@@ -235,7 +235,10 @@ def test_dispatch_timeout_keeps_results_and_rows(monkeypatch):
 
 # ------------------------------------------------------------ Buy/Sell required
 
-def test_buy_sell_dropdown_must_confirm(monkeypatch):
+def test_buy_sell_dropdown_unreadable_label_proceeds(monkeypatch):
+    # 2026-10-15: demanding a label of exactly "Buy" refused every account.
+    # An unreadable label is not a wrong side; WF's review page catches a
+    # missing action.
     async def _never(*_a, **_k):
         return False
 
@@ -247,6 +250,26 @@ def test_buy_sell_dropdown_must_confirm(monkeypatch):
             pass
 
     monkeypatch.setattr(wellsfargo, "_dropdown_shows", _never)
+    asyncio.run(wellsfargo._select_dropdown_option(_P(), "#BuySellBtn", "Buy",
+                                                   timeout_s=0.01, require=True))
+
+
+def test_buy_sell_dropdown_wrong_side_refuses(monkeypatch):
+    async def _never(*_a, **_k):
+        return False
+
+    async def _label(*_a, **_k):
+        return "Sell"
+
+    class _P:
+        async def select(self, sel, timeout=None):
+            raise asyncio.TimeoutError(sel)
+
+        async def sleep(self, *_a):
+            pass
+
+    monkeypatch.setattr(wellsfargo, "_dropdown_shows", _never)
+    monkeypatch.setattr(wellsfargo, "_dropdown_label", _label)
     with pytest.raises(RuntimeError) as ei:
         asyncio.run(wellsfargo._select_dropdown_option(_P(), "#BuySellBtn", "Buy",
                                                        timeout_s=0.01, require=True))

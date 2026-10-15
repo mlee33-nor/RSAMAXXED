@@ -168,24 +168,52 @@ def test_chase_empty_positions_list_is_really_empty(monkeypatch):
 
 # =============================================================== Wells Fargo
 
-def test_wf_side_label_must_be_exact():
-    assert wellsfargo._label_is_exactly("Sell", "Sell")
-    assert wellsfargo._label_is_exactly(" Action: Sell ", "Sell")
-    assert not wellsfargo._label_is_exactly("Sell Short", "Sell")
-    assert not wellsfargo._label_is_exactly("Buy to Cover", "Buy")
-    assert not wellsfargo._label_is_exactly("", "Buy")
+def test_wf_side_label_only_a_different_side_is_a_mismatch():
+    other = wellsfargo._label_shows_other_side
+    assert other("Sell Short", "Sell")
+    assert other("Buy to Cover", "Buy")
+    assert other("Sell", "Buy")
+    assert other("Action: Buy", "Sell")
+    # Wordy labels are the 2026-10-15 failure: every account refused with
+    # Buy set. They proceed.
+    assert not other("Buy", "Buy")
+    assert not other(" Action: Buy, selected ", "Buy")
+    assert not other("Buy\nOpens a menu", "Buy")
+    assert not other("Sell", "Sell")
+    assert not other("", "Buy")
+    # Both sides at once is the menu's text, not a choice.
+    assert not other("Buy Sell Sell Short Buy to Cover", "Buy")
 
 
-def test_wf_dropdown_shows_exact_rejects_sell_short():
+def test_wf_sell_short_never_counts_as_sell(monkeypatch):
     class _Opener:
         text_all = "Sell Short"
+
+        async def scroll_into_view(self):
+            pass
+
+        async def mouse_click(self):
+            pass
+
+        async def get_position(self):
+            return None
+
+        async def apply(self, *_a):
+            pass
 
     class _P:
         async def select(self, sel, timeout=None):
             return _Opener()
 
-    assert asyncio.run(wellsfargo._dropdown_shows(_P(), "#TIFBtn", "Sell"))  # loose
-    assert not asyncio.run(wellsfargo._dropdown_shows(_P(), "#BuySellBtn", "Sell", exact=True))
+        async def sleep(self, *_a):
+            pass
+
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(wellsfargo._select_dropdown_option(
+            _P(), "#BuySellBtn", "Sell", timeout_s=0.01, require=True))
+    assert "nothing was sent" in str(ei.value)
+    # A non-side dropdown keeps the loose match.
+    assert asyncio.run(wellsfargo._dropdown_shows(_P(), "#TIFBtn", "Sell"))
 
 
 def test_wf_ticket_on_another_account_stops_before_continue(monkeypatch):

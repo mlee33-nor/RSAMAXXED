@@ -72,7 +72,7 @@ except Exception:  # missing module, missing requests, anything at all
 
 # The release a customer is running — shown in the sidebar footer and stamped
 # on every crash-log START line, so a support report says which build it is.
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 # The main window's title. The single-instance guard finds a running copy's
 # window by it (FindWindowW), so it is defined once here and used by both.

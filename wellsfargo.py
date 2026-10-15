@@ -1338,35 +1338,45 @@ def _norm_dd(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
-#: Filler words an opener button label may carry around the chosen value.
-_DD_FILLER = {"action", "select", "order", "selected"}
+#: Words that turn a side into a different order ("Sell Short", "Buy to Cover").
+_OTHER_SIDE_WORDS = {"short", "cover"}
 
 
-def _label_is_exactly(label: str, option_value: str) -> bool:
-    """The opener label shows option_value and nothing else.
+def _label_shows_other_side(label: str, option_value: str) -> bool:
+    """The opener label positively shows a side other than option_value.
 
-    For the side of the order: "Sell Short" contains "Sell" (and the token
-    fallback in _dropdown_shows matches it), and a short sale is a different
-    order, not a near miss. NEEDS LIVE VERIFICATION: WF's #BuySellBtn label.
+    Only a positive mismatch counts: "Sell Short" when we wanted "Sell", or
+    "Sell" when we wanted "Buy". A label with extra text around the side (a
+    hidden screen-reader span, the menu items nested in the button) is NOT a
+    mismatch -- requiring the label to be exactly "Buy" failed every Wells
+    Fargo account on 2026-10-15 with nothing wrong on the ticket.
     """
-    want = _norm_dd(option_value)
-    if not want:
+    have = set(re.split(r"[^a-z0-9]+", (label or "").lower())) - {""}
+    want = set(re.split(r"[^a-z0-9]+", (option_value or "").lower())) - {""}
+    if not have or not want:
         return False
-    if _norm_dd(label) == want:
+    if {"buy", "sell"} <= have:
+        # Both sides in one label is the menu's text, not a choice: unreadable.
+        return False
+    if (have & _OTHER_SIDE_WORDS) - want:
         return True
-    have_words = [w for w in re.split(r"[^a-z0-9]+", (label or "").lower())
-                  if w and w not in _DD_FILLER]
-    want_words = [w for w in re.split(r"[^a-z0-9]+", option_value.lower()) if w]
-    return bool(have_words) and have_words == want_words
+    other = {"buy": "sell", "sell": "buy"}
+    return any(other.get(w) in have and w not in have for w in want)
 
 
-async def _dropdown_shows(page, opener_selector: str, option_value: str, *,
-                          exact: bool = False) -> bool:
+async def _dropdown_label(page, opener_selector: str) -> str:
+    try:
+        opener = await page.select(opener_selector, timeout=2.0)
+        return str(getattr(opener, "text_all", "") or "")
+    except Exception:
+        return ""
+
+
+async def _dropdown_shows(page, opener_selector: str, option_value: str) -> bool:
     """True if the dropdown's button label reflects option_value, i.e. WF's
     handleCustomSelectClick actually registered the selection. These custom
     selects display the chosen option's label in the opener button (#BuySellBtn /
-    #OrderTypeBtn / #TIFBtn). exact=True (the order side) accepts only the
-    value itself -- no substring or token match."""
+    #OrderTypeBtn / #TIFBtn)."""
     try:
         opener = await page.select(opener_selector, timeout=2.0)
     except Exception:
@@ -1375,8 +1385,6 @@ async def _dropdown_shows(page, opener_selector: str, option_value: str, *,
         txt = getattr(opener, "text_all", "") or ""
     except Exception:
         txt = ""
-    if exact:
-        return _label_is_exactly(txt, option_value)
     want = _norm_dd(option_value)          # "Good til Cancel" -> "goodtilcancel"
     have = _norm_dd(txt)                    # button "Good 'Til Cancel" -> "goodtilcancel"
     if not want or not have:
@@ -1411,9 +1419,16 @@ async def _select_dropdown_option(page, dropdown_opener_selector: str, option_va
     option_selector = f"a[data-val='{option_value}']"
     last_exc: Optional[Exception] = None
 
+    async def _took() -> bool:
+        if not await _dropdown_shows(page, dropdown_opener_selector, option_value):
+            return False
+        # The loose match reads "Sell Short" as "Sell": not taken for the side.
+        return not (require and _label_shows_other_side(
+            await _dropdown_label(page, dropdown_opener_selector), option_value))
+
     for _attempt in range(5):
         # Already selected (e.g. Day is the default, or a prior attempt took)?
-        if await _dropdown_shows(page, dropdown_opener_selector, option_value, exact=require):
+        if await _took():
             return
         try:
             opener = await page.select(dropdown_opener_selector, timeout=timeout_s)
@@ -1459,7 +1474,7 @@ async def _select_dropdown_option(page, dropdown_opener_selector: str, option_va
 
         # Let handleCustomSelectClick settle, then verify it registered.
         await page.sleep(0.4)
-        if await _dropdown_shows(page, dropdown_opener_selector, option_value, exact=require):
+        if await _took():
             return
         await page.sleep(0.4)
 
@@ -1473,13 +1488,18 @@ async def _select_dropdown_option(page, dropdown_opener_selector: str, option_va
     except Exception as e:
         last_exc = e
 
-    shown = await _dropdown_shows(page, dropdown_opener_selector, option_value, exact=require)
-    if not shown and require:
-        # The side of the order: never "proceed and let the confirm page
-        # sort it out" — a missed Buy/Sell is a different order, not an error.
-        raise RuntimeError(
-            f"Could not set {dropdown_opener_selector} to {option_value} on the "
-            f"ticket — nothing was sent")
+    shown = await _dropdown_shows(page, dropdown_opener_selector, option_value)
+    if require:
+        # The side of the order: refuse only when the button positively shows
+        # a DIFFERENT side (Sell Short, Buy to Cover, the opposite side). A
+        # wordy or unreadable label proceeds, as before 2026-10-10 -- WF's
+        # review page rejects an order with no action selected.
+        label = await _dropdown_label(page, dropdown_opener_selector)
+        if _label_shows_other_side(label, option_value):
+            raise RuntimeError(
+                f"Ticket shows {' '.join(label.split())[:60]!r}, not {option_value} "
+                f"— stopped before Continue, nothing was sent")
+        return
     if not shown and last_exc is not None:
         raise last_exc
 
@@ -1646,6 +1666,7 @@ _ORDER_RESULT_JS = (
     "|(confirmation|order|reference)\\s*(number|no\\.?|#)\\s*:?\\s*[A-Z0-9][A-Z0-9-]{3,}"
     "|order\\s+confirmation/i.test(t);"
     "return JSON.stringify({submit:vis(b),ok:ok,"
+    "text:t.replace(/\\s+/g,' ').slice(0,300),"
     "alert:a?(a.innerText||'').trim().replace(/\\s+/g,' ').slice(0,240):'',"
     "url:location.href});})();"
 )
@@ -1669,7 +1690,8 @@ async def _read_order_result(page, *, tries: int = 20, wait_s: float = 0.5) -> D
         if isinstance(st, dict) and st:
             if st.get("ok") and not st.get("submit"):
                 return {"ok": True, "alert": str(st.get("alert") or "")}
-            last = {"ok": False, "alert": str(st.get("alert") or "")}
+            last = {"ok": False, "alert": str(st.get("alert") or ""),
+                    "text": str(st.get("text") or "")}
         if i < tries - 1:
             await page.sleep(wait_s)
     return last
@@ -2168,8 +2190,11 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                         smsg = _submitted_unverified_msg(
                             RuntimeError("no order confirmation on the result page"))
                     outputs.append(AccountOutput(account_id=acct_label, ok=False, message=smsg))
+                    # The success test is unverified against a live result
+                    # page: record what it said so it can be tuned.
                     _trace(f"TRADE | Wells Fargo | {acct_label} | {smsg} "
-                           f"state={await _capture_page_state(page, symbol)}", notify=notify)
+                           f"state={await _capture_page_state(page, symbol)} "
+                           f"page_text={result.get('text', '')!r}", notify=notify)
                     _consec_hard_errors = 0
                     continue
 
@@ -2193,8 +2218,10 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                     continue
                 # Before the confirm click (the ticket, the quote's #prevdata,
                 # the preview): no order went out for this account.
-                outputs.append(AccountOutput(account_id=acct_label, ok=False,
-                                             message=f"{e} — nothing was sent"))
+                emsg = str(e)
+                if "nothing was sent" not in emsg:
+                    emsg = f"{emsg} — nothing was sent"
+                outputs.append(AccountOutput(account_id=acct_label, ok=False, message=emsg))
                 _trace(f"TRADE | Wells Fargo | {acct_label} | FAILED: {e} "
                        f"state={await _capture_page_state(page, symbol)}", notify=notify)
                 # Only a refusal counts toward the breaker. A page timeout is
