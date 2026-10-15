@@ -1372,6 +1372,18 @@ async def _dropdown_label(page, opener_selector: str) -> str:
         return ""
 
 
+async def _side_field(page) -> Optional[str]:
+    """The ticket's hidden #BuySell value, lowercased ("select"/"buy"/"sell"),
+    or None when the field can't be read."""
+    try:
+        v = await page.evaluate(
+            "(function(){var e=document.querySelector('#BuySell');"
+            "return e ? String(e.value) : null;})();")
+    except Exception:
+        return None
+    return v.strip().lower() if isinstance(v, str) else None
+
+
 async def _dropdown_shows(page, opener_selector: str, option_value: str) -> bool:
     """True if the dropdown's button label reflects option_value, i.e. WF's
     handleCustomSelectClick actually registered the selection. These custom
@@ -1420,6 +1432,10 @@ async def _select_dropdown_option(page, dropdown_opener_selector: str, option_va
     last_exc: Optional[Exception] = None
 
     async def _took() -> bool:
+        if require:
+            field = await _side_field(page)
+            if field is not None:
+                return field == option_value.lower()
         if not await _dropdown_shows(page, dropdown_opener_selector, option_value):
             return False
         # The loose match reads "Sell Short" as "Sell": not taken for the side.
@@ -1490,7 +1506,18 @@ async def _select_dropdown_option(page, dropdown_opener_selector: str, option_va
 
     shown = await _dropdown_shows(page, dropdown_opener_selector, option_value)
     if require:
-        # The side of the order: refuse only when the button positively shows
+        # WF's hidden #BuySell field holds the side the order will carry
+        # ("Select" / "Buy" / "Sell", read off the live ticket 2026-10-15).
+        # When it is readable it decides: anything but the side we asked for
+        # stops here.
+        field = await _side_field(page)
+        if field is not None:
+            if field == option_value.lower():
+                return
+            raise RuntimeError(
+                f"Could not set the order side to {option_value} (ticket shows "
+                f"{field or 'nothing'!r}) — stopped before Continue, nothing was sent")
+        # No field (markup changed): refuse only when the button positively shows
         # a DIFFERENT side (Sell Short, Buy to Cover, the opposite side). A
         # wordy or unreadable label proceeds, as before 2026-10-10 -- WF's
         # review page rejects an order with no action selected.
@@ -1502,6 +1529,38 @@ async def _select_dropdown_option(page, dropdown_opener_selector: str, option_va
         return
     if not shown and last_exc is not None:
         raise last_exc
+
+
+_COOKIE_BANNER_JS = (
+    "(function(){var d=document;"
+    "var b=d.querySelector('#onetrust-reject-all-handler');"
+    "if(b&&(b.offsetWidth||b.offsetHeight)){b.click();}"
+    "var s=d.querySelector('#onetrust-consent-sdk');"
+    "if(s){s.style.display='none';}"
+    "return !!(b||s);})();"
+)
+
+
+async def _dismiss_cookie_banner(page) -> None:
+    """Get WF's OneTrust cookie banner off the ticket (Reject all, then hide).
+
+    It covers the bottom of the page, where Preview Order sits, and a real
+    mouse click there lands on the banner instead. Never raises.
+    """
+    try:
+        await page.evaluate(_COOKIE_BANNER_JS)
+    except Exception:
+        pass
+
+
+async def _still_on_entry_form(page) -> bool:
+    """The order-entry ticket (Preview Order visible), not the review page."""
+    try:
+        return bool(await page.evaluate(
+            "(function(){var b=document.querySelector('#actionbtnContinue');"
+            "return !!(b&&(b.offsetWidth||b.offsetHeight||b.getClientRects().length));})();"))
+    except Exception:
+        return False
 
 
 async def _get_account_mask(page) -> str:
@@ -2095,6 +2154,11 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                 tif = "Good til Cancel" if order_type == "Limit" else "Day"
                 await _select_dropdown_option(page, "#TIFBtn", tif)
 
+                # Preview Order only opens the review page, never an order, so
+                # a second (JS) click when the first one went nowhere is safe.
+                # 2026-10-15: WF's OneTrust cookie banner sat over the button
+                # and ate the mouse click on every account.
+                await _dismiss_cookie_banner(page)
                 prev_btn = await page.select("#actionbtnContinue", timeout=10)
                 await prev_btn.scroll_into_view()
                 await prev_btn.mouse_click()
@@ -2103,9 +2167,29 @@ async def _cmd_trade(ctx: Dict[str, Any]) -> BrokerOutput:
                 await page.sleep(0.25)
 
                 try:
-                    confirm_btn = await page.select(".btn-wfa-primary.btn-wfa-submit", timeout=10)
+                    confirm_btn = await page.select(".btn-wfa-primary.btn-wfa-submit", timeout=6)
+                except Exception:
+                    confirm_btn = None
+                if not confirm_btn and await _still_on_entry_form(page):
+                    _trace(f"TRADE | Wells Fargo | {acct_label}: Preview Order click "
+                           f"went nowhere, clicking it again", notify=notify)
+                    await _dismiss_cookie_banner(page)
+                    try:
+                        prev_btn = await page.select("#actionbtnContinue", timeout=5)
+                        await prev_btn.apply("(e) => e.click()")
+                        await page.wait_for_ready_state("complete", timeout=20)
+                        await page.wait()
+                        await page.sleep(0.25)
+                    except Exception:
+                        pass
+
+                try:
+                    if not confirm_btn:
+                        confirm_btn = await page.select(".btn-wfa-primary.btn-wfa-submit", timeout=10)
                     await confirm_btn.scroll_into_view()
                 except Exception:
+                    _trace(f"TRADE | Wells Fargo | {acct_label}: no review page "
+                           f"state={await _capture_page_state(page, symbol)}", notify=notify)
                     # Before the submit click: nothing was sent, so none of
                     # the may-exist words ("confirmation", "submitted", ...)
                     # belong in this text — they would keep it out of Retry.

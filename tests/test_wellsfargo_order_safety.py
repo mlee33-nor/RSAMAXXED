@@ -367,3 +367,113 @@ def test_positions_marks_unloaded_account_failed(monkeypatch):
     assert not a1.ok and "holdings page did not load" in a1.message
     assert a2.ok
     assert out.state == "partial"
+
+
+# ------------------------------------------------------------ Preview Order click
+
+class _BannerPage(_Page):
+    """2026-10-15: WF's OneTrust cookie banner ate the Preview Order mouse
+    click, so the review page never loaded on any account. The first
+    `dead_clicks` mouse clicks on Preview do nothing; a JS click works."""
+
+    def __init__(self, *, dead_clicks=1, **kw):
+        super().__init__(**kw)
+        self.dead_clicks = dead_clicks
+        self.js = []
+        self.previewed = False
+
+    async def evaluate(self, js="", *_a, **_k):
+        self.js.append(js)
+        if "actionbtnContinue" in js:      # _still_on_entry_form
+            return not self.previewed
+        return await super().evaluate(js)
+
+    async def select(self, sel, timeout=None):
+        if sel == "#actionbtnContinue":
+            return _PreviewEl(self)
+        if sel == ".btn-wfa-primary.btn-wfa-submit" and not self.previewed:
+            raise asyncio.TimeoutError(sel)
+        return await super().select(sel, timeout)
+
+
+class _PreviewEl(_El):
+    def __init__(self, page):
+        super().__init__(page, "preview")
+
+    async def mouse_click(self):
+        self.page.clicks.append("preview")
+        if self.page.clicks.count("preview") > self.page.dead_clicks:
+            self.page.previewed = True
+
+    async def apply(self, js):
+        self.page.clicks.append("preview-js")
+        self.page.previewed = True
+
+
+def test_cookie_banner_is_dismissed_before_preview(monkeypatch):
+    page = _BannerPage(dead_clicks=0)
+    out = _run(monkeypatch, page)
+    assert out.accounts[0].ok
+    assert any("onetrust" in j for j in page.js)
+    assert "preview-js" not in page.clicks
+
+
+def test_dead_preview_click_is_retried_once_by_js(monkeypatch):
+    page = _BannerPage(dead_clicks=1)
+    out = _run(monkeypatch, page)
+    assert out.accounts[0].ok and out.accounts[0].message.startswith("Placed Buy 1 ABC")
+    assert page.clicks.count("preview-js") == 1
+    assert page.clicks.count("confirm") == 1
+
+
+def test_preview_that_never_loads_is_nothing_sent(monkeypatch):
+    class _Never(_BannerPage):
+        async def select(self, sel, timeout=None):
+            if sel == ".btn-wfa-primary.btn-wfa-submit":
+                raise asyncio.TimeoutError(sel)
+            return await super().select(sel, timeout)
+
+    page = _Never(dead_clicks=99)
+    out = _run(monkeypatch, page)
+    [a] = out.accounts
+    assert _no_order_words(a) and "nothing was sent" in a.message
+    assert "confirm" not in page.clicks
+
+
+# ------------------------------------------------------------ hidden #BuySell field
+
+def _side_page(field):
+    class _Opener(_El):
+        async def get_position(self):
+            return None
+
+        async def apply(self, *_a):
+            pass
+
+    class _P:
+        async def evaluate(self, js="", *_a, **_k):
+            return field
+
+        async def select(self, sel, timeout=None):
+            return _Opener(self, "opener")
+
+        async def sleep(self, *_a):
+            pass
+
+    return _P()
+
+
+def test_side_field_set_proceeds_whatever_the_label_says():
+    # Live label 2026-10-15: "Action. Currently selected Buy"
+    asyncio.run(wellsfargo._select_dropdown_option(
+        _side_page("Buy"), "#BuySellBtn", "Buy", timeout_s=0.01, require=True))
+
+
+@pytest.mark.parametrize("field", ["Select", "Sell", ""])
+def test_side_field_not_our_side_refuses(field):
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(wellsfargo._select_dropdown_option(
+            _side_page(field), "#BuySellBtn", "Buy", timeout_s=0.01, require=True))
+    low = str(ei.value).lower()
+    assert "nothing was sent" in low
+    assert not [w for w in _ORDER_MAY_EXIST if w in low]
