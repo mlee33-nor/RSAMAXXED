@@ -12,6 +12,7 @@ copying the feed per user would multiply it by the customer count for no gain.
 """
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timezone
 
 from sqlalchemy import (
@@ -181,12 +182,30 @@ class HoldingRow(Base):
 # that note is what every customer's mirror auto-buys.
 UNKNOWN_KIND = "unknown"
 
+# '🚧 RSA Alert' / 'LOW ODDS' (rsa_feed.LOW_ODDS_KIND): the split is declared,
+# the round-up just rarely happens. Not a conditional. Served as "Low Odds",
+# which a terminal's mirror buys only when its owner ticked "Buy low odds".
+LOW_ODDS_KIND = "low_odds"
+
+# '25 Shares/Account' -> 25. Same rule as rsa_feed.shares_per_account.
+_SHARES_RE = re.compile(r"(?<![\d.])(\d{1,4})\s*shares?\b", re.I)
+
+
+def shares_per_account(strategy: str | None) -> int | None:
+    """The share count an alert's Strategy names, or None. A conditional
+    buys several shares per account; every other type says 1."""
+    m = _SHARES_RE.search(strategy or "")
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if n >= 1 else None
+
 # Play.kind -> the picks.json note the desktop's mirror keys on. Must match
 # rsa_feed._PICK_NOTES: only "standard" becomes "Reg Alert" (a MIRROR_NOTES
 # entry); everything else, including any kind not listed here, is served with
 # the desktop's non-buyable unknown note.
 PICK_NOTES = {"standard": "Reg Alert", "otc": "OTC", "conditional": "conditional",
-              UNKNOWN_KIND: "unknown alert type"}
+              LOW_ODDS_KIND: "Low Odds", UNKNOWN_KIND: "unknown alert type"}
 
 
 def pick_note(kind: str | None) -> str:
@@ -211,7 +230,7 @@ class Play(Base):
     source_id: Mapped[str] = mapped_column(String(80))
 
     symbol: Mapped[str] = mapped_column(String(24))
-    kind: Mapped[str] = mapped_column(String(16), default=UNKNOWN_KIND)  # standard|otc|conditional|unknown
+    kind: Mapped[str] = mapped_column(String(16), default=UNKNOWN_KIND)  # standard|otc|conditional|low_odds|unknown
     alert_date: Mapped[str] = mapped_column(String(10), default="")     # YYYY-MM-DD
     ratio: Mapped[str] = mapped_column(String(24), default="")          # '1:15', as written
     ratio_n: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 15
@@ -228,6 +247,11 @@ class Play(Base):
     def is_actionable(self) -> bool:
         """Conditional alerts are watch-only — the split isn't declared yet."""
         return self.kind in ("standard", "otc")
+
+    @property
+    def shares(self) -> int | None:
+        """Shares per account the alert's Strategy asks for, or None."""
+        return shares_per_account(self.strategy)
 
     def days_left(self, today: date | None = None) -> int | None:
         if not self.last_buy_date:

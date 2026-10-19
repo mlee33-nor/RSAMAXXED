@@ -33,7 +33,7 @@ from typing import Iterable, Sequence
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import UNKNOWN_KIND, Play, PlayExit, PlayLifecycle, PlayRoundUp, pick_note
+from .models import LOW_ODDS_KIND, UNKNOWN_KIND, Play, PlayExit, PlayLifecycle, PlayRoundUp, pick_note
 
 # How far back the page looks. Exits older than this are still in the database
 # and still in the API; they just don't belong on a screen about what to trade.
@@ -1113,6 +1113,11 @@ def picks_json(board: Board) -> list[dict]:
             pick["roundup_history"] = p.roundup_history.strip()
         if p.posted_at is not None:
             pick["posted_at"] = p.posted_at.isoformat()
+        # A conditional's shares per account, from its Strategy: the count
+        # the terminal tells its user to buy by hand. Conditionals only, so
+        # the count can never ride on a row of any other type.
+        if p.kind == "conditional" and p.shares:
+            pick["shares"] = p.shares
         out.append(pick)
     return out
 
@@ -1150,6 +1155,8 @@ def _kind_from_note(note: str) -> str:
         return "standard"
     if "conditional" in n or "unverified" in n:
         return "conditional"
+    if n == "low odds":
+        return LOW_ODDS_KIND
     if "otc" in n:
         return "otc"
     return UNKNOWN_KIND

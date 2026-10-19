@@ -29,7 +29,7 @@ from ..db import get_db
 from ..deps import current_user, require_device
 from ..models import (
     Device, HoldingRow, HoldingSnapshot, PairingCode, Play, PlayExit,
-    PlayLifecycle, PlayRoundUp, Trade, UNKNOWN_KIND, User, utcnow,
+    PlayLifecycle, PlayRoundUp, Trade, UNKNOWN_KIND, LOW_ODDS_KIND, User, utcnow,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -395,7 +395,7 @@ class PlayIn(BaseModel):
         # nobody could read and must not buy. Loose chat ("unverified") stays
         # watch-only as before; any other word is filed as unknown.
         v = (v or "").lower().strip()
-        if v in {"standard", "otc", "conditional"}:
+        if v in {"standard", "otc", "conditional", LOW_ODDS_KIND}:
             return v
         if v == "unverified":
             return "conditional"
@@ -518,6 +518,8 @@ def require_feed_reader(
 
 #: Kinds /plays/picks serves as something a mirror buys.
 _BUY_KINDS = {"standard", "otc"}
+#: Kinds a terminal's mirror buys only when its owner opted in.
+_OPT_IN_KINDS = {LOW_ODDS_KIND}
 #: How old an alert may be and still be promoted to a buy kind on republish.
 KIND_PROMOTE_DAYS = 7
 
@@ -588,9 +590,18 @@ def ingest_plays(body: FeedIn, db: Session = Depends(get_db)) -> dict[str, Any]:
                 and (b.symbol, b.alert_date) in published):
             continue
         row = stored_buys.get(b.source_id)
+        # An opt-in kind is a buy for whoever ticked it, so it is promoted
+        # (from unknown) only while recent too -- but stepping DOWN to it from
+        # a buy every customer makes is always allowed.
         if row is not None and row.kind != b.kind and (
-                b.kind not in _BUY_KINDS or _recent_alert(row.alert_date)):
+                b.kind not in _BUY_KINDS | _OPT_IN_KINDS
+                or (b.kind in _OPT_IN_KINDS and row.kind in _BUY_KINDS)
+                or _recent_alert(row.alert_date)):
             row.kind = b.kind
+            # The Strategy goes with the type: a conditional's '5 Shares/
+            # Account' must not survive onto the row once it is re-read as
+            # something else.
+            row.strategy = b.strategy
             counts["kinds"] += 1
         if b.source_id in seen:
             continue

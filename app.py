@@ -1584,6 +1584,93 @@ MIRROR_LAST_BUY_MAX_AGE = 10
 # deliberate pass — see _mirror_skip_reason.
 MIRROR_NOTES = ("reg alert", "alert", "early access")
 
+# Low odds is an opt-in buy: only while "Buy low odds" is ticked on the Mirror
+# page (_mirror_wants). Off by default -- an install that never saw the box
+# buys exactly what it bought before. Never part of MIRROR_NOTES: that set is
+# also what the import/merge code calls "actionable" (a Reg Alert), and a low
+# odds post for a stored Reg Alert must still HOLD it.
+MIRROR_LOW_ODDS_NOTE = "low odds"
+# Conditionals are NEVER auto-bought: they are a hand buy, at the share count
+# the alert names ('5 Shares/Account'). Mirror says how many.
+MIRROR_CONDITIONAL_NOTE = "conditional"
+
+
+def _pick_shares(p: Dict[str, Any]) -> Optional[int]:
+    """Shares per account a pick's alert asks for (rsa_feed.to_pick `shares`),
+    or None when the pick doesn't say."""
+    try:
+        n = int((p or {}).get("shares"))
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 1 else None
+
+
+def _pick_is_conditional(p: Dict[str, Any]) -> bool:
+    return MIRROR_CONDITIONAL_NOTE in str((p or {}).get("note") or "").lower()
+
+
+def _pick_is_low_odds(p: Dict[str, Any]) -> bool:
+    return str((p or {}).get("note") or "").strip().lower() == MIRROR_LOW_ODDS_NOTE
+
+
+def _conditional_shares(p: Dict[str, Any]) -> Optional[int]:
+    """How many shares per account to buy BY HAND for a conditional pick, or
+    None when it isn't one or its alert names no count."""
+    return _pick_shares(p) if _pick_is_conditional(p) else None
+
+
+def _conditional_buy_text(p: Dict[str, Any]) -> str:
+    """'buy 5 shares/account by hand' -- what the user has to do."""
+    n = _conditional_shares(p)
+    if n is None:
+        return "buy by hand — the alert names no share count, check it"
+    return f"buy {_plural(n, 'share')}/account by hand"
+
+
+def _mirror_wants_pick(pick: Dict[str, Any], low_odds: bool) -> bool:
+    """Would mirror buy this pick's TYPE? (Age, journal and queue are checked
+    separately.) Reg Alerts always; low odds only while its box is ticked;
+    conditionals never. A held pick -- a Reg Alert a later post stepped back
+    -- is never bought, whatever it was stepped back to."""
+    note = str((pick or {}).get("note", "")).lower()
+    if note in MIRROR_NOTES:
+        return True
+    if (pick or {}).get("held"):
+        return False
+    if _pick_is_low_odds(pick):
+        return bool(low_odds)
+    return False
+
+
+def _mirror_opt_in(app) -> bool:
+    """Is `app`'s "Buy low odds" box ticked? A missing or broken var reads as
+    unticked: the gate fails toward buying less."""
+    var = getattr(app, "_mirror_buy_low_odds", None)
+    try:
+        return bool(var.get()) if var is not None else False
+    except Exception:
+        return False
+
+
+def _mirror_wants(app, pick: Dict[str, Any]) -> bool:
+    """_mirror_wants_pick with `app`'s box as ticked now. Tk thread only -- a
+    worker reads the box up front and calls _mirror_wants_pick."""
+    return _mirror_wants_pick(pick, _mirror_opt_in(app))
+
+
+def _mirror_buy_qty(p: Dict[str, Any]) -> Tuple[Optional[int], str]:
+    """(1, "") for a pick mirror may buy, or (None, why not).
+
+    Mirror only ever buys 1 share per account. A pick whose alert asks for any
+    other count is left for a hand buy -- never bought at 1 (that does not
+    round up) and never at its count (mirror buys only what the user agreed
+    to, and an upgraded conditional's count must not ride onto a Reg Alert)."""
+    n = _pick_shares(p)
+    if n is not None and n != 1:
+        return None, (f"alert asks for {_plural(n, 'share')}/account — "
+                      f"mirror only buys 1, buy it by hand")
+    return 1, ""
+
 # Brokers whose execute_trade() accepts only_accounts=[...] and will trade just
 # those. Anything not listed here re-runs its whole account list, so the
 # "retry the accounts that failed" action deliberately won't offer it — a retry
@@ -1667,7 +1754,7 @@ def _mirror_schedule_label() -> str:
     return ", ".join(f"{hh:02d}:{mm:02d}" for hh, mm in times) + " ET"
 
 
-def _mirror_skip_reason(note: str) -> str:
+def _mirror_skip_reason(note: str, shares: Any = None) -> str:
     """Plain English for why a pick was passed over, from its note.
 
     Mirror only ever buys a plain Reg Alert. Everything else is a deliberate
@@ -1677,7 +1764,9 @@ def _mirror_skip_reason(note: str) -> str:
     """
     n = (note or "").lower()
     if "conditional" in n:
-        return "conditional — split not declared yet"
+        return "conditional — " + _conditional_buy_text({"note": note, "shares": shares})
+    if n.strip() == MIRROR_LOW_ODDS_NOTE:
+        return "low odds — tick \"Buy low odds\" to auto-buy these"
     if "otc" in n:
         return "OTC — mirror doesn't auto-buy these"
     if "unknown" in n:
@@ -4556,7 +4645,8 @@ def _carry_pick_extras(rows: List[Dict[str, Any]],
                        donors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fill the display-only extras a row lacks from a donor with the same
     (date, SYMBOL), so a feed copy without them doesn't wipe what the local
-    cache already knew. Never touches symbol, note, date or last_buy."""
+    cache already knew. Never touches symbol, note, date or last_buy;
+    `shares` only between rows with the same note."""
     try:
         by_key = {(str(p.get("date") or ""), str(p.get("symbol") or "").upper()): p
                   for p in donors or [] if isinstance(p, dict)}
@@ -4566,6 +4656,13 @@ def _carry_pick_extras(rows: List[Dict[str, Any]],
             if d is not None and d is not p:
                 missing = {k: d[k] for k in PICK_DISPLAY_EXTRAS
                            if k not in p and d.get(k) not in (None, "")}
+                # `shares` is an order size, not decoration: carried only
+                # between posts of the SAME type, so a conditional's 5 can
+                # never ride onto the STANDARD (1 share) that replaced it.
+                if ("shares" not in p and d.get("shares") not in (None, "")
+                        and str(d.get("note") or "").strip().lower()
+                        == str(p.get("note") or "").strip().lower()):
+                    missing["shares"] = d["shares"]
                 if missing:
                     p = {**p, **missing}
             out.append(p)
@@ -8700,6 +8797,7 @@ class App(ctk.CTk):
         rows = self._pick_tab_lists.get(tab, [])
         return (tuple((str(p.get("symbol", "")).upper(), p.get("date", ""),
                        p.get("note", ""), str(p.get("last_buy", "")),
+                       str(p.get("shares", "")),
                        tuple(str(p.get(k, "")) for k in PICK_DISPLAY_EXTRAS))
                       for p in rows),
                 trade_journal.version(),
@@ -8825,6 +8923,9 @@ class App(ctk.CTk):
         "reg alert": ("REG ALERT", ACCENT),
         "otc": ("OTC", YELLOW),
         "conditional": ("CONDITIONAL", BLUE),
+        # Not a conditional: the split is declared, the round-up is just
+        # unlikely. Red-ish so it never reads as the steel CONDITIONAL badge.
+        "low odds": ("LOW ODDS", RED),
     }
 
     @staticmethod
@@ -9064,7 +9165,7 @@ class App(ctk.CTk):
         except Exception:
             max_age = MIRROR_MAX_AGE_DEFAULT
         return (enabled, queued, tuple(sorted(owed)), tuple(sorted(failed)),
-                executed, max_age)
+                executed, max_age, _mirror_opt_in(self))
 
     @staticmethod
     def _pick_mirror_status(pick: Dict[str, Any], sym: str, pdate: str,
@@ -9072,7 +9173,8 @@ class App(ctk.CTk):
         """(text, colour) for what mirror did or will not do with this pick,
         or ("", "") when there is nothing worth saying."""
         try:
-            enabled, queued, owed, failed, executed, max_age = state
+            enabled, queued, owed, failed, executed, max_age, *opt = state
+            opt_low_odds = bool(opt[0]) if opt else False
             key = (pdate, sym)
             at = sorted({rsa_feed._BROKER_ALIASES.get(b.lower(), b)
                          for (d, s, b) in owed if (d, s) == key and b})
@@ -9083,11 +9185,18 @@ class App(ctk.CTk):
             for k, note in failed:
                 if k == key:
                     return ("mirror failed" + (f" — {note}" if note else ""), RED)
+            if not n_brokers and _pick_is_conditional(pick) and not pick.get("held"):
+                # Not a skip: a job for the user, so it reads like one -- and
+                # it is shown with mirror off too. Mirror never buys these.
+                return (f"conditional — {_conditional_buy_text(pick)}", YELLOW)
             if not enabled or n_brokers:
                 return ("", "")
-            if not _pick_actionable(pick):
+            if not _mirror_wants_pick(pick, opt_low_odds):
                 return (f"mirror skips — {_mirror_skip_reason(pick.get('note', ''))}",
                         TEXT_MUTED)
+            _n, why = _mirror_buy_qty(pick)
+            if _n is None:
+                return (f"mirror skips — {why}", TEXT_MUTED)
             if key in executed:
                 return ("mirror sent", TEXT_SECONDARY)
             if not _pick_fresh_trading(pick, max_age, today):
@@ -9205,6 +9314,10 @@ class App(ctk.CTk):
         purchased = mode == "purchased"
         caption = [line for line in (caption or []) if line][:2]
         btxt, bcol = self._note_style(pick.get("note", ""))
+        # Only a conditional is sized above 1 -- and it is a hand buy, so
+        # the Buy / Top up buttons pre-fill its count.
+        shares = _conditional_shares(pick) or 1
+        buy_qty = str(shares)
         stripe = GREEN if purchased else (YELLOW if mode == "partial" else bcol)
         row_bg = BG_INPUT
 
@@ -9227,8 +9340,13 @@ class App(ctk.CTk):
 
             x = x0_left = 3 + 12
             x = rc.text_run(x, sy, [(sym, self._PF_SYM, TEXT_PRIMARY)], tags=base)
-            rc.pill(x + 10, sy, f" {btxt} ", self._PF_BADGE,
-                    _blend(bcol, row_bg, 0.82), bcol, padx=0, pady=1, tags=base)
+            _bx0, bx1 = rc.pill(x + 10, sy, f" {btxt} ", self._PF_BADGE,
+                                _blend(bcol, row_bg, 0.82), bcol, padx=0, pady=1,
+                                tags=base)
+            if shares > 1:
+                # A conditional is bought several shares deep; say how many.
+                rc.pill(bx1 + 6, sy, f" BUY {shares}/ACCT ", self._PF_BADGE,
+                        _blend(bcol, row_bg, 0.82), bcol, padx=0, pady=1, tags=base)
 
             right = w - 14
             btn = dict(padx=10, pady=3, anchor="e")
@@ -9248,7 +9366,7 @@ class App(ctk.CTk):
                     x0, _ = rc.pill(right, cy, "Top up →", self._PF_BTN,
                                     _blend(ACCENT, row_bg, 0.82), ACCENT_HOVER,
                                     tags=(row_tag,), **btn,
-                                    on_click=lambda s=sym: self._prefill_trade(s, "buy", "1"))
+                                    on_click=lambda s=sym: self._prefill_trade(s, "buy", buy_qty))
                     right = x0
             elif mode == "partial":
                 x0, _ = rc.pill(right, cy, f"{icon('check')} Mark done", self._PF_BTN,
@@ -9258,7 +9376,7 @@ class App(ctk.CTk):
                 x0, _ = rc.pill(x0 - 8, cy, "Top up →", self._PF_BTN,
                                 _blend(ACCENT, row_bg, 0.82), ACCENT_HOVER,
                                 tags=(row_tag,), **btn,
-                                on_click=lambda s=sym: self._prefill_trade(s, "buy", "1"))
+                                on_click=lambda s=sym: self._prefill_trade(s, "buy", buy_qty))
                 right = x0
             else:
                 # Plain "Buy →": the whole row is the buy, this just says so.
@@ -9313,7 +9431,7 @@ class App(ctk.CTk):
                     ly += line_h + 2
 
             if mode == "available":
-                rc.on_click(click_tag, lambda s=sym: self._quick_pick_buy(s))
+                rc.on_click(click_tag, lambda s=sym: self._quick_pick_buy(s, buy_qty))
             elif pdate:
                 # Once a pick has any fills, the useful thing to see is which
                 # brokers still owe it and why — buying is the explicit "Top up"
@@ -9459,9 +9577,10 @@ class App(ctk.CTk):
                 self._toggle_broker_chip(broker)
         return want
 
-    def _quick_pick_buy(self, symbol: str) -> None:
-        """Jump to Trade tab with symbol and qty pre-filled."""
-        self._prefill_trade(symbol, "buy", "1")
+    def _quick_pick_buy(self, symbol: str, qty: str = "1") -> None:
+        """Jump to Trade tab with symbol and qty pre-filled -- the alert's
+        shares per account (a conditional's 5), else 1."""
+        self._prefill_trade(symbol, "buy", qty)
         self._log(f"Quick Pick: {symbol} loaded — select brokers and execute")
 
     @staticmethod
@@ -9496,6 +9615,8 @@ class App(ctk.CTk):
                 note_text = _re.sub(r"@\w+", "", note_text).strip()
                 note_text = note_text.strip(" -–—")
                 note = f"conditional - {note_text}" if note_text else "conditional"
+            elif _re.search(r"\blow\s*odds\b", clean):
+                note = "Low Odds"
             elif "otc" in clean:
                 otc_match = _re.search(r"otc\s*[-–—]?\s*(.*)", line_lower)
                 note_text = otc_match.group(1).strip() if otc_match else ""
@@ -9514,7 +9635,12 @@ class App(ctk.CTk):
                 # Skip noise words that look like tickers
                 if ticker.upper() in ("IDLE", "ALERT", "OTC", "EARLY", "PREMIUM"):
                     continue
-                picks.append({"symbol": ticker.upper(), "note": note})
+                pick = {"symbol": ticker.upper(), "note": note}
+                # "CONDITIONAL - buy 5 shares (ABCD)": the size mirror buys.
+                n_sh = rsa_feed.shares_per_account(line)
+                if n_sh:
+                    pick["shares"] = n_sh
+                picks.append(pick)
         return picks
 
     def _manage_picks(self) -> None:
@@ -14924,7 +15050,7 @@ class App(ctk.CTk):
                 return
             fresh_unbought = {
                 self._mirror_key(p) for p in picks
-                if str(p.get("note", "")).lower() in MIRROR_NOTES
+                if _mirror_wants(self, p)
                 and self._mirror_pick_age_ok(p)
                 and self._mirror_journal_key(p) not in bought
                 and self._mirror_journal_key(p) not in attempted}
@@ -14981,6 +15107,7 @@ class App(ctk.CTk):
             "attempts": [[d, sym, int(n)] for (d, sym), n
                          in getattr(self, "_mirror_attempts", {}).items()],
             "max_age_days": self._mirror_max_age_days(),
+            "buy_low_odds": _mirror_opt_in(self),
             # Run ids taken off the Mirror page's NEEDS ATTENTION by hand.
             # Bounded: runs older than 30 days drop off the list anyway.
             "attention_dismissed": sorted(
@@ -15085,6 +15212,10 @@ class App(ctk.CTk):
         self._mirror_max_age = tk.IntVar(
             value=min(max(_age, MIRROR_AGE_CHOICES[0]), MIRROR_AGE_CHOICES[-1]))
         self._mirror_age_chips: Dict[int, Any] = {}
+        # "Buy low odds" (see _mirror_wants). Absent from older state files:
+        # off, which is what those installs have always done.
+        self._mirror_buy_low_odds = tk.BooleanVar(
+            value=saved.get("buy_low_odds") is True)
 
         # --- Pick queue (pacing) -------------------------------------------
         # Picks waiting their turn, the batches currently out, and the handle
@@ -15126,7 +15257,8 @@ class App(ctk.CTk):
                  font=(FONT_FAMILY, 9, "bold")).pack(anchor="w", pady=(6, 4))
 
         safety_points = [
-            "\u2713  Only executes on \"Reg Alert\" picks — skips OTC, conditional, and custom notes",
+            "\u2713  Only executes on \"Reg Alert\" picks — skips OTC, conditional and "
+            "custom notes, and low odds unless you tick it below",
             "\u2713  Always buys exactly 1 share per account — never more",
             "\u2713  BUY only — will never auto-sell your positions",
             "\u2713  Each pick is only executed once — duplicates are tracked and skipped",
@@ -15173,6 +15305,29 @@ class App(ctk.CTk):
             font=(FONT_FAMILY, 8), wraplength=600, justify="left")
         self._mirror_age_note.pack(anchor="w", pady=(6, 0))
         self._render_mirror_age_note()
+
+        # ---- Opt-in alert types ---------------------------------------------
+        types_section = tk.Frame(mirror_card.inner, bg=BG_CARD)
+        types_section.pack(fill="x", padx=20, pady=(0, 12))
+        tk.Label(types_section, text="ALSO BUY", bg=BG_CARD, fg=TEXT_SECONDARY,
+                 font=(FONT_FAMILY, 9, "bold")).pack(anchor="w", pady=(0, 6))
+        tk.Checkbutton(
+            types_section,
+            text=("Buy low odds  —  LOW ODDS alerts, 1 share/account (the "
+                  "round-up rarely happens on these)"),
+            variable=self._mirror_buy_low_odds, command=self._set_mirror_opt_in,
+            bg=BG_CARD, fg=TEXT_SECONDARY, activebackground=BG_CARD,
+            activeforeground=TEXT_PRIMARY, selectcolor=BG_INPUT,
+            font=(FONT_FAMILY, 9), anchor="w", bd=0, highlightthickness=0,
+            wraplength=600, justify="left",
+        ).pack(anchor="w")
+        tk.Label(types_section,
+                 text=("Conditional alerts are never auto-bought: they need "
+                       "several shares per account (e.g. 5 Shares/Account). "
+                       "Each one shows how many to buy, and its Buy button "
+                       "pre-fills that count."),
+                 bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 8),
+                 wraplength=600, justify="left").pack(anchor="w", pady=(4, 0))
 
         # Broker selection for mirror trading
         broker_section = tk.Frame(mirror_card.inner, bg=BG_CARD)
@@ -15531,6 +15686,23 @@ class App(ctk.CTk):
         """
         return _pick_fresh_trading(pick, self._mirror_max_age_days())
 
+    # ---- Mirror: opt-in alert types ----------------------------------------
+
+    def _set_mirror_opt_in(self) -> None:
+        """The "Buy low odds" box was clicked: save it and say what changes."""
+        on = _mirror_opt_in(self)
+        self._save_mirror_state()
+        self._mirror_log_msg("Low odds alerts will be bought (1 share/account)"
+                             if on else "Low odds alerts will be skipped")
+        self._render_mirror_age_note()
+        self._invalidate_page("mirror")
+        if on and self._mirror_enabled.get():
+            # Low odds picks already in the feed and inside the age limit are
+            # now wanted; the next check finds them.
+            self._mirror_log_msg(
+                f"Fresh low odds picks you haven't bought go at the next check "
+                f"({_mirror_schedule_label()})")
+
     def _set_mirror_max_age(self, days: int) -> None:
         days = int(days)
         self._mirror_max_age.set(days)
@@ -15557,7 +15729,7 @@ class App(ctk.CTk):
         stale = []
         extended = []
         for pick in (self._quick_picks or []):
-            if str(pick.get("note", "")).lower() not in MIRROR_NOTES:
+            if not _mirror_wants(self, pick):
                 continue
             # Too old for us, but still live in the feed — i.e. genuinely
             # skipped by this setting rather than gone anyway.
@@ -15758,7 +15930,7 @@ class App(ctk.CTk):
         # still owed, and enabling mirror must not bury it.
         pending_keys = {self._mirror_key(p) for p in pending}
         for pick in self._quick_picks:
-            if str(pick.get("note", "")).lower() not in MIRROR_NOTES:
+            if not _mirror_wants(self, pick):
                 continue
             key = self._mirror_key(pick)
             if key not in pending_keys:
@@ -16105,7 +16277,8 @@ class App(ctk.CTk):
         key = tuple(batch.get("mirror_key") or ())
         if len(key) != 2:
             return []
-        pick = {"date": key[0], "symbol": key[1], "note": "Reg Alert"}
+        pick = {"date": key[0], "symbol": key[1],
+                "note": str(batch.get("mirror_note") or "Reg Alert")}
         # The alert's last day to buy goes with the debt: the retry's age gate
         # must not buy after it, nor drop the debt while it is still open.
         row = next((p for p in (getattr(self, "_quick_picks", None) or [])
@@ -16224,7 +16397,7 @@ class App(ctk.CTk):
         bought = self._mirror_bought_keys(self._quick_picks)
         pending: List[Dict[str, str]] = []
         for pick in self._quick_picks:
-            if str(pick.get("note", "")).lower() not in MIRROR_NOTES:
+            if not _mirror_wants(self, pick):
                 continue
             if self._mirror_key(pick) in self._mirror_executed:
                 continue
@@ -16338,6 +16511,7 @@ class App(ctk.CTk):
         # silently costs the slot. The executed/queued sets are copied for the
         # same reason: the main thread keeps changing them while this runs.
         max_age = self._mirror_max_age_days()
+        opt_low_odds = _mirror_opt_in(self)
         executed = set(self._mirror_executed)
         queued = {self._mirror_key(p) for p in self._mirror_queue}
         # Read on the Tk thread with everything else. A check outside regular
@@ -16386,12 +16560,13 @@ class App(ctk.CTk):
                 for pick in picks:
                     note = pick.get("note", "").lower()
                     sym = str(pick.get("symbol", "")).upper()
-                    # Only Reg Alert / alert / early access
-                    if note not in MIRROR_NOTES:
+                    # Reg Alert / alert / early access, plus the low odds and
+                    # low odds when the user ticked it (read up front).
+                    if not _mirror_wants_pick(pick, opt_low_odds):
                         # Recorded, not just dropped: "why didn't it buy TOMZ"
                         # is the question the Mirror page exists to answer, and
                         # 'conditional' vs 'OTC' are different answers.
-                        reason = _mirror_skip_reason(note)
+                        reason = _mirror_skip_reason(note, pick.get("shares"))
                         if pick.get("held"):
                             reason = (f"on hold — a later alert changed this "
                                       f"{pick.get('held')} to {pick.get('note') or 'unknown'}")
@@ -16413,6 +16588,12 @@ class App(ctk.CTk):
                     if not _pick_fresh_trading(pick, max_age, today):
                         skipped.append({"symbol": sym,
                                         "reason": f"older than the {max_age}-trading-day limit"})
+                        continue
+                    # Mirror buys 1 share. An alert asking for any other count
+                    # is named and left for a hand buy.
+                    _n, why = _mirror_buy_qty(pick)
+                    if _n is None:
+                        skipped.append({"symbol": sym, "reason": why})
                         continue
                     if not market_ok:
                         skipped.append({"symbol": sym,
@@ -16774,14 +16955,22 @@ class App(ctk.CTk):
         current = next((p for p in (getattr(self, "_quick_picks", None) or [])
                         if self._mirror_key(p) == key), None)
         called_off = key in (getattr(self, "_feed_kept_bought_told", None) or ())
-        if called_off or (current is not None and not _pick_actionable(current)):
+        if called_off or (current is not None and not _mirror_wants(self, current)):
             # called_off: bought before the later alert, so the stored row
             # stays a buyable Reg Alert (see _import_picks_from_messages).
             what = ("called off" if called_off
                     else f"\"{current.get('note') or 'unknown'}\"")
-            self._mirror_log_msg(
-                f"{symbol}: not sent — the play is now {what} (a later alert). "
-                f"Check it by hand.")
+            if (not called_off and not current.get("held")
+                    and _pick_is_low_odds(current)
+                    and str(current.get("note") or "").lower()
+                    == str(pick.get("note") or "").lower()):
+                # Same type it was queued as: its box was unticked meanwhile.
+                self._mirror_log_msg(
+                    f"{symbol}: not sent — {_mirror_skip_reason(current.get('note', ''))}")
+            else:
+                self._mirror_log_msg(
+                    f"{symbol}: not sent — the play is now {what} (a later alert). "
+                    f"Check it by hand.")
             if only:
                 _mirror_owed_done(self, only, pick)
                 self._save_mirror_state()
@@ -16815,6 +17004,17 @@ class App(ctk.CTk):
                 _mirror_owed_done(self, only, pick)
                 self._save_mirror_state()
             return None
+
+        # Re-checked against the live row: an alert re-posted with a share
+        # count other than 1 is a hand buy now (see _mirror_buy_qty).
+        qty_n, why = _mirror_buy_qty(gate)
+        if qty_n is None:
+            self._mirror_log_msg(f"{symbol}: not sent — {why}")
+            if only:
+                _mirror_owed_done(self, only, pick)
+                self._save_mirror_state()
+            return None
+        qty = "1"
 
         held = _pick_broker_map([pick]).get(self._mirror_journal_key(pick), set())
         only_accts = [str(a) for a in (pick.get("_accounts") or []) if a] if only else []
@@ -16921,7 +17121,7 @@ class App(ctk.CTk):
         # strip + completion receipt as a manual trade, and reuse the worker.
         try:
             run_id = mirror_journal.start_run(
-                symbol=symbol, side="buy", qty="1", brokers=selected,
+                symbol=symbol, side="buy", qty=qty, brokers=selected,
                 trigger=trigger or ("manual" if when == "manual" else "schedule"),
                 slot=when, note=str(pick.get("note", "")),
                 pick_date=str(pick.get("date", "")), dry_run=False)
@@ -16933,7 +17133,7 @@ class App(ctk.CTk):
             "results": [],
             "side": "buy",
             "symbol": symbol,
-            "qty": "1",
+            "qty": qty,
             "dry_run": False,
             "origin": "mirror",
             "mirror_key": key,
@@ -16950,6 +17150,9 @@ class App(ctk.CTk):
             "mirror_owed_accounts": list(only_accts),
             # The alert's last day to buy, for any leg owed from this batch.
             "mirror_last_buy": str(gate.get("last_buy") or ""),
+            # The pick's type, for any leg owed from this batch (it used to
+            # be assumed "Reg Alert").
+            "mirror_note": str(gate.get("note") or pick.get("note") or ""),
             # Part of this pick was held back for a wedged broker (owed): its
             # failures here can never hand the WHOLE pick back (fix4 N1).
             "mirror_split": bool(wedged) and not only,
@@ -16967,13 +17170,13 @@ class App(ctk.CTk):
         self._live_start(batch)
         for broker in selected:
             if only_accts:
-                self._mirror_log_msg(f"  {broker}: sending BUY 1 {symbol} to "
+                self._mirror_log_msg(f"  {broker}: sending BUY {qty} {symbol} to "
                                      f"{_plural(len(only_accts), 'account')} only...")
-                self._run_in_thread(self._trade_worker, broker, "buy", symbol, "1",
+                self._run_in_thread(self._trade_worker, broker, "buy", symbol, qty,
                                     False, batch, list(only_accts))
                 continue
-            self._mirror_log_msg(f"  {broker}: sending BUY 1 {symbol}...")
-            self._run_in_thread(self._trade_worker, broker, "buy", symbol, "1", False, batch)
+            self._mirror_log_msg(f"  {broker}: sending BUY {qty} {symbol}...")
+            self._run_in_thread(self._trade_worker, broker, "buy", symbol, qty, False, batch)
 
         # Play notification sound
         try:
@@ -17377,6 +17580,22 @@ class App(ctk.CTk):
                         kept_bought.pop(k, None)
                         revived.add(k)
                     if _pick_actionable(p) == _pick_actionable(old):
+                        # Neither is a Reg Alert, but the type (or size) was
+                        # read differently -- a stored "unknown alert type"
+                        # that this build reads as LOW ODDS, a conditional
+                        # re-posted as low odds. Now that both can be opt-in
+                        # buys the label matters, so the newer reading wins.
+                        # Never over a hold, a buy, or with loose chat.
+                        if (not _pick_actionable(p)
+                                and str(p.get("note") or "").lower() != "unverified"
+                                and not old.get("held") and k not in bought
+                                and (str(p.get("note") or "") != str(old.get("note") or "")
+                                     or _pick_shares(p) != _pick_shares(old))
+                                and _pick_later_post(p, old) is not False):
+                            existing[i] = p
+                            if k in added:
+                                added[k] = p
+                            changed = True
                         continue
                     # Times prove this post older (a re-read of the original
                     # CONDITIONAL, or of the STANDARD a cancel followed): it
@@ -17547,6 +17766,13 @@ class App(ctk.CTk):
                 f"Imported {_plural(len(added), 'pick')}: {syms}"))
             self.after(0, lambda: self._push_notification(
                 f"Alert feed: imported {syms}", "success"))
+            # Conditionals are hand buys at the alert's size: say so once,
+            # where it can't be missed.
+            for c in [p for p in added if _pick_is_conditional(p)]:
+                text = (f"{str(c.get('symbol') or '?').upper()} is CONDITIONAL — "
+                        f"{_conditional_buy_text(c)} (mirror won't buy it)")
+                self.after(0, lambda t=text: self._alerts_log_msg(t))
+                self.after(0, lambda t=text: self._push_notification(t, "warning"))
             self.after(0, lambda: self._mirror_after_import(added))
         elif buy_msgs:
             self.after(0, lambda: self._alerts_log_msg("No new tickers found."))
@@ -17581,7 +17807,7 @@ class App(ctk.CTk):
         """
         if not getattr(self, "_mirror_enabled", None) or not self._mirror_enabled.get():
             return
-        if not any(str(p.get("note", "")).lower() in MIRROR_NOTES for p in added):
+        if not any(_mirror_wants(self, p) for p in added):
             return
         _state, _label, now = _market_status()
         if _mirror_due_slot(now) is None:

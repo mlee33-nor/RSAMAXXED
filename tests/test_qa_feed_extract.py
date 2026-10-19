@@ -44,7 +44,8 @@ def test_embed_alert_still_makes_a_reg_alert_pick():
     # (rsa_feed.to_pick), here only the post time.
     assert [{k: p[k] for k in ("symbol", "note", "date")} for p in picks] == [
         {"symbol": "SBFM", "note": "Reg Alert", "date": "2026-06-18"}]
-    assert set(picks[0]) <= {"symbol", "note", "date", "last_buy", *A.PICK_DISPLAY_EXTRAS}
+    assert set(picks[0]) <= {"symbol", "note", "date", "last_buy", "shares",
+                             *A.PICK_DISPLAY_EXTRAS}
     assert picks[0]["note"].lower() in A.MIRROR_NOTES
 
 

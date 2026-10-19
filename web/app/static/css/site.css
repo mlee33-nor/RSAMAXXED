@@ -1085,6 +1085,7 @@
   .ptag.std {color:var(--text-2);background:rgba(255,255,255,.05)}
   .ptag.otc {color:var(--accent-2);background:rgba(167,139,250,.14)}
   .ptag.cond{color:var(--amber);background:rgba(242,193,78,.13)}
+  .ptag.lowodds{color:var(--red);background:rgba(251,111,132,.13)}
   .ptag.ru  {color:var(--green);background:rgba(52,211,158,.13)}
 
   /* Countdown. Colour is the message; the words repeat it for anyone who

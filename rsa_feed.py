@@ -42,7 +42,7 @@ __all__ = [
     "parse_buy_message", "parse_sell_message", "parse_messages",
     "normalize_broker", "parse_rsa_date", "to_pick", "to_picks", "from_pick",
     "FeedBatch",
-    "BUY_KINDS", "SUPPORTED_BROKERS",
+    "BUY_KINDS", "SUPPORTED_BROKERS", "LOW_ODDS_KIND", "shares_per_account",
     "LifecycleRow", "parse_lifecycle_message", "parse_lifecycle_messages",
     "LIFECYCLE_STATUSES", "SELLABLE_STATUSES", "FRACTIONAL_STATUSES",
     "FRACTIONAL_BROKERS", "CASH_IN_LIEU_BROKERS", "returns_fraction",
@@ -103,7 +103,14 @@ def normalize_broker(raw: str) -> str:
 
 # ------------------------------------------------------------------- utilities
 
-BUY_KINDS = ("standard", "otc", "conditional")
+# '🚧 RSA Alert' / 'LOW ODDS': a real buy alert (same fields, 1 Share/Account)
+# for a name whose round-up record is poor -- the embed carries a "Low Odds
+# Round-Up Tracker" (~2%). It is NOT a conditional: the split is declared. It
+# used to fall through to UNKNOWN_KIND. Mirror buys it only when the user ticks
+# "Buy Low Odds".
+LOW_ODDS_KIND = "low_odds"
+
+BUY_KINDS = ("standard", "otc", "conditional", LOW_ODDS_KIND)
 
 # A buy that came from loose chat rather than an RSA Alert (the embed, or the
 # same alert typed out under an "RSA Alert" title). "Market opens 9:30 (ET)"
@@ -137,6 +144,24 @@ def parse_rsa_date(value: str, *, today: date | None = None) -> str | None:
         return date(yr, mo, da).isoformat()
     except ValueError:
         return None
+
+
+# '25 Shares/Account' / '1 Share/Account' / '5 shares per account'.
+_SHARES_RE = re.compile(r"(?<![\d.])(\d{1,4})\s*shares?\b", re.I)
+
+
+def shares_per_account(strategy: Any) -> int | None:
+    """The share count an alert's Strategy line asks for, or None.
+
+    A CONDITIONAL alert buys several shares per account ('5 Shares/Account')
+    so the position rounds up whichever ratio the company settles on; every
+    other type says '1 Share/Account'. None when the line names no count --
+    never guessed, because the count becomes an order quantity."""
+    m = _SHARES_RE.search(str(strategy or ""))
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if n >= 1 else None
 
 
 def _money(value: str) -> float | None:
@@ -187,7 +212,7 @@ class BuyAlert:
 
     source_id: str
     symbol: str
-    kind: str = "standard"              # standard | otc | conditional
+    kind: str = "standard"              # standard | otc | conditional | low_odds
     alert_date: str = ""                # YYYY-MM-DD, the date the alert is for
     ratio: str = ""                     # '1:15' as written
     ratio_n: int | None = None          # 15 — the round-up multiple
@@ -204,6 +229,11 @@ class BuyAlert:
         so the terminal must not fire on them. Unverified (loose-chat) buys
         never are."""
         return self.kind in ("standard", "otc")
+
+    @property
+    def shares(self) -> int | None:
+        """Shares per account the alert's Strategy asks for, or None."""
+        return shares_per_account(self.strategy)
 
     def days_left(self, today: date | None = None) -> int | None:
         if not self.last_buy_date:
@@ -333,6 +363,10 @@ def _kind_from(desc: str, title: str) -> str:
     # Conditional first: "CONDITIONAL - OTC" is still watch-only.
     if "conditional" in blob:
         return "conditional"
+    # 'LOW ODDS' (title glyph 🚧). Before OTC: a low-odds OTC name is still
+    # low odds, and mirror must ask the Low Odds box, not treat it as OTC.
+    if re.search(r"\blow[\s_-]*odds\b", blob):
+        return LOW_ODDS_KIND
     if "otc" in blob:
         return "otc"
     # Only an explicit STANDARD is buyable. See UNKNOWN_KIND.
@@ -806,6 +840,7 @@ _KIND_GLYPHS = {
     "\U0001f514": "standard",     # 🔔
     "\U0001f48a": "otc",          # 💊
     "\U0001f4dd": "conditional",  # 📝
+    "\U0001f6a7": LOW_ODDS_KIND,  # 🚧
 }
 
 
@@ -851,7 +886,7 @@ class LifecycleRow:
     sell_symbol: str            # what it trades as now; differs after a rename
     alert_date: str             # YYYY-MM-DD
     status: str                 # one of LIFECYCLE_STATUSES
-    kind: str = "standard"      # standard | otc | conditional
+    kind: str = "standard"      # standard | otc | conditional | low_odds
     kind_glyph: str = ""        # the raw leading glyph, for anything unmapped
     raw: str = ""
 
@@ -1012,6 +1047,7 @@ def _oldest_first(messages: Iterable[dict]) -> list[dict]:
 
 # "unverified" must stay OUT of app.py's MIRROR_NOTES so the mirror never buys it.
 _PICK_NOTES = {"standard": "Reg Alert", "otc": "OTC", "conditional": "conditional",
+               LOW_ODDS_KIND: "Low Odds",
                UNVERIFIED_KIND: "unverified", UNKNOWN_KIND: "unknown alert type"}
 
 
@@ -1042,6 +1078,11 @@ def to_pick(buy: BuyAlert) -> dict[str, str]:
         pick["est_profit"] = buy.est_profit
     if buy.roundup_history:
         pick["roundup_history"] = str(buy.roundup_history)[:200]
+    # Shares per account, from the alert's Strategy. Written whenever the alert
+    # names it, 1 included: a conditional's 5 must never be carried onto the
+    # STANDARD that replaces it because the STANDARD's row left the key out.
+    if buy.shares:
+        pick["shares"] = buy.shares
     if buy.posted_at:
         pick["posted_at"] = str(buy.posted_at)
     return pick
@@ -1103,8 +1144,21 @@ def from_pick(pick: dict[str, str]) -> BuyAlert | None:
         est_profit=_opt_float(pick.get("est_profit")),
         last_buy_date=str(pick.get("last_buy") or "")[:10] or None,
         roundup_history=str(pick.get("roundup_history") or "").strip()[:200],
+        strategy=_strategy_from_pick(pick),
         posted_at=_opt_iso(pick.get("posted_at")),
     )
+
+
+def _strategy_from_pick(pick: dict) -> str:
+    """A pick's `shares` back into the alert's Strategy wording, or "" when
+    the pick doesn't say -- unknown, never assumed to be 1."""
+    try:
+        n = int(pick.get("shares"))
+    except (TypeError, ValueError):
+        return ""
+    if n < 1:
+        return ""
+    return f"{n} Shares/Account" if n > 1 else "1 Share/Account"
 
 
 def to_picks(buys: Sequence[BuyAlert]) -> list[dict[str, str]]:

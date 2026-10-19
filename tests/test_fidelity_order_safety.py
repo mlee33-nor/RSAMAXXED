@@ -336,3 +336,53 @@ def test_scrape_accepts_any_one_letter_prefix():
 
     got = asyncio.run(fidelity._open_account_dropdown_and_scrape(_P()))
     assert [g["acctNum"] for g in got] == ["Z12345678", "X98765432", "245678901"]
+
+
+def test_scrape_waits_for_a_list_that_fills_late():
+    # The ticket is up but its account list is still empty (or the menu didn't
+    # open on the first click). The old one-shot read failed the whole login
+    # with "No destination accounts found"; it must keep looking instead.
+    class _P:
+        reads = 0
+
+        async def evaluate(self, js, *a, **k):
+            if "querySelectorAll('div[role=\"option\"] button')" in js:
+                _P.reads += 1
+                return [] if _P.reads < 4 else ["Individual (Z12345678)"]
+            return False  # list not visible yet
+
+        async def select(self, *_a, **_k):
+            raise RuntimeError("no handle")
+
+        async def wait_for_ready_state(self, *_a, **_k):
+            pass
+
+        async def wait(self, *_a, **_k):
+            pass
+
+        async def sleep(self, *_a):
+            pass
+
+    got = asyncio.run(fidelity._open_account_dropdown_and_scrape(_P()))
+    assert [g["acctNum"] for g in got] == ["Z12345678"]
+    assert _P.reads == 4
+
+
+def test_scrape_gives_up_empty_after_the_wait():
+    class _P:
+        async def evaluate(self, js, *a, **k):
+            return [] if "ett-acct-sel-list" in js and "button" in js else False
+
+        async def select(self, *_a, **_k):
+            raise RuntimeError("no handle")
+
+        async def wait_for_ready_state(self, *_a, **_k):
+            pass
+
+        async def wait(self, *_a, **_k):
+            pass
+
+        async def sleep(self, *_a):
+            pass
+
+    assert asyncio.run(fidelity._open_account_dropdown_and_scrape(_P(), wait_s=2)) == []

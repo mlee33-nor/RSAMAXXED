@@ -91,7 +91,8 @@ def test_a_missing_kind_is_never_standard():
 
 @pytest.mark.parametrize("kind,want", [("standard", "standard"), ("STANDARD", "standard"),
                                        ("otc", "otc"), ("Conditional", "conditional"),
-                                       ("unverified", "conditional")])
+                                       ("unverified", "conditional"),
+                                       ("low_odds", "low_odds"), ("LOW_ODDS", "low_odds")])
 def test_known_kinds_still_file_as_before(kind, want):
     assert PlayIn(source_id="x", symbol="ABCD", kind=kind).kind == want
 

@@ -117,7 +117,7 @@ def test_to_pick_from_pick_round_trip():
     pick = rsa_feed.to_pick(buy)
     assert pick == {"symbol": "BTOC", "note": "Reg Alert", "date": "2026-10-09",
                     "last_buy": "2026-10-14", "ratio": "1:16", "entry_price": 0.2151,
-                    "est_profit": 3.23, "roundup_history": "N/A",
+                    "est_profit": 3.23, "roundup_history": "N/A", "shares": 1,
                     "posted_at": "2026-10-09T21:50:54+00:00"}
     back = rsa_feed.from_pick(json.loads(json.dumps(pick)))
     assert (back.symbol, back.alert_date, back.ratio, back.ratio_n, back.entry_price,

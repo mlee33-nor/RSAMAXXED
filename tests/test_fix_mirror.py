@@ -116,7 +116,7 @@ def test_the_alert_carries_its_last_day_to_buy_into_the_pick():
                             alert_date="2026-10-09", last_buy_date="2026-10-14")
     pick = rsa_feed.to_pick(buy)
     assert pick == {"symbol": "BTOC", "note": "Reg Alert", "date": "2026-10-09",
-                    "last_buy": "2026-10-14"}
+                    "last_buy": "2026-10-14", "shares": 1}
     assert rsa_feed.from_pick(pick).last_buy_date == "2026-10-14"
     # No last day: the three-key shape, unchanged.
     assert "last_buy" not in rsa_feed.to_pick(

@@ -1734,49 +1734,22 @@ async def _ensure_expanded_ticket_mode(page, *, notify: Optional[NotifyFn]) -> N
         pass
 
 
-async def _open_account_dropdown_and_scrape(page) -> List[Dict[str, str]]:
-    """
-    Legacy-style scrape from #ett-acct-sel-list.
-    Returns list of {"acctNum": "...", "name": "..."}.
-    """
-    out: List[Dict[str, str]] = []
-
-    dropdown_selector = "#dest-acct-dropdown"
-    # wait for dropdown presence
-    for _ in range(40):
-        try:
-            exists = await page.evaluate(f'document.querySelector("{dropdown_selector}") !== null')
-            if exists:
-                break
-        except Exception:
-            pass
-        await page.sleep(0.25)
-
-    # open dropdown
-    try:
-        await page.evaluate(f'document.querySelector("{dropdown_selector}").click()')
-    except Exception:
-        # try click via select
-        dd = await page.select(dropdown_selector, timeout=10)
-        await dd.scroll_into_view()
-        await dd.mouse_click()
-
-    # scrape visible options
-    scraped = await page.evaluate(
-        """
+_ACCT_SCRAPE_JS = """
         (function() {
             const list = document.getElementById("ett-acct-sel-list");
             if (!list) return [];
             const buttons = list.querySelectorAll('div[role="option"] button');
             let results = [];
             for (let btn of buttons) {
-                results.push(btn.innerText.trim());
+                results.push((btn.innerText || btn.textContent || '').trim());
             }
             return results;
         })();
         """
-    )
 
+
+def _parse_account_options(scraped) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
     for item in (scraped or []):
         # Optional one-letter prefix: Z-prefixed brokerage numbers and any other
         # lettered account type (the old Z-only pattern silently dropped those).
@@ -1787,6 +1760,69 @@ async def _open_account_dropdown_and_scrape(page) -> List[Dict[str, str]]:
         acct_num = m.group(2).strip()
         out.append({"acctNum": acct_num, "name": nickname})
     return out
+
+
+async def _open_account_dropdown_and_scrape(page, *, wait_s: float = 20.0,
+                                            label: str = "") -> List[Dict[str, str]]:
+    """
+    Open the destination-account dropdown and read its options.
+    Returns list of {"acctNum": "...", "name": "..."}.
+
+    This used to be one shot: a plain JS .click() on the dropdown and an
+    immediate read of the list. Both halves lose races. The PVD dropdown opens
+    on pointerdown, so .click() often doesn't open it at all, and the options
+    are filled in from an account fetch that can land after #previewOrderBtn
+    is already up — a freshly signed-in login is the slowest. Either way the
+    read found nothing and the whole login failed with "No destination
+    accounts found" on a ticket that had its accounts a second later; the same
+    login then traded fine on the next attempt.
+
+    So: poll the list until it has options, opening the menu only when it is
+    closed (re-clicking an open PVD menu toggles it shut) and giving each open
+    attempt time to land before deciding it didn't.
+    """
+    dropdown_selector = "#dest-acct-dropdown"
+    list_selector = "#ett-acct-sel-list"
+    step_s = 0.5
+    last_open_at = -999.0
+    scraped: Any = []
+    tries = max(1, int(wait_s / step_s))
+    for i in range(tries):
+        try:
+            scraped = await page.evaluate(_ACCT_SCRAPE_JS)
+        except Exception:
+            scraped = []
+        out = _parse_account_options(scraped)
+        if out:
+            return out
+
+        # Give a previous open attempt ~1.5s before trying again, so a menu
+        # that is slow to appear isn't immediately toggled shut.
+        elapsed = i * step_s
+        if elapsed - last_open_at >= 1.5 and not await _element_visible(page, list_selector):
+            last_open_at = elapsed
+            # Alternate a real input-event click with the handle-free pointer
+            # sequence; either one alone has failed on this ticket before.
+            if (i // 3) % 2 == 0:
+                await _stale_safe_click(page, dropdown_selector, tries=1, settle_s=0.3)
+            else:
+                await _js_pointer_click_selector(page, dropdown_selector)
+        await page.sleep(step_s)
+
+    # Say what the ticket actually showed, so the next report of this is
+    # diagnosable from fidelity_nav.log alone.
+    try:
+        diag = await page.evaluate(
+            "(function(){var d=document.querySelector('" + dropdown_selector + "');"
+            "var l=document.querySelector('" + list_selector + "');"
+            "return 'dropdown=' + (d ? 'yes' : 'no') + ' list=' + (l ? 'yes' : 'no')"
+            " + ' options=' + (l ? l.querySelectorAll('div[role=\"option\"]').length : 0)"
+            " + ' url=' + window.location.href;})();")
+    except Exception:
+        diag = "unreadable"
+    raw = [str(s)[:60] for s in (scraped or [])][:5]
+    _trace(f"TRADE | {label} | no destination accounts after {wait_s:.0f}s ({diag}; raw={raw})")
+    return []
 
 
 async def _select_account_in_dropdown(page, acct_num: str) -> None:
@@ -3562,7 +3598,7 @@ def bootstrap(*args, **kwargs) -> BrokerOutput:
                     try:
                         await _nav(page, TRADE_URL, f"BOOTSTRAP[{c.label}]", notify=notify)
                         await _wait_for_trade_ticket(page, label=c.label, notify=notify)
-                        sub = await _open_account_dropdown_and_scrape(page)
+                        sub = await _open_account_dropdown_and_scrape(page, label=c.label)
                         _trace(f"BOOTSTRAP | {c.label} | {len(sub)} destination account(s)",
                                notify=notify)
                     except Exception as e:
@@ -3908,7 +3944,15 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False, **
 
                 # Scrape destination accounts (legacy)
                 _trace(f"TRADE | {c.label} | scraping account list", notify=notify)
-                acct_list = await _open_account_dropdown_and_scrape(page)
+                acct_list = await _open_account_dropdown_and_scrape(page, label=c.label)
+                if not acct_list and not smart_sell:
+                    # Nothing has been sent yet, so one fresh ticket is a free
+                    # second chance before failing the whole login.
+                    _trace(f"TRADE | {c.label} | no accounts on ticket, reloading once", notify=notify)
+                    await _nav(page, TRADE_URL, f"TRADE[{c.label}]", notify=notify)
+                    await _wait_for_trade_ticket(page, label=c.label, notify=notify)
+                    await _ensure_expanded_ticket_mode(page, notify=notify)
+                    acct_list = await _open_account_dropdown_and_scrape(page, label=c.label)
                 if not acct_list:
                     _login_fail(c.label, _not_sent("No destination accounts found on trade ticket"))
                     if dry_run:

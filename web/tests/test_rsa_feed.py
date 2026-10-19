@@ -82,8 +82,8 @@ def test_alert_kind_comes_from_the_leading_glyph():
     assert by_symbol["KPEA"].kind == "otc"           # 💊
     assert by_symbol["WLDS"].kind == "conditional"   # 📝
     assert by_symbol["AGAE"].kind == "standard"      # 🔔
-    # Undocumented glyphs fall back to standard rather than guessing.
-    assert by_symbol["WORX"].kind == "standard"      # 🚧
+    # 🚧 is the LOW ODDS type (the BUY embeds say so too).
+    assert by_symbol["WORX"].kind == "low_odds"      # 🚧
 
 
 def test_only_finished_plays_are_sellable():
