@@ -72,7 +72,7 @@ except Exception:  # missing module, missing requests, anything at all
 
 # The release a customer is running — shown in the sidebar footer and stamped
 # on every crash-log START line, so a support report says which build it is.
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 
 # The main window's title. The single-instance guard finds a running copy's
 # window by it (FindWindowW), so it is defined once here and used by both.
@@ -1836,8 +1836,32 @@ FS_NANO    = 8    # axis ticks / captions
 # Helpers
 # ---------------------------------------------------------------------------
 
+_BROKER_IMPORT_LOCK = threading.Lock()
+_shared_imports_warm = False
+
+
 def _load_broker(name: str) -> Any:
-    return importlib.import_module(BROKER_MODULES[name])
+    """Import a broker module, first warming the libraries brokers share.
+
+    A batch starts every broker on its own thread. Fidelity imports zendriver
+    at module level while Chase/SoFi/WF import it lazily at login, so two
+    threads could run zendriver's first import at once; Python's per-module
+    import locks then raise "deadlock detected by _ModuleLock(...)", which
+    Chase reports as "Missing dependency zendriver". Importing zendriver fully
+    once, under one lock, means every later import is a sys.modules lookup.
+    """
+    global _shared_imports_warm
+    with _BROKER_IMPORT_LOCK:
+        if not _shared_imports_warm:
+            _shared_imports_warm = True
+            try:
+                import zendriver  # noqa: F401
+                import zendriver.core.keys  # noqa: F401
+            except Exception:
+                # A genuinely missing/broken zendriver still surfaces through
+                # the broker's own import, with its own message.
+                pass
+        return importlib.import_module(BROKER_MODULES[name])
 
 
 def _env(key: str) -> str:
