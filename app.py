@@ -72,7 +72,7 @@ except Exception:  # missing module, missing requests, anything at all
 
 # The release a customer is running — shown in the sidebar footer and stamped
 # on every crash-log START line, so a support report says which build it is.
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 
 # The main window's title. The single-instance guard finds a running copy's
 # window by it (FindWindowW), so it is defined once here and used by both.
@@ -3014,10 +3014,13 @@ def _mirror_retry_at_text() -> str:
 
 #: Nothing-sent failures a retry cannot fix -- the broker refused the order or
 #: the account can't take it. Chase refuses ~37% of pending-split names
-#: outright; re-sending those three times only adds noise.
+#: outright; re-sending those three times only adds noise. Fidelity's (020255)
+#: "Opening buy orders are not allowed online for this security" is the same
+#: refusal in other words.
 _MIRROR_PERMANENT_FAILURE = (
     "rejected", "insufficient", "invalid", "not enough shares", "no tradable",
     "no accounts", "cannot trade specific accounts", "missing ",
+    "not allowed online", "cannot be placed online",
 )
 
 

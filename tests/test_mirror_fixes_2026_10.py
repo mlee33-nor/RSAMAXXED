@@ -742,3 +742,33 @@ def test_an_explicit_toggle_off_is_saved_as_off(tmp_path, monkeypatch):
     Mirror._toggle_mirror_trading(m)
     saved = json.loads((tmp_path / "s.json").read_text(encoding="utf-8"))
     assert saved["enabled"] is False
+
+
+# -- Fidelity "not allowed online" is a refusal, not a retry (2026-10-26) ----
+# MASK: Fidelity answered (020255) on every account. The leg read as
+# nothing-sent but not refused, so mirror re-sent it to Fidelity three times.
+
+_FIDELITY_020255 = "(020255) Opening buy orders are not allowed online for this security."
+
+
+def _fidelity_refused_leg():
+    return {"broker": "fidelity", "ok_accounts": 0, "accounts": [
+        {"account_id": "Fidelity 1 · Individual (Z00000001)", "ok": False,
+         "message": f"Preview failed: {_FIDELITY_020255} — nothing was sent"},
+        {"account_id": "Fidelity 1 · Individual (Z00000002)", "ok": False,
+         "message": f"Skipped: {_FIDELITY_020255}"},
+    ]}
+
+
+def test_fidelity_not_allowed_online_is_not_retried():
+    leg = _fidelity_refused_leg()
+    assert A._mirror_permanent_refusal([leg])
+    assert not A._mirror_leg_retryable(leg)
+
+
+def test_chase_cannot_be_placed_online_is_not_retried():
+    leg = {"broker": "chase", "ok_accounts": 0, "accounts": [
+        {"account_id": "0000", "ok": False,
+         "message": "Your trade cannot be placed online at this time. — nothing was sent"}]}
+    assert A._mirror_permanent_refusal([leg])
+    assert not A._mirror_leg_retryable(leg)

@@ -50,7 +50,7 @@ def test_embed_alert_still_makes_a_reg_alert_pick():
 
 
 def test_version_bumped():
-    assert A.APP_VERSION == "1.1.4"
+    assert A.APP_VERSION == "1.1.5"
 
 
 def test_diagnose_feed_does_not_require_a_plays_key(monkeypatch, capsys):
