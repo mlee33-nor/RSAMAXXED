@@ -39,6 +39,7 @@ from modules.outputs import BrokerOutput, log_event
 from modules import _2fa_prompt
 from modules import atomic
 from modules import market_calendar
+from modules import update_apply, updater
 from modules.canvas_rows import RowCanvas, wrap_lines
 import balances
 import feed_client
@@ -72,7 +73,7 @@ except Exception:  # missing module, missing requests, anything at all
 
 # The release a customer is running — shown in the sidebar footer and stamped
 # on every crash-log START line, so a support report says which build it is.
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.2.0"
 
 # The main window's title. The single-instance guard finds a running copy's
 # window by it (FindWindowW), so it is defined once here and used by both.
@@ -116,10 +117,11 @@ AUTOSELL_STALL_POLL_MS = 60000
 # Every hand-back re-queues the play, and re-queuing it drives another holdings
 # read, and a holdings read is a broker LOGIN. A broker that cannot authenticate
 # at all — SoFi behind a Turnstile human check — therefore turns an unbounded
-# retry into an unbounded login loop against that broker. Three is enough to
-# ride out a dropped session and few enough that a real blocker escalates to a
-# human instead of hammering the door.
-AUTOSELL_MAX_ATTEMPTS = 3
+# retry into an unbounded login loop against that broker. Two (the first try
+# plus ONE retry) rides out a dropped session; three just logged in a third
+# time to hear the same answer, so a real blocker now escalates to a human
+# after one retry instead of hammering the door.
+AUTOSELL_MAX_ATTEMPTS = 2
 
 # How soon the Sell-now board is looked at again after the sell queue drains
 # or a mirror (auto-buy) run finishes. Short on purpose: the day should run
@@ -129,8 +131,10 @@ AUTOSELL_RECHECK_MS = 30000
 
 # How long a handed-back play waits before it may be queued again. With
 # re-checks minutes apart rather than an hour, a broker that cannot log in
-# would otherwise use all AUTOSELL_MAX_ATTEMPTS in one burst.
-AUTOSELL_RETRY_BACKOFF_MS = 10 * 60 * 1000
+# would otherwise use all AUTOSELL_MAX_ATTEMPTS in one burst. 30 min, like a
+# mirror leg retry (MIRROR_LEG_RETRY_MS): 10 min was too soon for a dead
+# session to come back, so the one retry was usually wasted.
+AUTOSELL_RETRY_BACKOFF_MS = 30 * 60 * 1000
 
 # The longest one exit holdings read may take before the brokers still out are
 # treated as unread. Under AUTOSELL_STALL_SECS so a hung read ends on its own
@@ -1082,6 +1086,65 @@ _ASK_GRACE_S = 15
 # verify" so nothing automatic re-sends it, and its broker is released.
 TRADE_LEG_WATCHDOG_SLACK_S = 600
 TRADE_LEG_WATCHDOG_POLL_MS = 60_000
+# The trade budget for a broker with no entry in MIRROR_BROKER_TRADE_BUDGET_S
+# (Chase, Robinhood, Public, Fennel, Schwab, SoFi, IBKR). The watchdog used to
+# give EVERY broker the slowest broker's budget -- 60+ min, hours with several
+# Wells Fargo / Fidelity logins -- so on 2026-10-02 a Chase buy of SUGP sat at
+# "still purchasing" for 2h28m and POAS waited behind it until the app closed.
+# The healthy maximum in the logs is 4m36s (Chase); 5 min + the 10 min slack
+# writes a hung quick broker off at 15 min and lets the queue go on.
+TRADE_LEG_DEFAULT_BUDGET_S = 300
+
+
+def _broker_leg_budget_s(broker: str) -> float:
+    """How long one broker's leg may run before the watchdog writes it off:
+    that broker's OWN trade budget (for its login count) plus the slack."""
+    spec = MIRROR_BROKER_TRADE_BUDGET_S.get(str(broker or "").lower())
+    if spec is None:
+        return TRADE_LEG_DEFAULT_BUDGET_S + TRADE_LEG_WATCHDOG_SLACK_S
+    first, extra = spec
+    try:
+        n = max(1, int(broker_logins.login_count(broker)))
+    except Exception:
+        n = 1
+    return first + extra * (n - 1) + MIRROR_STALL_SLACK_S + TRADE_LEG_WATCHDOG_SLACK_S
+
+
+# Every refusal for a play past its last day to buy carries this text, so the
+# mirror's retry logic (_MIRROR_PERMANENT_FAILURE) never sends it again.
+PAST_LAST_BUY_MARK = "past its last day to buy"
+
+
+def _past_last_buy(symbol: str, picks: Optional[List[Dict[str, Any]]] = None,
+                   today: Optional[date] = None) -> Optional[str]:
+    """The last day to buy (YYYY-MM-DD) when `symbol`'s most recent alert named
+    one and it has passed; None when it is still buyable or never had one.
+
+    Only the newest alert for the symbol counts: a ticker that comes back with
+    a fresh play is buyable again on that play's own dates.
+    """
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return None
+    if picks is None:
+        try:
+            picks = _local_picks()
+        except Exception:
+            return None
+    latest = None
+    for p in picks or ():
+        if not isinstance(p, dict) or str(p.get("symbol") or "").upper() != sym:
+            continue
+        if latest is None or str(p.get("date") or "") > str(latest.get("date") or ""):
+            latest = p
+    if latest is None:
+        return None
+    last = str(latest.get("last_buy") or "")[:10]
+    try:
+        last_d = datetime.strptime(last, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return last if (today or _mirror_today()) > last_d else None
 
 
 def _restart_leg_clock(batch: Optional[dict], broker: str) -> None:
@@ -1560,8 +1623,9 @@ def _mirror_stall_ms() -> int:
         worst = max(worst, (first + extra * (n - 1) + MIRROR_STALL_SLACK_S) * 1000)
     return int(worst)
 # A launch whose every leg failed with nothing sent is handed back for another
-# try at the next check, at most this many launches in all.
-MIRROR_MAX_ATTEMPTS = 3
+# try at the next check, at most this many launches in all: the first try plus
+# ONE retry. Three re-sent the same failing leg every 30 min for an hour.
+MIRROR_MAX_ATTEMPTS = 2
 # Mirror holds its first launch until startup has restored broker sessions and
 # _mirror_resume has run. If the restore never reports, this long after launch
 # the hold is lifted anyway (loudly) rather than never buying again.
@@ -3021,6 +3085,7 @@ _MIRROR_PERMANENT_FAILURE = (
     "rejected", "insufficient", "invalid", "not enough shares", "no tradable",
     "no accounts", "cannot trade specific accounts", "missing ",
     "not allowed online", "cannot be placed online",
+    PAST_LAST_BUY_MARK,
 )
 
 
@@ -5252,6 +5317,8 @@ class App(ctk.CTk):
         # login with nothing but "Missing dependency". Checked off the main
         # thread once the log and notification centre exist; never blocks.
         self.after(1500, self._startup_depcheck)
+        self.after(20000, self._update_report_healthy)
+        self.after(updater.FIRST_CHECK_DELAY_S * 1000, self._update_tick)
         # No plays-password prompt on startup: the hosted feed is open, so a
         # fresh install has nothing to enter and asking would invent friction
         # that the product does not have. _prompt_plays_key stays reachable
@@ -5329,6 +5396,80 @@ class App(ctk.CTk):
             threading.Thread(target=_work, name="depcheck", daemon=True).start()
         except Exception:
             pass
+
+    # ---- Silent updates (modules/updater.py) ------------------------------
+
+    #: How often the update timer wakes: to check GitHub when due, and to see
+    #: whether a staged update can be installed now.
+    UPDATE_TICK_MS = 5 * 60 * 1000
+
+    def _update_report_healthy(self) -> None:
+        """Tell a waiting installer this version came up. It rolls the update
+        back if this never arrives, so it is written only once the window has
+        been up a while, not at import."""
+        try:
+            updater.write_healthy(ROOT_DIR, APP_VERSION)
+        except Exception as exc:                # noqa: BLE001
+            _crash_note("UPDATE", f"could not write healthy marker: {exc}")
+
+    def _update_busy(self) -> bool:
+        """Anything that a restart would cut off: an order out, a mirror run,
+        the sell queue or its holdings read, a broker browser in use, or any
+        counted worker (_run_in_thread) running or finished within the idle
+        window -- the timer only looks every few minutes, and a short trade
+        that fell between two looks must still hold the restart off."""
+        import time
+        stamp = getattr(self, "_worker_stamp", None)
+        recent = (stamp is not None
+                  and time.monotonic() - stamp < updater.IDLE_BEFORE_INSTALL_S)
+        return bool(getattr(self, "_trade_in_flight", False)
+                    or getattr(self, "_brokers_in_flight", None)
+                    or self._mirror_busy()
+                    or getattr(self, "_autosell_queue", None)
+                    or getattr(self, "_queue_busy", False)
+                    or getattr(self, "_workers_running", 0)
+                    or recent
+                    or any(lk.locked() for lk in _browser_locks.values()))
+
+    def _update_tick(self) -> None:
+        self._cancel_timer("_update_tick_id")
+        self._update_tick_id = self.after(self.UPDATE_TICK_MS, self._update_tick)
+        if not updater.enabled():
+            return
+        import time
+        now = time.monotonic()
+        if not hasattr(self, "_update_checker"):
+            self._update_checker = updater.Checker(
+                ROOT_DIR, APP_VERSION,
+                lambda m: self.after(0, lambda m=m: self._log(m, "meta")))
+            self._update_idle = updater.IdleClock(time.monotonic)
+            self._update_next_check = now
+        if now >= self._update_next_check:
+            self._update_next_check = now + updater.CHECK_EVERY_S
+            self._update_checker.start()
+
+        idle_s = self._update_idle.sample(self._update_busy())
+        if idle_s < updater.IDLE_BEFORE_INSTALL_S:
+            return
+        if not updater.quiet_hours(market_calendar.now_et()):
+            return
+        staged = updater.find_staged(ROOT_DIR, APP_VERSION)
+        if staged is None:
+            return
+        if updater.install_mode(ROOT_DIR) == "git" and update_apply.git_unfit_reason(ROOT_DIR):
+            return
+        if self._update_busy():                 # the git check above takes a moment
+            return
+        self._log(f"Update: installing {staged.name} — restarting now, back in a "
+                  f"few seconds", "meta")
+        _crash_note("UPDATE", f"quiet-hours install of {staged.name}")
+        try:
+            updater.launch_installer(ROOT_DIR, staged)
+        except Exception as exc:                # noqa: BLE001 — stay up, try later
+            self._log(f"Update: could not start the installer — {exc}", "warn")
+            return
+        self._update_handoff = True
+        self.destroy()
 
     # ---- Shell scaffolding ------------------------------------------------
 
@@ -7266,6 +7407,8 @@ class App(ctk.CTk):
         self.bind("<Control-k>", lambda e: self._open_command_palette())
         self.bind("<Control-K>", lambda e: self._open_command_palette())
         self.bind("<Control-r>", lambda e: self._global_refresh())
+        self.bind("<Control-f>", lambda e: self._log_focus_search())
+        self.bind("<Control-F>", lambda e: self._log_focus_search())
         # Same order as _NAV_SECTIONS, so Ctrl+N counts down the sidebar. Only
         # the first nine: there is no <Control-Key-10> keysym, and binding one
         # raises at startup rather than failing quietly.
@@ -7687,6 +7830,9 @@ class App(ctk.CTk):
         "bootstrap": ("BOOT", "boot"),
         "command": ("CMD", "cmd"),
         "exported": ("EXPORT", "export"), "export": ("EXPORT", "export"),
+        "auto-sell": ("SELL", "sell"), "exit": ("SELL", "sell"),
+        "queue": ("QUEUE", "queue"), "update": ("UPDATE", "update"),
+        "track": ("TRACK", "track"),
     }
 
     def _log_category(self, msg: str):
@@ -7695,6 +7841,64 @@ class App(ctk.CTk):
             if m.startswith(kw):
                 return spec
         return ("SYS", "sys")
+
+    @staticmethod
+    def _log_is_detail(msg: str) -> bool:
+        stripped = msg.lstrip() if msg else ""
+        return bool(msg) and (msg[:1] in (" ", "\t")
+                              or stripped[:1] in ("✔", "⚠", "✘", "•", "→"))
+
+    #: Words that keep a broker step line visible with steps hidden: the
+    #: step that failed is the one the user needs.
+    _LOG_STEP_KEEP = ("fail", "error", "reject", "not allowed", "timed out",
+                      "timeout", "denied", "refused", "skipping")
+    _LOG_ISSUE_TAGS = frozenset(("error", "fail", "warn", "banner_err",
+                                 "done_err", "done_warn"))
+    _LOG_ISSUE_WORDS = ("⚠", "✘", "failed", "error", "giving up", "verify",
+                        "not allowed", "rejected", "did not confirm")
+
+    def _log_is_step(self, msg: str) -> bool:
+        """Broker step chatter: heartbeats, nav traces, 'Stats: refreshed'.
+        Hidden unless "Broker steps" is on or a search is typed."""
+        m = (msg or "").strip().lower()
+        if not m or any(w in m for w in self._LOG_STEP_KEEP):
+            return False
+        if m.startswith("stats: refreshed"):
+            return True
+        if not self._log_is_detail(msg):
+            return False
+        # "fidelity: LOGIN | goto=…", "fidelity: TRADE | … | action BUY set"
+        head, _, rest = m.partition(": ")
+        if rest and " " not in head and " | " in rest[:40]:
+            return True
+        return any(w in m for w in ("still purchasing", "fetching fill price",
+                                    "starting trade", "still selling"))
+
+    def _log_is_issue(self, msg: str, tag: Optional[str]) -> bool:
+        if tag in self._LOG_ISSUE_TAGS:
+            return True
+        m = (msg or "").lower()
+        return any(w in m for w in self._LOG_ISSUE_WORDS)
+
+    def _log_visible(self, msg: str, tag: Optional[str], cat: str) -> bool:
+        q = (getattr(self, "_log_query", "") or "").strip().lower()
+        if q:
+            return q in (msg or "").lower()
+        if not msg:
+            return True
+        view = getattr(self, "_log_view", "all")
+        if view == "issues":
+            return self._log_is_issue(msg, tag)
+        if view == "trades" and cat not in ("trade", "sell"):
+            # "✘ Nothing bought…", "⚠ Bought X with errors…" follow a Mirror
+            # line, so they carry its category; they are still trade outcomes.
+            if not (self._log_is_detail(msg) and msg.lstrip()[:1] in ("✔", "⚠", "✘")):
+                return False
+        if view == "mirror" and cat != "mirror":
+            return False
+        if not getattr(self, "_log_show_steps", False) and self._log_is_step(msg):
+            return False
+        return True
 
     #: How much session history the Activity feed keeps.
     #:
@@ -7712,33 +7916,173 @@ class App(ctk.CTk):
 
     def _log(self, msg: str, tag: Optional[str] = None) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
-        self._log_lines.append((f"{ts}  {msg}", tag))
+        # A detail line belongs to the top-level line above it, so the
+        # Trades / Mirror filters keep a broker's sub-steps with their parent.
+        if msg and not self._log_is_detail(msg):
+            self._log_cur_cat = self._log_category(msg)[1]
+        cat = getattr(self, "_log_cur_cat", "sys")
+        self._log_lines.append((f"{ts}  {msg}", tag, cat))
         _activity_note(f"{ts}  {msg}")
         if len(self._log_lines) > self.LOG_MAX_LINES:
             # Trim in one slice rather than popping per line.
             del self._log_lines[:len(self._log_lines) - self.LOG_MAX_LINES]
         if not hasattr(self, "_log_text"):
             return
+        if not self._log_visible(msg, tag, cat):
+            self._log_update_count()
+            return
+        self._log_shown = getattr(self, "_log_shown", 0) + 1
+        self._log_update_count()
         t = self._log_text
+        follow = self._log_at_bottom()
         t.configure(state="normal")
         self._trim_log_widget(t)
-        t.insert("end", f"{ts}  ", "ts")
-        stripped = msg.lstrip() if msg else ""
-        is_detail = bool(msg) and (msg[:1] in (" ", "\t")
-                                   or stripped[:1] in ("✔", "⚠", "✘", "•", "→"))
+        self._log_render(t, ts, msg, tag)
+        t.configure(state="disabled")
+        if follow:
+            t.see("end")
+        else:
+            self._log_show_jump(True)
+
+    def _log_render(self, t: tk.Text, ts: str, msg: str, tag: Optional[str]) -> None:
+        """One feed line: muted time, a fixed-width category badge (top-level
+        lines only), then the message. The badge already says "MIRROR", so a
+        leading "Mirror: " is not printed twice."""
+        start = t.index("end-1c")
+        is_detail = self._log_is_detail(msg)
+        t.insert("end", f"{ts}   ", "ts")
         if msg and not is_detail:
             label, key = self._log_category(msg)
-            t.insert("end", f" {label} ", f"badge_{key}")
+            t.insert("end", f" {label:^6} ", f"badge_{key}")
             t.insert("end", "  ")
+            low = msg.lower()
+            for kw in self._LOG_BADGES:
+                if low.startswith(kw + ":"):
+                    msg = msg[len(kw) + 1:].lstrip()
+                    break
         elif is_detail:
-            t.insert("end", "     ")   # indent so detail nests under its parent
-        if tag:
-            t.insert("end", msg, tag)
-        else:
-            t.insert("end", msg)
+            t.insert("end", "    ")   # indent so detail nests under its parent
+            msg = msg.lstrip(" \t")
+        msg_start = t.index("end-1c")
+        t.insert("end", msg, (tag,) if tag else ())
         t.insert("end", "\n")
-        t.see("end")
+        t.tag_add("detail" if is_detail else "head", start, "end-1c")
+        q = (getattr(self, "_log_query", "") or "").strip()
+        if q and msg:
+            # Character offsets from the message start: a message can hold
+            # newlines (a broker's HTML error page), so no line.col math.
+            low, ql, i = msg.lower(), q.lower(), 0
+            while True:
+                i = low.find(ql, i)
+                if i < 0:
+                    break
+                t.tag_add("hit", f"{msg_start}+{i}c", f"{msg_start}+{i + len(q)}c")
+                i += len(q)
+
+    def _log_at_bottom(self) -> bool:
+        try:
+            return self._log_text.yview()[1] >= 0.999
+        except (tk.TclError, AttributeError):
+            return True
+
+    def _log_rerender(self) -> None:
+        """Redraw the feed from the stored history under the current search
+        and filter."""
+        t = getattr(self, "_log_text", None)
+        if t is None:
+            return
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        shown = 0
+        for entry in self._log_lines[-self.LOG_MAX_LINES:]:
+            line, tag, cat = (tuple(entry) + (None, "sys"))[:3]
+            ts, msg = line[:8], line[10:]
+            if self._log_visible(msg, tag, cat):
+                self._log_render(t, ts, msg, tag)
+                shown += 1
+        if not shown and self._log_lines:
+            t.insert("end", "\n   Nothing matches. ", "meta")
+            t.insert("end", "Clear the search or pick All.", "meta")
         t.configure(state="disabled")
+        t.see("end")
+        self._log_show_jump(False)
+        self._log_update_count(shown)
+
+    def _log_update_count(self, shown: Optional[int] = None) -> None:
+        lbl = getattr(self, "_log_count_lbl", None)
+        if lbl is None:
+            return
+        total = len(self._log_lines)
+        if shown is None:
+            shown = getattr(self, "_log_shown", total)
+        else:
+            self._log_shown = shown
+        shown = min(shown, total)
+        lbl.configure(text=(f"{total} lines" if shown >= total
+                            else f"{shown} of {total} lines"))
+
+    def _log_show_jump(self, on: bool) -> None:
+        btn = getattr(self, "_log_jump", None)
+        if btn is None:
+            return
+        if on and not btn.winfo_manager():
+            btn.place(relx=1.0, rely=1.0, x=-28, y=-14, anchor="se")
+        elif not on and btn.winfo_manager():
+            btn.place_forget()
+
+    def _log_paint_chips(self) -> None:
+        view = getattr(self, "_log_view", "all")
+        for key, chip in getattr(self, "_log_chips", {}).items():
+            sel = key == view
+            chip.configure(bg=BG_CARD_ALT if sel else BG_CARD,
+                           fg=TEXT_PRIMARY if sel else TEXT_MUTED)
+        chip = getattr(self, "_log_steps_chip", None)
+        if chip is not None:
+            on = getattr(self, "_log_show_steps", False)
+            chip.configure(text=("☑  Broker steps" if on else "☐  Broker steps"),
+                           fg=TEXT_PRIMARY if on else TEXT_MUTED)
+
+    def _log_set_view(self, view: str) -> None:
+        self._log_view = view
+        self._log_paint_chips()
+        self._log_rerender()
+
+    def _log_toggle_steps(self) -> None:
+        self._log_show_steps = not getattr(self, "_log_show_steps", False)
+        self._log_paint_chips()
+        self._log_rerender()
+
+    def _log_search_changed(self) -> None:
+        # Debounced: every keystroke would otherwise redraw 2,000 lines.
+        pending = getattr(self, "_log_search_after", None)
+        if pending:
+            try:
+                self.after_cancel(pending)
+            except (tk.TclError, ValueError):
+                pass
+        self._log_search_after = self.after(180, self._log_search_apply)
+
+    def _log_search_apply(self) -> None:
+        self._log_search_after = None
+        ent = getattr(self, "_log_search", None)
+        q = ent.get() if ent is not None else ""
+        self._log_query = q
+        clear = getattr(self, "_log_search_clear", None)
+        if clear is not None:
+            clear.configure(fg=TEXT_MUTED if q else BG_INPUT)
+        self._log_rerender()
+
+    def _log_search_reset(self) -> None:
+        ent = getattr(self, "_log_search", None)
+        if ent is not None:
+            ent.delete(0, "end")
+        self._log_search_apply()
+
+    def _log_focus_search(self) -> None:
+        ent = getattr(self, "_log_search", None)
+        if ent is not None and self._active_nav == "logs":
+            ent.focus_set()
+            ent.select_range(0, "end")
 
     def _trim_log_widget(self, t: tk.Text) -> None:
         """Drop the oldest lines from the Activity feed once it is over cap.
@@ -7755,8 +8099,35 @@ class App(ctk.CTk):
             return
         t.delete("1.0", f"{lines - self.LOG_MAX_LINES}.0")
 
+    #: Workers that only read market quotes. They run every 45s, touch no
+    #: broker session and can be cut off at any moment, so they never count
+    #: as work an update has to wait for.
+    _IDLE_EXEMPT_WORKERS = frozenset(("_quote_worker", "_quote_one_worker",
+                                      "_quote_many_worker"))
+
     def _run_in_thread(self, target, *args) -> None:
-        threading.Thread(target=target, args=args, daemon=True).start()
+        if getattr(target, "__name__", "") in self._IDLE_EXEMPT_WORKERS:
+            threading.Thread(target=target, args=args, daemon=True).start()
+            return
+        # Everything else (trades, bootstraps -- which may sit at a 2FA
+        # prompt -- Refresh All, feed pulls) is counted, and its last start
+        # or finish stamped, so an update never restarts the app under it
+        # (_update_busy).
+        lock = self.__dict__.setdefault("_workers_lock", threading.Lock())
+
+        def _counted() -> None:
+            import time
+            with lock:
+                self._workers_running = getattr(self, "_workers_running", 0) + 1
+                self._worker_stamp = time.monotonic()
+            try:
+                target(*args)
+            finally:
+                with lock:
+                    self._workers_running -= 1
+                    self._worker_stamp = time.monotonic()
+
+        threading.Thread(target=_counted, daemon=True).start()
 
     def _cancel_timer(self, attr: str) -> None:
         """Cancel the pending `after` held on `self.<attr>`, if any.
@@ -12052,6 +12423,16 @@ class App(ctk.CTk):
         # "pre" may have an order behind it -- see the except below.
         stage = "pre"
         try:
+            # Hard stop, for every buy (mirror, retry, desk): never open a
+            # play past its last day to buy. Raised at "pre", so it reads as
+            # nothing sent, and PAST_LAST_BUY_MARK keeps mirror from retrying.
+            if side == "buy":
+                last = _past_last_buy(symbol, getattr(self, "_quick_picks", None)
+                                      or None)
+                if last:
+                    raise RuntimeError(
+                        f"{symbol.upper()} not bought — {PAST_LAST_BUY_MARK} "
+                        f"({last}); the play is closed")
             if slot is not None:
                 self.after(0, lambda b=broker, busy=slot.locked(): self._log(
                     f"  {b}: waiting for browser..." if busy else f"  {b}: starting trade..."))
@@ -12660,11 +13041,12 @@ class App(ctk.CTk):
 
     def _trade_leg_watchdog_check(self, batch: dict) -> None:
         now = datetime.now()
-        budget = _mirror_stall_ms() / 1000 + TRADE_LEG_WATCHDOG_SLACK_S
         started = batch.get("started") or now
         legs = batch.get("leg_started") or {}
         overdue = []
         for broker in sorted(batch.get("pending") or ()):
+            # Per broker: a hung Chase leg must not get Wells Fargo's hours.
+            budget = _broker_leg_budget_s(broker)
             t0 = legs.get(broker)
             # A leg still waiting for its browser gets that wait on top: the
             # lock acquire is bounded by itself and reports when it gives up.
@@ -17024,9 +17406,14 @@ class App(ctk.CTk):
         if not gate.get("last_buy") and pick.get("last_buy"):
             gate = dict(gate, last_buy=pick["last_buy"])
         if not self._mirror_pick_age_ok(gate):
-            self._mirror_log_msg(
-                f"{symbol}: aged past the {self._mirror_max_age_days()}-trading-day "
-                f"limit while queued — skipped")
+            last = str(gate.get("last_buy") or "")[:10]
+            if last and _mirror_today().isoformat() > last:
+                self._mirror_log_msg(
+                    f"{symbol}: rejected — {PAST_LAST_BUY_MARK} ({last})")
+            else:
+                self._mirror_log_msg(
+                    f"{symbol}: aged past the {self._mirror_max_age_days()}-trading-day "
+                    f"limit while queued — skipped")
             if only:
                 _mirror_owed_done(self, only, pick)
                 self._save_mirror_state()
@@ -21854,21 +22241,90 @@ class App(ctk.CTk):
                  font=(ICON_FONT, 12)).pack(side="left", padx=(0, 8))
         tk.Label(log_head, text="Session Activity", bg=BG_CARD, fg=TEXT_PRIMARY,
                  font=(FONT_FAMILY, 13, "bold")).pack(side="left")
-        tk.Label(log_head, text="EVERY BROKER OP · TRADE · ALERT", bg=BG_CARD,
-                 fg=TEXT_MUTED, font=(FONT_FAMILY, 7, "bold")).pack(side="right")
+        self._log_count_lbl = tk.Label(log_head, text="", bg=BG_CARD,
+                                       fg=TEXT_MUTED, font=(FONT_FAMILY, 8, "bold"))
+        self._log_count_lbl.pack(side="right")
+
+        # ---- Toolbar: search · view chips · broker steps -------------------
+        bar = tk.Frame(log_card.inner, bg=BG_CARD)
+        bar.pack(fill="x", padx=16, pady=(2, 10), side="top")
+        sb = ctk.CTkFrame(bar, corner_radius=9, fg_color=BG_INPUT,
+                          bg_color=BG_CARD, border_width=1, border_color=BORDER)
+        sb.pack(side="left", fill="x", expand=True, padx=(0, 12))
+        tk.Label(sb, text=icon("search"), bg=BG_INPUT, fg=TEXT_MUTED,
+                 font=(ICON_FONT, 11)).pack(side="left", padx=(11, 7), pady=6)
+        self._log_search = tk.Entry(sb, bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0,
+                                    relief="flat", insertbackground=TEXT_PRIMARY,
+                                    highlightthickness=0, font=(FONT_FAMILY, 10))
+        self._log_search.pack(side="left", fill="x", expand=True, pady=6)
+        self._log_search_clear = tk.Label(sb, text=icon("close"), bg=BG_INPUT,
+                                          fg=BG_INPUT, font=(ICON_FONT, 9),
+                                          cursor="hand2")
+        self._log_search_clear.pack(side="right", padx=(6, 10))
+        self._log_search_clear.bind("<Button-1>", lambda e: self._log_search_reset())
+        ph = tk.Label(sb, text="Search the log — ticker, broker, error…  (Ctrl F)",
+                      bg=BG_INPUT, fg=TEXT_MUTED, font=(FONT_FAMILY, 10))
+
+        def _placeholder(_e=None):
+            try:
+                focused = self.focus_get() is self._log_search
+            except (KeyError, tk.TclError):
+                focused = False
+            if self._log_search.get() or focused:
+                ph.place_forget()
+            else:
+                ph.place(in_=self._log_search, x=0, rely=0.5, anchor="w")
+        ph.bind("<Button-1>", lambda e: self._log_search.focus_set())
+        self._log_search.bind("<FocusIn>", _placeholder)
+        self._log_search.bind("<FocusOut>", _placeholder)
+        self._log_search.bind("<KeyRelease>", lambda e: (_placeholder(),
+                                                         self._log_search_changed()))
+        self._log_search.bind("<Escape>", lambda e: (self._log_search_reset(),
+                                                     _placeholder()))
+        self.after_idle(_placeholder)
+
+        chips = tk.Frame(bar, bg=BG_CARD)
+        chips.pack(side="left")
+        self._log_chips = {}
+        for key, text in (("all", "All"), ("trades", "Trades"),
+                          ("mirror", "Mirror"), ("issues", "Issues")):
+            chip = tk.Label(chips, text=text, bg=BG_CARD, fg=TEXT_MUTED,
+                            font=(FONT_FAMILY, 9, "bold"), padx=11, pady=5,
+                            cursor="hand2")
+            chip.pack(side="left", padx=1)
+            chip.bind("<Button-1>", lambda e, k=key: self._log_set_view(k))
+            self._log_chips[key] = chip
+        tk.Frame(bar, bg=BORDER, width=1, height=18).pack(side="left", padx=10)
+        self._log_steps_chip = tk.Label(bar, text="", bg=BG_CARD,
+                                        font=(FONT_FAMILY, 9, "bold"),
+                                        cursor="hand2")
+        self._log_steps_chip.pack(side="left")
+        self._log_steps_chip.bind("<Button-1>", lambda e: self._log_toggle_steps())
+
         tk.Frame(log_card.inner, bg=BORDER, height=1).pack(fill="x", padx=16,
                                                            side="top")
 
         self._log_text = tk.Text(log_card.inner, bg=BG_CARD, fg=TEXT_PRIMARY,
                                  font=(FONT_MONO, 10), bd=0, wrap="word",
                                  state="disabled", insertbackground=TEXT_PRIMARY,
-                                 highlightthickness=0, padx=16, pady=12,
-                                 spacing1=1, spacing3=2)
+                                 highlightthickness=0, padx=18, pady=12,
+                                 spacing1=2, spacing3=2)
         scrollbar = ttk.Scrollbar(log_card.inner, orient="vertical",
                                   command=self._log_text.yview)
-        self._log_text.configure(yscrollcommand=scrollbar.set)
+
+        def _yscroll(first, last):
+            scrollbar.set(first, last)
+            if float(last) >= 0.999:
+                self._log_show_jump(False)
+        self._log_text.configure(yscrollcommand=_yscroll)
         self._log_text.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y", pady=4)
+        self._log_jump = tk.Label(log_card.inner, text="↓  Jump to latest",
+                                  bg=ACCENT, fg=TEXT_PRIMARY,
+                                  font=(FONT_FAMILY, 9, "bold"), padx=12, pady=5,
+                                  cursor="hand2")
+        self._log_jump.bind("<Button-1>", lambda e: (self._log_text.see("end"),
+                                                     self._log_show_jump(False)))
 
         # color tags for status lines + completion summary
         self._log_text.tag_configure("ts", foreground=TEXT_MUTED)
@@ -21901,23 +22357,29 @@ class App(ctk.CTk):
             "pick": GREEN, "watch": TEXT_SECONDARY, "dash": TEXT_SECONDARY,
             "stats": TEXT_SECONDARY, "boot": TEXT_SECONDARY, "cmd": TEXT_SECONDARY,
             "export": TEXT_SECONDARY, "sys": TEXT_MUTED,
+            "sell": GREEN, "queue": BLUE, "update": TEXT_SECONDARY,
+            "track": BLUE,
         }
         for _key, _col in _badge_cols.items():
             self._log_text.tag_configure(
                 f"badge_{_key}", foreground=_col,
                 background=_blend(_col, BG_CARD, 0.78),
-                font=(FONT_FAMILY, 8, "bold"))
+                font=(FONT_MONO, 8, "bold"))
+        # Breathing room above each top-level line groups it with its details;
+        # detail text is a step quieter than the line it belongs to.
+        self._log_text.tag_configure("head", spacing1=9)
+        self._log_text.tag_configure("detail", foreground=TEXT_SECONDARY,
+                                     font=(FONT_MONO, 9))
+        self._log_text.tag_configure("hit", background=_blend(YELLOW, BG_CARD, 0.15),
+                                     foreground="#0a0a12")
+        for _t in ("ts", "success", "ok", "error", "fail", "warn", "meta",
+                   "banner_ok", "banner_err", "done_ok", "done_warn", "done_err",
+                   "done_none", "hit"):
+            self._log_text.tag_raise(_t)
 
-        if self._log_lines:
-            self._log_text.configure(state="normal")
-            for entry in self._log_lines[-self.LOG_MAX_LINES:]:
-                line, tag = entry if isinstance(entry, tuple) else (entry, None)
-                start = self._log_text.index("end-1c")
-                self._log_text.insert("end", line + "\n")
-                if tag:
-                    self._log_text.tag_add(tag, start, f"{start} lineend")
-            self._log_text.see("end")
-            self._log_text.configure(state="disabled")
+        self._log_query = ""
+        self._log_paint_chips()
+        self._log_rerender()
 
     # ---- Live activity strip + completion receipt -------------------------
 
@@ -22340,15 +22802,60 @@ def _single_instance_or_exit() -> None:
     _crash_note("SECOND COPY", "another RSAMAXXED is already running — exiting "
                                "without touching state")
     _notify_already_running()
-    raise SystemExit(0)
+    # Not 0: an update installer watching this start reads this code as
+    # "another copy has the lock", not as a broken release.
+    raise SystemExit(update_apply.EXIT_ALREADY_RUNNING)
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _update_recover_or_exit() -> None:
+    """Run BEFORE the single-instance lock (modules/updater.py).
+
+    While an update is being installed -- or the installer is watching the
+    new version come up -- a copy started by hand must stay out of the way:
+    taking the lock would make the installer's own copy exit, and the
+    installer would read that as a broken release. An interrupted install
+    that was just undone means this process may have imported half-new code,
+    so it starts a clean copy of itself and exits.
+    """
+    what = updater.startup_recover(ROOT_DIR)
+    if what == "run":
+        return
+    if what == "busy":
+        _crash_note("UPDATE", "an update is being installed — not starting")
+        try:
+            if sys.platform == "win32":
+                import ctypes
+                ctypes.WinDLL("user32").MessageBoxW(
+                    None, "RSAMAXXED is finishing an update and will open by "
+                          "itself in a moment.", "RSAMAXXED",
+                    0x0 | 0x40 | 0x10000 | 0x40000)
+        except Exception:
+            pass
+        raise SystemExit(0)
+    _crash_note("UPDATE", "undid an interrupted update — restarting clean")
+    from modules import quiet
+    quiet.popen([sys.executable, str(ROOT_DIR / "app.py")],
+                cwd=str(ROOT_DIR), close_fds=True)
+    raise SystemExit(0)
+
+
+def _update_install_or_continue() -> None:
+    """Run after the lock, before App(): a staged update that needs no pip
+    install goes in now, while nothing is trading. The installer waits for
+    this process to exit, swaps the files and starts the new version."""
+    if updater.startup_install(ROOT_DIR, APP_VERSION,
+                               lambda m: _crash_note("UPDATE", m)):
+        raise SystemExit(0)
+
+
 if __name__ == "__main__":
+    _update_recover_or_exit()
     _single_instance_or_exit()
+    _update_install_or_continue()
     app = App()
     app.mainloop()
     # Reached only when the root window has gone. Under `pyw` this is the last
@@ -22356,3 +22863,7 @@ if __name__ == "__main__":
     # means the window was torn down, and one that ends without it means the
     # process was killed outright.
     _crash_note("MAINLOOP RETURNED")
+    # Handed over to the updater: it is waiting for this pid to end, and a
+    # stray non-daemon thread must not keep a windowless copy alive.
+    if getattr(app, "_update_handoff", False):
+        os._exit(0)

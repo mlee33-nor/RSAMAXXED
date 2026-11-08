@@ -20,6 +20,9 @@ pytz>=2023.3
 tzdata>=2023.3
 # Draws the app icon (logo.py).
 pillow>=10.0.0,<13
+# Checks the signature on every silent update (modules/updater.py). robin-stocks
+# already pulls it in; named here because the updater must never lose it.
+cryptography>=42,<47
 
 # --- Broker libraries ------------------------------------------------------
 robin-stocks==3.4.0

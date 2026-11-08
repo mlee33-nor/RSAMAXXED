@@ -657,7 +657,8 @@ def test_a_launch_that_sent_nothing_is_handed_back(monkeypatch):
     monkeypatch.setattr(A, "_verify_manually_accounts", A._verify_manually_accounts)
     m = Mirror()
     key = ("2026-10-09", "AAA")
-    for attempt in (1, 2):
+    # Handed back until MIRROR_MAX_ATTEMPTS is used up (first try + 1 retry).
+    for attempt in range(1, A.MIRROR_MAX_ATTEMPTS):
         m._mirror_executed.add(key)
         Mirror._mirror_record_outcome(m, _failed_batch(REJECT), 0, 1)
         assert key not in m._mirror_executed, f"attempt {attempt} forfeited the pick"

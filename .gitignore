@@ -94,3 +94,8 @@ roundup_radar.json
 
 # Cross-process journal locks (modules/atomic.file_lock).
 *.json.lock
+
+# Silent updates: staged downloads, backups, the installer's journal. Per machine.
+updates/
+# Release builds made by release.py (uploaded to GitHub, never committed).
+dist/

@@ -177,7 +177,9 @@ def test_the_owed_leg_waits_out_its_back_off(monkeypatch):
     assert [(q["_only"], q["_attempts"]) for q in m._mirror_queue] == [("chase", "1")]
 
 
-def test_an_owed_retry_is_bounded_then_surfaced():
+def test_an_owed_retry_is_bounded_then_surfaced(monkeypatch):
+    # The bounding mechanism, at a 3-attempt cap; the real cap is checked below.
+    monkeypatch.setattr(A, "MIRROR_MAX_ATTEMPTS", 3)
     m = _Mirror()
     key = ("2026-10-09", "AAA")
     login = _res("chase", errors=["Login failed"])
@@ -186,6 +188,17 @@ def test_an_owed_retry_is_bounded_then_surfaced():
     assert key not in m._mirror_failed
     m._mirror_owed = []
     A.App._mirror_record_outcome(m, _batch(login, owed="chase", owed_attempts=2), 0, 1)
+    assert m._mirror_owed == []
+    assert key in m._mirror_failed and "short Chase" in m._mirror_failed_notes[key]
+
+
+def test_an_owed_retry_gets_one_retry_only():
+    """The first retry that also fails is surfaced, not sent a third time."""
+    assert A.MIRROR_MAX_ATTEMPTS == 2
+    m = _Mirror()
+    key = ("2026-10-09", "AAA")
+    login = _res("chase", errors=["Login failed"])
+    A.App._mirror_record_outcome(m, _batch(login, owed="chase", owed_attempts=1), 0, 1)
     assert m._mirror_owed == []
     assert key in m._mirror_failed and "short Chase" in m._mirror_failed_notes[key]
 

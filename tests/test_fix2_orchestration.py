@@ -321,7 +321,7 @@ def _batch(brokers, started):
 
 
 def test_watchdog_settles_a_leg_that_never_reports(monkeypatch):
-    monkeypatch.setattr(A, "_mirror_stall_ms", lambda: 60_000)
+    monkeypatch.setattr(A, "_broker_leg_budget_s", lambda b: 60)  # per-broker budget
     monkeypatch.setattr(A, "TRADE_LEG_WATCHDOG_SLACK_S", 0)
     app = BatchApp(["fidelity", "robinhood"])
     now = datetime.now()
@@ -357,7 +357,7 @@ def test_watchdog_settles_a_leg_that_never_reports(monkeypatch):
 
 
 def test_watchdog_gives_a_leg_waiting_for_its_browser_the_lock_wait(monkeypatch):
-    monkeypatch.setattr(A, "_mirror_stall_ms", lambda: 60_000)
+    monkeypatch.setattr(A, "_broker_leg_budget_s", lambda b: 60)  # per-broker budget
     monkeypatch.setattr(A, "TRADE_LEG_WATCHDOG_SLACK_S", 0)
     app = BatchApp(["fidelity"])
     batch = _batch(["fidelity"], datetime.now() - timedelta(minutes=5))

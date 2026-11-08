@@ -214,9 +214,11 @@ def test_prefixed_login_rows_are_login_labels():
     assert not A._is_login_label("Fidelity 2 · Individual (Z00000001)")
 
 
-def test_aimed_retry_login_failure_never_widens(sim):
+def test_aimed_retry_login_failure_never_widens(sim, monkeypatch):
     """A retry aimed at one account whose login then fails whole stays aimed
     at that account: owing the login's row would re-buy its filled accounts."""
+    # Needs a cap that allows a further retry after this one to see the aim.
+    monkeypatch.setattr(A, "MIRROR_MAX_ATTEMPTS", 3)
     sim.clock.set_et(datetime(2026, 10, 5, 9, 44, 59))
     sim.seed_mirror()
     sim.seed_autosell(enabled=False)

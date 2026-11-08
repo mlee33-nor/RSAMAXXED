@@ -472,10 +472,33 @@ CONTENTS
 
 ┌─ 13. UPDATING ──────────────────────────────────────────────────────────────
 │
+│  RSAMAXXED UPDATES ITSELF. You do not need to do anything.
+│
+│     -  It checks for a new version every few hours and downloads it in
+│        the background.
+│     -  The update goes in the next time you start the app (a few
+│        seconds), or overnight / at the weekend if you leave it running.
+│        It never restarts while an order, mirror buy or sell is running,
+│        or during market hours.
+│     -  Every update is signed. The app refuses anything that was not
+│        signed by RSAMAXXED, even if it came from GitHub.
+│     -  Your .env, trades, saved sign-ins and logs are never touched.
+│     -  If a new version fails to start, the app puts the previous
+│        version back on its own and skips that update.
+│     -  What happened is written to logs\update.log.
+│
+│  To turn it off, add this line to your .env:   RSA_AUTO_UPDATE=false
+│  A git install with changes of your own, or on a branch other than
+│  main, is never updated automatically.
+│
+│  The rest of this section is for updating BY HAND, which is only needed
+│  if automatic updates are off, or to get onto a version that has them
+│  (v1.2.0 and later).
+│
 │  Check the version at the bottom of the left sidebar, and compare it
 │  with the latest release on GitHub:
 │     https://github.com/mlee33-nor/RSAMAXXED/releases
-│  The current version is v1.1.3. Close RSAMAXXED before updating.
+│  Close RSAMAXXED before updating.
 │
 │  IF YOU INSTALLED WITH GIT
 │     1.  In the app folder run:   git pull
