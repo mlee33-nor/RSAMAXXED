@@ -253,12 +253,13 @@ class Market:
 # =========================================================================
 
 #: How each broker labels itself on a whole-login failure row.
-LOGIN_LABEL = {"chase": "Chase", "fennel": "Fennel", "fidelity": "Fidelity",
+LOGIN_LABEL = {"aries": "Aries", "chase": "Chase", "fennel": "Fennel", "fidelity": "Fidelity",
                "ibkr": "IBKR", "public": "Public", "robinhood": "Robinhood",
                "schwab": "Schwab", "sofi": "SoFi", "wellsfargo": "Wells Fargo"}
 
 #: Accounts per login, by broker. Public and Fidelity have two logins.
 FLEET: Dict[str, List[List[str]]] = {
+    "aries": [["Aries (5001)", "Aries (5002)"]],
     "chase": [["CHASE (...1001)", "CHASE (...1002)", "CHASE (...1003)"]],
     "fennel": [["Fennel · Individual (F0001)", "Fennel · Individual (F0002)"]],
     "fidelity": [["Fidelity 1 - Individual (Z10001)", "Fidelity 1 - Roth IRA (Z10002)"],
@@ -274,7 +275,7 @@ FLEET: Dict[str, List[List[str]]] = {
                     "WELLSTRADE (****1003)"]],
 }
 
-ACCOUNT_BROKERS = ("fidelity", "wellsfargo", "ibkr")   # take only_accounts
+ACCOUNT_BROKERS = ("fidelity", "wellsfargo", "ibkr", "aries")   # take only_accounts
 
 #: Order-time failure modes.
 #:   ok              every account fills
@@ -424,6 +425,8 @@ class FakeBroker:
             return {f"Fidelity {i}"}
         if self.name == "ibkr":
             return {"IBKR" if i == 1 else f"IBKR {i}"}
+        if self.name == "aries":
+            return {"Aries" if i == 1 else f"Aries {i}"}
         if self.name == "wellsfargo":
             if i == 1:
                 return {"Wells Fargo", "Wells Fargo 1"}

@@ -91,7 +91,7 @@ def test_8_the_refused_copy_exits_before_touching_any_state(tmp_path, monkeypatc
     try:
         with pytest.raises(SystemExit) as exc:
             A._single_instance_or_exit()
-        assert exc.value.code == 0 and told == [1]
+        assert exc.value.code == A.update_apply.EXIT_ALREADY_RUNNING and told == [1]
     finally:
         A._release_single_instance(name)
     assert {p.name: p.read_bytes() for p in state.iterdir()} == before
@@ -142,7 +142,8 @@ def test_9_corrupt_trades_json_with_a_backup_recovers_and_rebuys_nothing(sim):
     assert_no_duplicates(sim)
     assert not sim.orders(symbol="AAA")
     assert sim.ledger(side="buy") == sim.every_account("BBB")
-    assert len(sim.journal(symbol="AAA")) == 25, "recovered history lost"
+    assert len(sim.journal(symbol="AAA")) == len(sim.every_account("AAA")), \
+        "recovered history lost"
     assert sim.idle_ok() == []
 
 

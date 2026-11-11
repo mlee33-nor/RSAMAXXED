@@ -99,3 +99,8 @@ roundup_radar.json
 updates/
 # Release builds made by release.py (uploaded to GitHub, never committed).
 dist/
+
+# Public fee guard: the halt flag, and the API evidence log (account last-4s
+# and order ids; it is the user's record, not the product's).
+public_fee_halt.json
+evidence/

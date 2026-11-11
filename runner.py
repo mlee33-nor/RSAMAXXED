@@ -31,6 +31,7 @@ load_dotenv(ENV_FILE, override=True, interpolate=False)
 
 
 BROKER_MODULES = {
+    "aries": "aries",
     "chase": "chase",
     "fennel": "fennel",
     "fidelity": "fidelity",

@@ -14,6 +14,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import broker_logins
+import public_evidence
+import public_fees
 from modules.broker_logging import log_exception, write_log
 from modules.outputs import AccountOutput, BrokerOutput, HoldingRow
 
@@ -213,6 +215,56 @@ class _PublicClient:
             raise RuntimeError(f"Portfolio fetch failed: HTTP {r.status_code} - {r.text}")
         return r.json() or {}
 
+    def preflight_equity_market_order(
+        self,
+        *,
+        account_id: str,
+        side: str,
+        symbol: str,
+        quantity: str,
+        market_session: str = "CORE",
+        tif: str = "DAY",
+    ) -> Dict[str, Any]:
+        """Public's non-mutating cost estimate for an order: commission and
+        regulatory fees. Never places anything."""
+        requests = self._requests()
+        url = f"{API_BASE}/userapigateway/trading/{account_id}/preflight/single-leg"
+        body: Dict[str, Any] = {
+            "instrument": {"symbol": symbol, "type": "EQUITY"},
+            "orderSide": side,
+            "orderType": "MARKET",
+            "expiration": {"timeInForce": tif},
+            "quantity": quantity,
+        }
+        if market_session:
+            body["equityMarketSession"] = market_session
+        try:
+            r = requests.post(url, json=body, headers=self._headers(), timeout=20)
+        except Exception as e:
+            public_evidence.record_http("preflight", account=_safe_last4(account_id),
+                                        request=body, error=str(e))
+            raise
+        public_evidence.record_http("preflight", account=_safe_last4(account_id),
+                                    request=body, response=r)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Preflight failed: HTTP {r.status_code} - {r.text[:300]}")
+        return r.json() or {}
+
+    def get_history(self, account_id: str, *, start: Optional[str] = None,
+                    next_token: Optional[str] = None) -> Dict[str, Any]:
+        """One page of account history (trades, fees, money movement)."""
+        requests = self._requests()
+        url = f"{API_BASE}/userapigateway/trading/{account_id}/history"
+        params: Dict[str, Any] = {}
+        if start:
+            params["start"] = start
+        if next_token:
+            params["nextToken"] = next_token
+        r = requests.get(url, headers=self._headers(), params=params, timeout=15)
+        if r.status_code >= 400:
+            raise RuntimeError(f"History fetch failed: HTTP {r.status_code} - {r.text[:300]}")
+        return r.json() or {}
+
     def place_equity_market_order(
         self,
         *,
@@ -245,15 +297,20 @@ class _PublicClient:
             raise RuntimeError(f"Public sign-in refresh failed ({e}) — nothing was sent") from e
         try:
             r = requests.post(url, json=body, headers=headers, timeout=30)
-        except requests.exceptions.ConnectTimeout as e:
-            # Never connected, so the order never left this machine.
-            raise RuntimeError(f"Order not sent: could not reach Public ({e})") from e
         except Exception as e:
+            # Evidence first: what was sent, and that no answer came back.
+            public_evidence.record_http("order", account=_safe_last4(account_id),
+                                        request=body, error=f"{type(e).__name__}: {e}")
+            if isinstance(e, requests.exceptions.ConnectTimeout):
+                # Never connected, so the order never left this machine.
+                raise RuntimeError(f"Order not sent: could not reach Public ({e})") from e
             # A read timeout or dropped connection: the POST went out and
             # Public may well have taken it.
             raise _OrderMayExist(
                 f"Public did not answer after the order may have been submitted "
                 f"({type(e).__name__}: {e}) — verify in Public before retrying") from e
+        public_evidence.record_http("order", account=_safe_last4(account_id),
+                                    request=body, response=r)
         if r.status_code >= 500:
             raise _OrderMayExist(
                 f"Public returned HTTP {r.status_code} after the order may have been "
@@ -656,6 +713,87 @@ def _format_preview_ticket(*, endpoint_path: str, body: Dict[str, Any]) -> str:
 
 
 # =============================================================================
+# Fee guard glue (see public_fees.py)
+# =============================================================================
+
+def _fee_scan_targets(ready) -> List[Tuple[Any, str, str]]:
+    out: List[Tuple[Any, str, str]] = []
+    for pi, c, accts in ready:
+        if c is None:
+            continue
+        for a in accts or []:
+            if not isinstance(a, dict):
+                continue
+            aid = (a.get("accountId") or "").strip()
+            if aid:
+                typ = (a.get("accountType") or "").strip() or "ACCOUNT"
+                out.append((c, aid, f"Public {pi} {typ} ({_safe_last4(aid)})"))
+    return out
+
+
+def _fee_halt_row(label: str) -> AccountOutput:
+    """A sell refused by the fee guard. Says "skipped" and "nothing was sent"
+    so every hand-back path reads it as no order out (app._NOTHING_SENT)."""
+    return AccountOutput(
+        account_id=label, ok=False, order_id=None,
+        message=(f"Skipped: Public selling is paused by the fee guard — "
+                 f"{public_fees.halt_reason()}. Nothing was sent. Resume it on "
+                 f"the MONITOR > Public Fees page once you have looked at the fee."))
+
+
+def _fee_halt_output(ready) -> BrokerOutput:
+    rows = [_fee_halt_row(label) for _c, _a, label in _fee_scan_targets(ready)]
+    if not rows:
+        rows = [_fee_halt_row("Public")]
+    return BrokerOutput(broker=BROKER, state="failed", accounts=rows,
+                        message=f"Public selling paused (fee guard): "
+                                f"{public_fees.halt_reason()} — nothing was sent")
+
+
+def _preflight(client, acct_id: str, label: str, side: str, symbol: str,
+               qty: str) -> Optional[Dict[str, Any]]:
+    """public_fees.preflight_check of Public's preflight for this order, or
+    None when it could not be read (logged; the order is not held up)."""
+    fn = getattr(client, "preflight_equity_market_order", None)
+    if not callable(fn):
+        return None
+    try:
+        resp = fn(account_id=acct_id, side=side, symbol=symbol, quantity=qty,
+                  market_session="CORE", tif="DAY")
+    except Exception as e:
+        public_fees.log(f"preflight {side} {qty} {symbol} at {label} failed: {e}")
+        return None
+    chk = public_fees.preflight_check(resp)
+    public_fees.log(
+        f"preflight {side} {qty} {symbol} at {label}: "
+        f"commission={chk['commission']} regulatory={chk['regulatory']} "
+        f"other={chk['other_fees']} notices={len(chk['notices'])}"
+        + (f" TRIP: {chk['trip']}" if chk["trip"] else ""), resp)
+    return chk
+
+
+def _post_sell_scan(target: Tuple[Any, str, str]) -> None:
+    """Read one account's recent history for a fee right after a sale."""
+    try:
+        public_fees.scan_accounts([target], days=3, max_pages=2)
+    except Exception as e:
+        public_fees.log(f"post-sell scan failed for {target[2]}: {e}")
+
+
+def scan_fees(*args, **kwargs) -> Dict[str, Any]:
+    """Every Public account's history, read for fees (trips the halt on a new
+    one). For the app's periodic check; never raises."""
+    try:
+        ok, msg, ready = _ensure_clients()
+        if not ok:
+            return {"found": [], "errors": [msg], "scanned": 0}
+        return public_fees.scan_accounts(_fee_scan_targets(ready))
+    except Exception as e:
+        public_fees.log(f"periodic scan failed: {e}")
+        return {"found": [], "errors": [str(e)], "scanned": 0}
+
+
+# =============================================================================
 # Executors (contract outputs only)
 # =============================================================================
 
@@ -750,6 +888,9 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
     outs: List[AccountOutput] = []
     log_sections: List[str] = []
     _acct_i = 0
+    # (client, account_id, label) of the last sale sent, read for a fee
+    # before the next order goes out (see _post_sell_scan).
+    post_sell_check: Optional[Tuple[Any, str, str]] = None
 
     # Which cap belongs to which account (see _match_caps), and which caps
     # found their account: one that found none is reported, never dropped.
@@ -766,6 +907,24 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
         # there proves nothing (see _match_caps).
         every_login_read = all(c is not None and accts for _pi, c, accts in ready)
         cap_for = _match_caps(caps, all_labels, fallback=every_login_read)
+
+    # FEE GUARD (public_fees.py). Every play here is a reverse split, and
+    # Public charges a fee on a sale within 90 days after one. A fee seen
+    # anywhere stops every Public sell until a person clears it -- checked
+    # here, before any order, against the saved halt AND a fresh read of
+    # every account's history (a fee can post after the batch that caused it).
+    is_sell = api_side == "SELL"
+    if is_sell:
+        if public_fees.halt_status() is None:
+            try:
+                # 30 days, a few pages: recent enough for a fee from the
+                # last batch; the app's hourly scan covers the full 120.
+                public_fees.scan_accounts(_fee_scan_targets(ready), days=30,
+                                          max_pages=3)
+            except Exception as e:                  # never blocks on its own
+                public_fees.log(f"pre-sell scan failed: {e}")
+        if public_fees.halt_status() is not None:
+            return _fee_halt_output(ready)
 
     log_sections.append("DRY RUN — NO ORDER SUBMITTED" if dry_run else "LIVE ORDER MODE")
     log_sections.append(f"broker: {BROKER}")
@@ -803,6 +962,18 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
                     order_id=None,
                 ))
                 continue
+
+            if is_sell:
+                # The previous account's sale has had the inter-account pause
+                # to fill: read its history now, before another order goes.
+                if post_sell_check is not None:
+                    _post_sell_scan(post_sell_check)
+                    post_sell_check = None
+                if public_fees.halt_status() is not None:
+                    if per_account and cap_for.get(acct_label):
+                        caps_used.add(cap_for[acct_label])
+                    outs.append(_fee_halt_row(acct_label))
+                    continue
 
             acct_qty = qty_s
             order_sym = sym
@@ -861,6 +1032,34 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
             )
             ticket = _format_preview_ticket(endpoint_path=endpoint_path, body=body)
 
+            # Ask Public what this order costs before sending it. A sell that
+            # would carry a commission or fee trips the guard and is not sent;
+            # a buy only reports what it saw (and every response is logged).
+            fee_note = ""
+            chk = _preflight(client, acct_id, acct_label, api_side, order_sym, acct_qty)
+            if chk is not None:
+                if is_sell and chk.get("trip"):
+                    public_fees.trip(
+                        f"{chk['trip']} on a {order_sym} sale at {acct_label}",
+                        source="preflight", account=acct_label, symbol=order_sym,
+                        qty=acct_qty, amount=str(chk.get("total")),
+                        parts=chk.get("parts"))
+                    outs.append(_fee_halt_row(acct_label))
+                    continue
+                fee_note = public_fees.describe_preflight(chk)
+                if fee_note and not is_sell:
+                    public_fees._emit({"kind": "notice", "account": acct_label,
+                                       "symbol": order_sym, "side": api_side,
+                                       "note": fee_note})
+                if fee_note:
+                    ticket += f"\n  public preflight: {fee_note}"
+
+            # Last look before the order: another batch, or the background
+            # scan, may have tripped the guard during the preflight round-trip.
+            if is_sell and public_fees.halt_status() is not None:
+                outs.append(_fee_halt_row(acct_label))
+                continue
+
             if dry_run:
                 outs.append(AccountOutput(account_id=acct_label, ok=True, message=ticket,
                                           order_id=oid, extra=extra))
@@ -881,10 +1080,21 @@ def execute_trade(*, side: str, qty: str, symbol: str, dry_run: bool = False,
                 )
                 placed = ("order placed" if not per_account
                           else f"order placed ({acct_qty} sh {order_sym})")
+                if fee_note:
+                    placed += f" — Public preflight: {fee_note}"
                 outs.append(AccountOutput(account_id=acct_label, ok=True, message=placed,
                                           order_id=str(order_id) if order_id else oid, extra=extra))
+                if is_sell:
+                    post_sell_check = (client, acct_id, acct_label)
             except Exception as e:
                 outs.append(AccountOutput(account_id=acct_label, ok=False, message=str(e), order_id=None))
+                if is_sell and isinstance(e, _OrderMayExist):
+                    post_sell_check = (client, acct_id, acct_label)
+
+    # The last sale gets the same history read the others got between accounts.
+    if post_sell_check is not None:
+        time.sleep(3.0)
+        _post_sell_scan(post_sell_check)
 
     if per_account:
         failed_logins = [pi for pi, c, _a in ready if c is None]

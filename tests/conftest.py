@@ -45,6 +45,15 @@ def _keep_tests_out_of_the_real_trade_log(tmp_path, tmp_path_factory, monkeypatc
         monkeypatch.setattr(mod, "ROUNDUP_RADAR_FILE",
                             tmp_path / "roundup_radar.json", raising=False)
     _redirect_state_files(tmp_path_factory.mktemp("state"), monkeypatch)
+    ev = sys.modules.get("public_evidence")
+    if ev is not None:
+        # Its chain head is cached per process; each test has its own file.
+        for name in ("_head", "_seq", "_tx_seen"):
+            monkeypatch.setattr(ev, name, None)
+    pf = sys.modules.get("public_fees")
+    if pf is not None:
+        # A trip is sticky in memory for the process; each test starts clean.
+        monkeypatch.setattr(pf, "_mem_halt", None)
     yield
 
 
@@ -63,6 +72,8 @@ _STATE_FILES = {
     "etf_journal": ("ETF_FILE",),
     "balances": ("BALANCES_FILE",),
     "cloud_sync": ("_STATE_FILE", "_TRADES_FILE"),
+    "public_fees": ("STATE_FILE", "LOG_FILE"),
+    "public_evidence": ("EVIDENCE_DIR", "EVIDENCE_FILE"),
 }
 
 

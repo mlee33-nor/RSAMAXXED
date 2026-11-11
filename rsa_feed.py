@@ -53,13 +53,14 @@ __all__ = [
 # The brokers the terminal can actually execute in. Anything else still parses —
 # it is real information about the play — it just can't be automated here.
 SUPPORTED_BROKERS = (
-    "Chase", "Fennel", "Fidelity", "IBKR",
+    "Aries", "Chase", "Fennel", "Fidelity", "IBKR",
     "Public", "Robinhood", "Schwab", "SoFi", "Wells Fargo",
 )
 
 # Written aliases seen in the channel, lowercased. The fuzzy pass below catches
 # the typos ('Swchab'); this table catches the deliberate shorthand ('wells').
 _BROKER_ALIASES = {
+    "aries": "Aries", "aries financial": "Aries",
     "chase": "Chase", "jpmorgan": "Chase", "jpm": "Chase",
     "fennel": "Fennel",
     "fidelity": "Fidelity", "fid": "Fidelity",

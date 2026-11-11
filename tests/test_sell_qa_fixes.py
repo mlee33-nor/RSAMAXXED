@@ -164,7 +164,7 @@ def test_a_second_copy_exits_before_anything_is_built(monkeypatch):
     monkeypatch.setattr(A, "App", lambda *a, **k: seen.append("BUILT"))
     with pytest.raises(SystemExit) as ex:
         A._single_instance_or_exit()
-    assert ex.value.code == 0
+    assert ex.value.code == A.update_apply.EXIT_ALREADY_RUNNING
     assert seen == ["told"]
 
 

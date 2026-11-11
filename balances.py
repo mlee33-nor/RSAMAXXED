@@ -57,6 +57,7 @@ _CASH_KEYS: Dict[str, Tuple[str, ...]] = {
     "fidelity":   ("cash",),          # FCASH, recovered in fidelity.py
     "chase":      ("cash",),          # cash positions, recovered in chase.py
     "ibkr":       ("cash",),          # TotalCashValue from IB Gateway, ibkr.py
+    "aries":      ("cash",),          # cashBalance / settledFunds, aries.py
 }
 
 

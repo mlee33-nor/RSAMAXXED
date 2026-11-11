@@ -73,7 +73,7 @@ except Exception:  # missing module, missing requests, anything at all
 
 # The release a customer is running — shown in the sidebar footer and stamped
 # on every crash-log START line, so a support report says which build it is.
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # The main window's title. The single-instance guard finds a running copy's
 # window by it (FindWindowW), so it is defined once here and used by both.
@@ -450,6 +450,7 @@ AUTOSELL_MAY_EXIST_HOLD = timedelta(hours=36)
 #: Brokerages whose every SELL this app sends is a DAY order, read from each
 #: module's order code (2026-10-10):
 #:
+#:   aries      "timeInForce": "DAY" on every market order (aries.py)
 #:   chase      tif "DAY" on the order payload
 #:   fennel     fennel-invest-api createOrder sends timeInForce "day"
 #:   ibkr       MarketOrder(..., tif="DAY")
@@ -469,7 +470,7 @@ AUTOSELL_MAY_EXIST_HOLD = timedelta(hours=36)
 #: A hold at one of those ends only when the journal shows the leg closed, a
 #: live holdings read finds the shares gone, or a human clears it.
 AUTOSELL_DAY_ORDER_BROKERS = frozenset(
-    {"chase", "fennel", "ibkr", "public", "robinhood", "schwab", "sofi"})
+    {"aries", "chase", "fennel", "ibkr", "public", "robinhood", "schwab", "sofi"})
 
 
 def _hold_lapses(broker: str) -> bool:
@@ -1044,6 +1045,7 @@ def _save_custom_accounts(accounts: List[Dict[str, Any]]) -> None:
         pass                    # said once, loudly, when it would not read
 
 BROKER_MODULES = {
+    "aries": "aries",
     "chase": "chase",
     "fennel": "fennel",
     "fidelity": "fidelity",
@@ -1086,6 +1088,29 @@ _ASK_GRACE_S = 15
 # verify" so nothing automatic re-sends it, and its broker is released.
 TRADE_LEG_WATCHDOG_SLACK_S = 600
 TRADE_LEG_WATCHDOG_POLL_MS = 60_000
+# How often every Public account's history is re-read for a sale fee (see
+# public_fees.py). A fee can post after the sale that caused it, or come from
+# a sale made in Public's own app; the pre-sell and post-sell reads miss those.
+PUBLIC_FEE_SCAN_MS = 60 * 60 * 1000
+
+
+def _public_fee_scan_ms() -> int:
+    """PUBLIC_FEE_SCAN_MINUTES from .env (0 turns the timed scan off; the
+    checks around every Public sell still run). Default: hourly."""
+    raw = os.getenv("PUBLIC_FEE_SCAN_MINUTES", "").strip()
+    try:
+        mins = int(raw) if raw else PUBLIC_FEE_SCAN_MS // 60000
+    except ValueError:
+        mins = PUBLIC_FEE_SCAN_MS // 60000
+    return max(0, mins) * 60 * 1000
+
+
+def _public_fee_threshold_text() -> str:
+    try:
+        import public_fees
+        return f"{public_fees.threshold():.2f}"
+    except Exception:
+        return "0.25"
 # The trade budget for a broker with no entry in MIRROR_BROKER_TRADE_BUDGET_S
 # (Chase, Robinhood, Public, Fennel, Schwab, SoFi, IBKR). The watchdog used to
 # give EVERY broker the slowest broker's budget -- 60+ min, hours with several
@@ -1197,6 +1222,7 @@ def _hung_browser_brokers() -> set:
 _LIVE_ACCOUNT_COUNTS: Dict[str, int] = {}
 
 BROKER_ENV_KEYS: Dict[str, List[str]] = {
+    "aries":      ["ARIES_CLIENT_ID"],
     "chase":      ["CHASE_USERNAME", "CHASE_PASSWORD"],
     "fennel":     ["FENNEL_EMAIL"],
     "fidelity":   ["FIDELITY_USERNAME", "FIDELITY_PASSWORD", "FIDELITY_TOTP_SECRET"],
@@ -1739,7 +1765,7 @@ def _mirror_buy_qty(p: Dict[str, Any]) -> Tuple[Optional[int], str]:
 # those. Anything not listed here re-runs its whole account list, so the
 # "retry the accounts that failed" action deliberately won't offer it — a retry
 # that quietly re-buys the accounts that already filled is worse than no retry.
-RETRYABLE_ACCOUNT_BROKERS = ("wellsfargo", "fidelity", "ibkr")
+RETRYABLE_ACCOUNT_BROKERS = ("wellsfargo", "fidelity", "ibkr", "aries")
 
 
 def _ok_account_count(out: Any) -> int:
@@ -1755,8 +1781,8 @@ def _is_login_label(account_id: Any) -> bool:
     "IBKR") rather than one account -- also with broker_logins' login prefix
     ("Wells Fargo 2 · Wells Fargo"). As only_accounts it means every account
     at that login."""
-    return bool(re.fullmatch(r"(?:(?:Fidelity|Wells Fargo|IBKR) \d+ · )?"
-                             r"(Fidelity|Wells Fargo|IBKR)( \d+)?",
+    return bool(re.fullmatch(r"(?:(?:Fidelity|Wells Fargo|IBKR|Aries) \d+ · )?"
+                             r"(Fidelity|Wells Fargo|IBKR|Aries)( \d+)?",
                              str(account_id or "").strip()))
 
 
@@ -2775,6 +2801,111 @@ def _leg_open_accounts(broker: str, symbol: str) -> List[tuple]:
             label[k] = acct     # file order is chronological: the last one wins
         net[k] = net.get(k, 0.0) + (qty if t.get("side") == "buy" else -qty)
     return sorted((label[k], q) for k, q in net.items() if q > 1e-9)
+
+
+def _merged_remnant_accounts(broker: str, symbol: Any) -> List[tuple]:
+    """(account_id, shares, bought-as ticker) the journal holds open that a split merged away.
+
+    The stuck Sell-now leg: two buys into one account (or a 5-share buy), a
+    reverse split that rounds the lot down to ONE share, that one share sold,
+    and the journal still counting the rest. NCT/ZCMD/VIVK at Robinhood and
+    CPOP at Wells Fargo sat on Sell now for weeks this way while auto-sell
+    read every account empty, again and again, and gave up.
+
+    The journal alone cannot tell this from a partial exit (see
+    [reverse-split-fractional-pl]), so this is NOT an inference rule. The
+    caller must already hold the broker's answer: every account read, none
+    holding the stock (lifecycle.resolve's `missing`). Given that, an account
+    qualifies only if it has ALSO been exited once here -- a sell or close
+    dated after its last buy. That is what separates a merged remnant from the
+    SMTK failure, where a parser bug read ten accounts empty that had never
+    sold anything: no prior exit, nothing qualifies, the dispute still fires.
+
+    Skipped too: an account whose exit was a FRACTION of a share. That is
+    Public's late round-up (0.2 credited, 0.98 weeks later) -- empty now is
+    not empty for good there, and _sell_plays reopens it on the next exit.
+    """
+    if isinstance(symbol, (tuple, list, set, frozenset)):
+        symbols = {str(s or "").upper() for s in symbol if s}
+    else:
+        symbols = {str(symbol or "").upper()}
+    open_by_acct = dict(_leg_open_accounts(broker, tuple(symbols)))
+    if not open_by_acct:
+        return []
+    want = {_acct_net_key(broker, a): a for a in open_by_acct}
+    last_buy: Dict[str, datetime] = {}
+    last_exit: Dict[str, datetime] = {}
+    bought_as: Dict[str, str] = {}
+    fractional: set = set()
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        rows = _sell_side_rows(names=sorted(symbols))
+    except Exception:
+        return []
+    for t in rows:
+        if (_journaled_symbol(t) not in symbols
+                or str(t.get("broker") or "") != broker):
+            continue
+        k = _acct_net_key(broker, t.get("account_id") or "")
+        if k not in want:
+            continue
+        when = _parse_iso_utc(t.get("timestamp")) or epoch
+        side = t.get("side")
+        if side == "buy":
+            last_buy[k] = max(last_buy.get(k, epoch), when)
+            bought_as[k] = _journaled_symbol(t)
+            continue
+        last_exit[k] = max(last_exit.get(k, epoch), when)
+        raw = t.get("executed_qty", t.get("qty"))
+        try:
+            if abs(float(raw) - round(float(raw))) > 1e-9:
+                fractional.add(k)
+        except (TypeError, ValueError):
+            fractional.add(k)       # unreadable quantity: don't guess
+    out = []
+    for k, acct in want.items():
+        if k in fractional or k not in last_exit:
+            continue
+        if last_exit[k] > last_buy.get(k, epoch):
+            out.append((acct, open_by_acct[acct],
+                        bought_as.get(k) or sorted(symbols)[0]))
+    return out
+
+
+def _close_merged_remnants(task, missing) -> List[str]:
+    """Close the merged-away remnants at brokers that read EMPTY. Lines to log.
+
+    `missing` is lifecycle.resolve's: brokers where every account was read and
+    none held the stock. Recorded as trade_journal.CLOSE_RECONCILED -- no price,
+    outside realized P/L, reported by unaccounted(). An unread broker never
+    reaches here (resolve files it under `errors`), and neither does a broker
+    that showed the stock in any account.
+    """
+    names = tuple(dict.fromkeys(s for s in (task.symbol, task.alert_symbol) if s))
+    lines: List[str] = []
+    for broker in (missing or ()):
+        key = lifecycle.app_key(broker)
+        try:
+            gone = _merged_remnant_accounts(key, names)
+        except Exception:
+            continue
+        done = 0
+        for acct, qty, sym in gone:
+            try:
+                trade_journal.record_close(
+                    broker=key, account_id=acct, symbol=sym, qty=qty, reason=trade_journal.CLOSE_RECONCILED,
+                    note=f"{broker} read every account with no {task.symbol}; "
+                         f"already exited here once -- split merged the rest")
+                done += 1
+            except Exception:
+                break       # journal unwritable: leave the rest disputed
+        if done:
+            shares = sum(g[1] for g in gone[:done])
+            lines.append(f"{broker}: closed {_qty_text(shares)} merged-away "
+                         f"share{'s' if shares != 1 else ''} in "
+                         f"{_plural(done, 'account')} (the broker shows none; "
+                         f"each was already sold once)")
+    return lines
 
 
 def _public_raw_positions(symbols, rows=None) -> Dict[str, List[float]]:
@@ -5317,6 +5448,9 @@ class App(ctk.CTk):
         # login with nothing but "Missing dependency". Checked off the main
         # thread once the log and notification centre exist; never blocks.
         self.after(1500, self._startup_depcheck)
+        # Public fee guard: announce a saved halt, hear new ones the moment a
+        # trade thread trips one, and re-read Public's history on a timer.
+        self.after(3500, self._fee_guard_start)
         self.after(20000, self._update_report_healthy)
         self.after(updater.FIRST_CHECK_DELAY_S * 1000, self._update_tick)
         # No plays-password prompt on startup: the hosted feed is open, so a
@@ -5396,6 +5530,438 @@ class App(ctk.CTk):
             threading.Thread(target=_work, name="depcheck", daemon=True).start()
         except Exception:
             pass
+
+    # ---- Public fee guard (public_fees.py) --------------------------------
+    #
+    # Public charges a fee on a sale of reverse-split stock within 90 days of
+    # the split -- every play here. public.py refuses every Public SELL once a
+    # fee is seen (preflight or account history); this is the part a person
+    # sees: an error notification the moment it trips, a saved halt announced
+    # at every launch, a background history read, and the Resume button.
+
+    def _fee_guard_start(self) -> None:
+        try:
+            import public_fees
+        except Exception:
+            return
+        self._fee_notices_seen: set = set()
+        public_fees.add_listener(
+            lambda ev: self.after(0, lambda ev=ev: self._fee_guard_event(ev)))
+        h = public_fees.halt_status()
+        if h:
+            msg = (f"Public selling is PAUSED by the fee guard (since "
+                   f"{h.get('at', '?')}): {h.get('reason')}. Resume it on the "
+                   f"MONITOR > Public Fees page once you have looked at the fee.")
+            try:
+                self._log(msg, "error")
+                self._push_notification(msg, "error")
+            except Exception:
+                pass
+        self._fee_guard_render()
+        self.after(60_000, self._fee_guard_tick)
+
+    def _fee_guard_event(self, ev: Dict[str, Any]) -> None:
+        kind = ev.get("kind")
+        try:
+            if kind == "halt" and ev.get("first"):
+                msg = (f"PUBLIC FEE DETECTED — Public selling stopped. "
+                       f"{ev.get('reason')}. No Public sell will go out until "
+                       f"you press Resume on the MONITOR > Public Fees page. "
+                       f"Buys are not affected.")
+                self._log(msg, "error")
+                self._push_notification(msg, "error")
+                try:
+                    self.bell()
+                    self.deiconify()
+                    self.lift()
+                except Exception:
+                    pass
+            elif kind == "halt":
+                self._log(f"Public fee guard: another fee seen — "
+                          f"{ev.get('reason')} ({ev.get('account', '')}); "
+                          f"selling stays paused", "error")
+            elif kind == "notice":
+                key = (ev.get("symbol"), ev.get("note"))
+                if key in self._fee_notices_seen:
+                    return
+                self._fee_notices_seen.add(key)
+                msg = (f"Public {str(ev.get('side', '')).lower()} "
+                       f"{ev.get('symbol')}: Public's preflight reported "
+                       f"{ev.get('note')} (first seen at {ev.get('account')}). "
+                       f"Full response in logs/public_fees.log.")
+                self._log(msg, "warn")
+                self._push_notification(msg, "warning")
+        finally:
+            self._fee_guard_render()
+
+    def _fee_guard_tick(self) -> None:
+        """Read every Public account's history for a fee, off the UI thread.
+        Catches a fee that posts after the sale that caused it (settlement,
+        a sale made in Public's own app). A new one trips the halt, which
+        reaches _fee_guard_event through the listener."""
+        if getattr(self, "_fee_scan_running", False):
+            # The last scan is still reading (a slow history endpoint):
+            # never stack a second one behind it.
+            self.after(_public_fee_scan_ms() or PUBLIC_FEE_SCAN_MS,
+                       self._fee_guard_tick)
+            return
+
+        def _work() -> None:
+            try:
+                import public_fees
+                if public_fees.halt_status() is not None:
+                    return
+                if not _broker_has_creds("public"):
+                    return
+                _load_broker("public").scan_fees()
+            except Exception:
+                pass
+            finally:
+                self._fee_scan_running = False
+            self.after(0, self._fee_guard_render)
+        self._fee_scan_running = True
+        try:
+            threading.Thread(target=_work, name="public-fee-scan",
+                             daemon=True).start()
+        except Exception:
+            pass
+        nxt = _public_fee_scan_ms()
+        if nxt:
+            self.after(nxt, self._fee_guard_tick)
+
+    def _fee_guard_resume(self) -> None:
+        try:
+            import public_fees
+            h = public_fees.halt_status()
+            if not h:
+                return
+            if not public_fees.clear(by="MONITOR page button"):
+                self._push_notification(
+                    "Could not resume Public selling: the fee guard's state file "
+                    "could not be read or written (is it locked by Google Drive "
+                    "or antivirus?). Selling stays paused — try again shortly.",
+                    "error")
+                return
+        except Exception as e:
+            self._push_notification(f"Could not resume Public selling: {e}", "error")
+            return
+        self._log(f"Public fee guard: selling resumed by hand (it was paused "
+                  f"for: {h.get('reason')})", "warn")
+        self._push_notification("Public selling resumed. The fee already seen "
+                                 "will not pause it again; a new one will.",
+                                 "success")
+        self._fee_guard_render()
+
+    def _fee_guard_render(self) -> None:
+        """Repaint the MONITOR page (it is cheap, and the halt is urgent)."""
+        if "monitor" in getattr(self, "_frames", {}):
+            self._render_fee_monitor()
+
+    # ---- MONITOR page: Public fee watch + API evidence ---------------------
+
+    def _build_fee_monitor(self) -> None:
+        frame = tk.Frame(self._content, bg=BG_PRIMARY)
+        self._frames["monitor"] = frame
+        canvas = tk.Canvas(frame, bg=BG_PRIMARY, bd=0, highlightthickness=0)
+        body = tk.Frame(canvas, bg=BG_PRIMARY)
+        _bind_scrollregion(canvas, body)
+        cw = canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(cw, width=e.width))
+        canvas.pack(fill="both", expand=True)
+        self._attach_wheel(canvas, frame)
+        m: Dict[str, Any] = {}
+        self._fm = m
+
+        # Status
+        card = RoundedFrame(body, bg_color=BG_CARD, border_color=BORDER, radius=14)
+        card.pack(fill="x", pady=(0, 14))
+        top = tk.Frame(card.inner, bg=BG_CARD)
+        top.pack(fill="x", padx=20, pady=(16, 4))
+        m["dot"] = StatusDot(top, color=TEXT_MUTED, size=12)
+        m["dot"].pack(side="left", padx=(0, 10))
+        m["status"] = tk.Label(top, text="Loading…", bg=BG_CARD, fg=TEXT_PRIMARY,
+                               font=(FONT_FAMILY, 15, "bold"))
+        m["status"].pack(side="left")
+        m["reason"] = tk.Label(card.inner, text="", bg=BG_CARD, fg=TEXT_SECONDARY,
+                               font=(FONT_FAMILY, 10), wraplength=900,
+                               justify="left", anchor="w")
+        m["reason"].pack(fill="x", padx=20)
+        m["scan"] = tk.Label(card.inner, text="", bg=BG_CARD, fg=TEXT_MUTED,
+                             font=(FONT_FAMILY, 9), wraplength=900,
+                             justify="left", anchor="w")
+        m["scan"].pack(fill="x", padx=20, pady=(4, 0))
+        btns = tk.Frame(card.inner, bg=BG_CARD)
+        btns.pack(fill="x", padx=20, pady=(10, 16))
+        m["resume"] = PillButton(btns, text="Resume Public selling",
+                                 command=self._fee_guard_resume, bg_color=RED,
+                                 width=210, height=36, font_size=10)
+        tk.Label(card.inner, text=(
+            "Public charges an administrative fee on a sale of reverse-split stock "
+            "within 90 days after the split (waived for Premium). Before every "
+            "Public sell the app asks Public's preflight what the order costs, and "
+            "it reads each account's history before the batch, between accounts "
+            "and once an hour. The first commission or fee of "
+            f"${_public_fee_threshold_text()} or more stops every Public SELL until "
+            "you press Resume. Buys are never blocked."),
+            bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9), wraplength=900,
+            justify="left", anchor="w").pack(fill="x", padx=20, pady=(0, 16))
+
+        # Tiles
+        tiles = tk.Frame(body, bg=BG_PRIMARY)
+        tiles.pack(fill="x", pady=(0, 14))
+        m["tiles"] = {}
+        for i, (key, title) in enumerate((
+                ("buys", "Buy preflights recorded"),
+                ("flagged", "Buys where Public showed a fee/notice"),
+                ("orders", "Public orders recorded"),
+                ("fees", "Sale fees detected"))):
+            t = RoundedFrame(tiles, bg_color=BG_CARD, border_color=BORDER, radius=12)
+            t.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 10, 0))
+            tiles.grid_columnconfigure(i, weight=1, uniform="fm")
+            v = tk.Label(t.inner, text="–", bg=BG_CARD, fg=TEXT_PRIMARY,
+                         font=(FONT_MONO, 20, "bold"))
+            v.pack(anchor="w", padx=16, pady=(12, 0))
+            tk.Label(t.inner, text=title, bg=BG_CARD, fg=TEXT_MUTED,
+                     font=(FONT_FAMILY, 9), wraplength=200,
+                     justify="left").pack(anchor="w", padx=16, pady=(0, 12))
+            m["tiles"][key] = v
+
+        # Evidence
+        ev = RoundedFrame(body, bg_color=BG_CARD, border_color=BORDER, radius=14)
+        ev.pack(fill="x", pady=(0, 14))
+        tk.Label(ev.inner, text="Evidence log — what Public's API told this app",
+                 bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_FAMILY, 12, "bold")
+                 ).pack(anchor="w", padx=20, pady=(16, 4))
+        tk.Label(ev.inner, text=(
+            "Every Public preflight, order and history transaction is saved "
+            "verbatim with Public's own server timestamp, in "
+            "evidence/public_evidence.jsonl. Each record carries the SHA-256 of "
+            "the one before it, so an edited, deleted or reordered line shows. "
+            "Copy the head hash somewhere outside this PC now and then (email it "
+            "to yourself): that dates everything up to it."),
+            bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9), wraplength=900,
+            justify="left", anchor="w").pack(fill="x", padx=20)
+        m["chain"] = tk.Label(ev.inner, text="", bg=BG_CARD, fg=TEXT_SECONDARY,
+                              font=(FONT_FAMILY, 10, "bold"), anchor="w")
+        m["chain"].pack(fill="x", padx=20, pady=(10, 2))
+        m["head"] = tk.Entry(ev.inner, bg=BG_INPUT, fg=TEXT_SECONDARY,
+                             readonlybackground=BG_INPUT, relief="flat",
+                             font=(FONT_MONO, 9), state="readonly")
+        m["head"].pack(fill="x", padx=20, pady=(2, 8), ipady=4)
+        eb = tk.Frame(ev.inner, bg=BG_CARD)
+        eb.pack(fill="x", padx=20, pady=(0, 16))
+        for text, fn in (("Export evidence pack", self._fee_monitor_export),
+                         ("Copy head hash", self._fee_monitor_copy_head),
+                         ("Open folder", self._fee_monitor_open_folder)):
+            PillButton(eb, text=text, command=fn, bg_color=BG_CARD_ALT,
+                       hover_color=BG_ELEVATED, width=170, height=32,
+                       font_size=9).pack(side="left", padx=(0, 8))
+
+        # Recent preflights + fee events
+        for key, title in (("pre", "Latest Public preflights (newest first)"),
+                           ("events", "Fee detections")):
+            c = RoundedFrame(body, bg_color=BG_CARD, border_color=BORDER, radius=14)
+            c.pack(fill="x", pady=(0, 14))
+            tk.Label(c.inner, text=title, bg=BG_CARD, fg=TEXT_PRIMARY,
+                     font=(FONT_FAMILY, 12, "bold")).pack(anchor="w", padx=20,
+                                                          pady=(16, 6))
+            txt = tk.Text(c.inner, bg=BG_INPUT, fg=TEXT_SECONDARY, relief="flat",
+                          font=(FONT_MONO, 9), height=12 if key == "pre" else 6,
+                          wrap="none", bd=0, padx=10, pady=8)
+            txt.pack(fill="x", padx=20, pady=(0, 16))
+            txt.tag_configure("bad", foreground=RED)
+            txt.tag_configure("ok", foreground=GREEN)
+            txt.configure(state="disabled")
+            m[key] = txt
+
+    def _render_fee_monitor(self) -> None:
+        """Read the halt, the last scan and the evidence summary off the UI
+        thread (the evidence file grows), then paint."""
+        if getattr(self, "_fm_loading", False):
+            self._fm_again = True
+            return
+        self._fm_loading = True
+
+        def _work() -> None:
+            snap: Dict[str, Any] = {}
+            try:
+                import public_fees
+                import public_evidence
+                snap["halt"] = public_fees.halt_status()
+                state = public_fees._load()
+                snap["last_scan"] = state.get("last_scan") or {}
+                snap["events"] = list(state.get("events") or [])
+                snap["threshold"] = str(public_fees.threshold())
+                snap["ev"] = public_evidence.summary(limit=40)
+            except Exception as e:      # noqa: BLE001
+                snap["error"] = str(e)
+            self.after(0, lambda: self._paint_fee_monitor(snap))
+
+        threading.Thread(target=_work, name="fee-monitor", daemon=True).start()
+
+    def _paint_fee_monitor(self, snap: Dict[str, Any]) -> None:
+        self._fm_loading = False
+        if getattr(self, "_fm_again", False):
+            self._fm_again = False
+            self.after(10, self._render_fee_monitor)
+        m = getattr(self, "_fm", None)
+        if not m:
+            return
+
+        def _text(w, rows):
+            w.configure(state="normal")
+            w.delete("1.0", "end")
+            for line, tag in rows:
+                w.insert("end", line + "\n", (tag,) if tag else ())
+            w.configure(state="disabled")
+
+        try:
+            if snap.get("error"):
+                m["status"].configure(text="Monitor could not load", fg=YELLOW)
+                m["reason"].configure(text=snap["error"])
+                return
+            h = snap.get("halt")
+            if h:
+                m["dot"].set_color(RED)
+                m["status"].configure(text="PUBLIC SELLING PAUSED — fee detected", fg=RED)
+                m["reason"].configure(text=f"Since {h.get('at', '?')}: {h.get('reason')}",
+                                      fg=RED)
+                m["resume"].pack(side="left")
+            else:
+                m["dot"].set_color(GREEN)
+                m["status"].configure(text="WATCHING — no Public sale fee detected",
+                                      fg=GREEN)
+                m["reason"].configure(text="Public sells are allowed.",
+                                      fg=TEXT_SECONDARY)
+                m["resume"].pack_forget()
+            ls = snap.get("last_scan") or {}
+            if ls:
+                errs = ls.get("errors") or []
+                m["scan"].configure(text=(
+                    f"Last history scan {ls.get('at', '?')}: "
+                    f"{_plural(int(ls.get('scanned') or 0), 'account')} read over "
+                    f"{ls.get('days', '?')} days, "
+                    f"{_plural(int(ls.get('found') or 0), 'new fee')}"
+                    + (f" — {_plural(len(errs), 'read error')}: {errs[0]}" if errs else "")
+                    + f".  Threshold ${snap.get('threshold')}."))
+            else:
+                m["scan"].configure(text="No history scan yet (runs a minute after "
+                                         "launch, then hourly, and before "
+                                         "every Public sell).")
+
+            evs = snap.get("ev") or {}
+            events = snap.get("events") or []
+            m["tiles"]["buys"].configure(text=str(evs.get("buy_preflights", 0)))
+            fl = evs.get("buy_preflights_flagged", 0)
+            m["tiles"]["flagged"].configure(text=str(fl), fg=RED if fl else GREEN)
+            m["tiles"]["orders"].configure(text=str(evs.get("orders", 0)))
+            m["tiles"]["fees"].configure(text=str(len(events)),
+                                         fg=RED if events else GREEN)
+
+            chain = evs.get("chain") or {}
+            if chain.get("ok"):
+                m["chain"].configure(
+                    text=f"Chain intact — {evs.get('records', 0)} records "
+                         f"({evs.get('first') or '—'} → {evs.get('last') or '—'})",
+                    fg=GREEN)
+            else:
+                m["chain"].configure(
+                    text=f"CHAIN BROKEN at record {chain.get('bad_seq')}: "
+                         f"{chain.get('why')}", fg=RED)
+            m["head"].configure(state="normal")
+            m["head"].delete(0, "end")
+            m["head"].insert(0, str(chain.get("head") or ""))
+            m["head"].configure(state="readonly")
+
+            rows = []
+            for r in evs.get("recent") or []:
+                fee = str(r.get("commission") if r.get("commission") is not None else "?")
+                notices = r.get("notices") or []
+                flagged = (fee not in ("0", "0.00", "0.0", "?") or notices
+                           or r.get("error"))
+                line = (f"{(r.get('time') or '')[:19]:<19}  {str(r.get('side') or ''):<4} "
+                        f"{str(r.get('symbol') or ''):<6} qty {str(r.get('qty') or ''):<8} "
+                        f"acct …{str(r.get('account') or '')[-4:]:<4}  "
+                        f"commission {fee:<5}"
+                        + (f"  reg {r['reg']}" if r.get("reg") else "")
+                        + (f"  NOTICE: {'; '.join(notices)[:160]}" if notices else "")
+                        + (f"  ERROR: {str(r.get('error'))[:80]}" if r.get("error") else ""))
+                rows.append((line, "bad" if flagged else None))
+            if not rows:
+                rows = [("No Public preflight recorded yet — the next Public buy or "
+                         "sell records one per account.", None)]
+            _text(m["pre"], rows)
+            erows = [(f"{e.get('at', '')}  {e.get('reason', '')}", "bad")
+                     for e in events[::-1]]
+            _text(m["events"], erows or [("None. Every fee Public charges on a sale "
+                                         "will be listed here.", "ok")])
+        except Exception as e:          # noqa: BLE001
+            _crash_note("FEE_MONITOR", repr(e))
+
+    def _fee_monitor_scan_now(self) -> None:
+        if not _broker_has_creds("public"):
+            self._push_notification("No Public login is set up.", "warning")
+            return
+        self._push_notification("Reading every Public account's history for fees…",
+                                "info")
+
+        def _work() -> None:
+            try:
+                res = _load_broker("public").scan_fees()
+            except Exception as e:      # noqa: BLE001
+                res = {"errors": [str(e)], "found": [], "scanned": 0}
+            n, errs = len(res.get("found") or []), res.get("errors") or []
+
+            def _done() -> None:
+                if n:
+                    pass        # the halt listener already shouted
+                elif errs:
+                    self._push_notification(
+                        f"Public fee scan: {_plural(int(res.get('scanned') or 0), 'account')} read, "
+                        f"{len(errs)} could not be read — {errs[0]}", "warning")
+                else:
+                    self._push_notification(
+                        f"Public fee scan: {_plural(int(res.get('scanned') or 0), 'account')} read, "
+                        f"no fee found.", "success")
+                self._render_fee_monitor()
+            self.after(0, _done)
+
+        threading.Thread(target=_work, name="public-fee-scan-now", daemon=True).start()
+
+    def _fee_monitor_export(self) -> None:
+        try:
+            from tkinter import filedialog
+            dest = filedialog.askdirectory(title="Save the Public evidence pack to…")
+            if not dest:
+                return
+            import public_evidence
+            out, chk = public_evidence.export(Path(dest))
+        except Exception as e:          # noqa: BLE001
+            self._push_notification(f"Evidence export failed: {e}", "error")
+            return
+        self._log(f"Monitor: evidence pack exported to {out} ({chk['count']} records, "
+                  f"chain {'intact' if chk['ok'] else 'BROKEN'}, head {chk['head']})")
+        self._push_notification(f"Evidence pack saved: {out.name}",
+                                "success" if chk["ok"] else "warning")
+        self._render_fee_monitor()
+
+    def _fee_monitor_copy_head(self) -> None:
+        m = getattr(self, "_fm", None) or {}
+        head = m["head"].get() if m.get("head") is not None else ""
+        if not head:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(head)
+        self._push_notification("Head hash copied — paste it into an email to "
+                                "yourself to date-stamp the log.", "success")
+
+    def _fee_monitor_open_folder(self) -> None:
+        try:
+            import public_evidence
+            public_evidence.EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(public_evidence.EVIDENCE_DIR))  # type: ignore[attr-defined]
+        except Exception as e:          # noqa: BLE001
+            self._push_notification(f"Could not open the folder: {e}", "error")
 
     # ---- Silent updates (modules/updater.py) ------------------------------
 
@@ -6078,6 +6644,9 @@ class App(ctk.CTk):
             ("mirror", "Mirror", "lightning"),            # or have it opened for you
             ("exits", "Exits", "export"),                 # close it
         ]),
+        ("MONITOR", [
+            ("monitor", "Public Fees", "eye"),    # the reverse-split fee watch
+        ]),
         ("INVEST", [
             ("invest", "Invest", "pie"),          # what the profit does next
         ]),
@@ -6230,6 +6799,7 @@ class App(ctk.CTk):
         self._build_mirror()
         self._build_accounts()
         self._build_logs()
+        self._build_fee_monitor()
         # Every page is placed ONCE, stacked on top of each other, and a visit
         # just raises one. The old pack_forget/pack swap unmapped and remapped
         # a whole page tree per click, which is both slow and what made pages
@@ -6250,6 +6820,7 @@ class App(ctk.CTk):
         "stats":     ("analytics", "Analytics", "Performance, risk and realized P/L"),
         "accounts":  ("brokers", "Brokers", "Connections, credentials and bootstrap"),
         "logs":      ("activity", "Activity", "Live session event log"),
+        "monitor":   ("eye", "Monitor", "Public reverse-split fee watch, and what Public's API disclosed"),
     }
 
     # Contextual page-header actions (rendered into the right header slot)
@@ -6260,6 +6831,8 @@ class App(ctk.CTk):
         "mirror":    [("Check Now", "_mirror_check_clicked"), ("Export CSV", "_export_mirror_csv")],
         "stats":     [("Export CSV", "_export_trades_csv")],
         "accounts":  [("Bootstrap All", "_bootstrap_all")],
+        "monitor":   [("Scan Now", "_fee_monitor_scan_now"),
+                      ("Export Evidence", "_fee_monitor_export")],
     }
 
     def _render_header_actions(self, name: str) -> None:
@@ -6298,6 +6871,7 @@ class App(ctk.CTk):
             "watchlist": self._render_watchlist,
             "exits": self._render_exits_now,
             "mirror": self._render_mirror,
+            "monitor": self._render_fee_monitor,
         }.get(name)
 
     def _show_frame(self, name: str) -> None:
@@ -19722,6 +20296,14 @@ class App(ctk.CTk):
                 _mark_public_late_checked((task.symbol, task.alert_symbol))
             except Exception:
                 pass
+        # A broker that read empty where we had already sold once: the rest
+        # was merged away by a split. Close it so the leg leaves Sell now
+        # instead of being disputed and retried forever. Before the callbacks,
+        # so their _journal_disputes sees the journal as it now stands.
+        if resolved.missing:
+            for line in _close_merged_remnants(task, resolved.missing):
+                self.after(0, lambda m=line: self._log(
+                    f"Exits: {task.symbol} — {m}", "meta"))
         cb = then or self._exit_confirm
         self.after(0, lambda: (_holds_after_read(self, task, resolved), cb(resolved)))
 

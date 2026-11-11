@@ -101,6 +101,14 @@ def _f(name: str, env: str, label: str, **kw) -> Field:
 
 
 SCHEMAS: Dict[str, Schema] = {
+    "aries": Schema(
+        # A personal API key from Aries' Client Center -> API -> Generate Key:
+        # two values, no password and no 2FA (see aries.py). The key needs the
+        # account, position and order scopes, ticked when it is generated.
+        broker="aries", display="Aries", style="keyed",
+        fields=(_f("client_id", "ARIES_CLIENT_ID",
+                   "Client ID (Client Center → API → Generate Key)", secret=False),
+                _f("client_secret", "ARIES_CLIENT_SECRET", "Client Secret"))),
     "chase": Schema(
         broker="chase", display="Chase", style="keyed",
         # Not an email — see the chase-login-silent-reject note. Saying so on

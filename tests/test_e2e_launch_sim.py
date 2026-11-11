@@ -130,9 +130,9 @@ def test_1_clean_launch_buys_each_unbought_standard_pick_once_everywhere(sim):
     # journal: one sell row per order, at the qty actually sold
     jl = sim.journal_ledger(side="sell")
     assert jl == {(b, a, s, "sell"): 1 for (b, a, s) in exp_aaa | exp_bbb}
-    # realized: AAA 23 x (5.00 - 0.25) + 2 Public fractions at break-even
+    # realized: AAA 25 x (5.00 - 0.25) + 2 Public fractions at break-even
     # (0.05 x $5 = $0.25 restated onto the whole share); BBB 2 x 0.15.
-    assert sim.realized() == pytest.approx(23 * 4.75 + 0 + 2 * 0.15, abs=1e-6)
+    assert sim.realized() == pytest.approx(25 * 4.75 + 0 + 2 * 0.15, abs=1e-6)
     assert_no_wedge(sim)
 
 
